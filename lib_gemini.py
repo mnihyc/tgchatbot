@@ -1,4 +1,6 @@
-API_KEY = 'YOUR_GEMINI_API_KEY_HERE'
+import os
+API_KEY = os.getenv('GEMINI_API_KEY')
+assert(API_KEY, 'GEMINI_API_KEY not set')
 
 from typing import AsyncIterator
 import google.generativeai as genai
