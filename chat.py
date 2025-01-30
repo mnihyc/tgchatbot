@@ -1,5 +1,8 @@
-token = 'YOUR_TELEGRAM_BOT_TOKEN_HERE'
-whitelist = [] # WHITELIST ACCESS ONLY
+import os
+token = os.getenv('TGBOT_TOKEN')
+assert(token, 'TGBOT_TOKEN not set')
+
+whitelist = os.getenv('TGBOT_WHITELIST')
 
 import time, asyncio, functools, random, os
 from typing import AsyncIterator, Callable, Dict, List
