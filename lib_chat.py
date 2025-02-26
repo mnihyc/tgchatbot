@@ -8,7 +8,7 @@ class LType(Enum):
     TEXT = 0
     IMAGE = 1
 
-from typing import Dict, List
+from typing import Callable, Dict, List
 from abc import abstractmethod
 
 class LChat:
@@ -16,13 +16,18 @@ class LChat:
     MAX_RCTOKENS = 1048576 // 2
     MAX_IMAGES = 3000 // 2
     
-    def __init__(self, cid: int):
+    def __init__(self, cid: int, tid: int):
         self.history: List[Dict[str, object]] = []
         self.cid: int = cid
+        self.tid: int = tid
+        self.a_m_c = None
 
     @abstractmethod
     async def add_message(self, parts: List[object], role: LRole) -> None:
         pass
+
+    def add_message_callback(self, callback: Callable[[], None]) -> None:
+        self.a_m_c = callback
 
     @abstractmethod
     async def get_parts(self, message: str|List[str], type: LType) -> List[object]:
