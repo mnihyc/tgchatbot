@@ -11,7 +11,7 @@ whitelist = [w.strip() for w in whitelist.strip().split(',') if w.strip()]
 keywords = os.getenv('TGBOT_KEYWORDS')
 keywords = [k.strip() for k in keywords.strip().split(',') if k.strip()]
 
-import time, asyncio, functools, random, os, io, base64
+import time, asyncio, functools, random, os, io, base64, json
 from datetime import datetime, timedelta, timezone
 from typing import AsyncIterator, Callable, Dict, List
 from annotated_types import T
@@ -160,9 +160,17 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             #     chatcls = GPT35Chat
     except:
         pass
-    chatbot_map[chat.id] = chatbot = chatcls(random.getrandbits(31))
-    logger.info(f'/start by chatid {chat.id}, type {chatbot.NAME}, cid {chatbot.cid}')
-    message = await send(f'[BOT] Start {chatbot.NAME} .')
+    chatbot_map[chat.id] = chatbot = chatcls(random.getrandbits(31), chat.id)
+    if os.path.exists(f'cache/{chatbot.tid}.json'):
+        os.mkdir('cache', exist_ok=True)
+        with open(f'cache/{chatbot.tid}.json', 'r', encoding='utf-8') as f:
+            chatbot.history = json.load(f)
+    def save_cache() -> None:
+        with open(f'cache/{chatbot.tid}.json', 'w', encoding='utf-8') as f:
+            json.dump(chatbot.history, f, ensure_ascii=False, indent=2)
+    chatbot.add_message_callback(save_cache)
+    logger.info(f'/start by chatid {chat.id}, type {chatbot.NAME}, cid {chatbot.cid}; history cache {len(chatbot.history)}')
+    message = await send(f'[BOT] Start {chatbot.NAME} with {len(chatbot.history)} history.')
     # if not await generate(message, chatbot, load_preset('default', is_group(chat))):
     #     del chatbot_map[chat.id]
     #     return
@@ -369,7 +377,7 @@ async def group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     #      or str(update.effective_message.reply_to_message.from_user.id) != token.split(':')[0]:
     #     return
     if not is_started(chat):
-        await send('[BOT] Not started.')
+        #await send('[BOT] Not started.')
         return
     chatbot = chatbot_map[chat.id]
     async with chatmsglock_map.setdefault(chat.id, asyncio.Lock()):

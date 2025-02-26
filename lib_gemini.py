@@ -18,10 +18,10 @@ from utils import detect_image
 from lib_chat import LRole, LType, LChat
 
 class GeminiChat(LChat):
-    NAME = 'gemini-2.0-flash-exp'
+    NAME = 'gemini-2.0-flash'
 
-    def __init__(self, cid: int):
-        super().__init__(cid)
+    def __init__(self, cid: int, tid: int):
+        super().__init__(cid, tid)
         self.temperature: float = 1.0
         self.top_k: int = 40
         self.top_p: float = 0.95
@@ -33,8 +33,11 @@ class GeminiChat(LChat):
                 message = [message]
             return message
         else:
-            mime, data, _ = detect_image(message)
-            return [{'mime_type': mime, 'data': data}]
+            res = []
+            for img in detect_image(message):
+                mime, data, _ = img
+                res.append({'mime_type': mime, 'data': data})
+            return res
     
     async def add_message(self, parts: List[object], role: LRole) -> None:
         match role:
@@ -45,6 +48,8 @@ class GeminiChat(LChat):
             case LRole.MODEL:
                 rolestr = 'model'
         self.history.append({'role': rolestr, 'parts': parts})
+        if self.a_m_c:
+            self.a_m_c()
     
     async def count_tokens(self) -> int:
         #return sum(len(p) for m in self.history for p in m['parts'])
