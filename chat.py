@@ -162,7 +162,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         pass
     chatbot_map[chat.id] = chatbot = chatcls(random.getrandbits(31), chat.id)
     if os.path.exists(f'cache/{chatbot.tid}.json'):
-        os.mkdir('cache', exist_ok=True)
+        os.makedirs('cache', exist_ok=True)
         with open(f'cache/{chatbot.tid}.json', 'r', encoding='utf-8') as f:
             chatbot.history = json.load(f)
     def save_cache() -> None:
@@ -174,7 +174,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # if not await generate(message, chatbot, load_preset('default', is_group(chat))):
     #     del chatbot_map[chat.id]
     #     return
-    await chatbot.add_message([load_preset('default', is_group(chat))], LRole.SYSTEM)
+    if len(chatbot.history) == 0:
+        await chatbot.add_message([load_preset('default', is_group(chat))], LRole.SYSTEM)
     lastmsg_map[chat.id] = message
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str, system: bool = False) -> None:
@@ -386,7 +387,7 @@ async def group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     try:
         images = await handle_photos(update, chatbot)
         logger.info(f'group message by chatid {chat.id}, cid {chatbot.cid}, type {chatbot.NAME}, photos {len(images)}, prompt_len {len(prompt or [])}')
-        if prompt and any(k.lower() in prompt.lower() for k in keywords) and chat.id in lastmsg_map:
+        if prompt and (any(k.lower() in prompt.lower() for k in keywords) or (update.effective_message.reply_to_message and lastmsg_map[chat.id].id == update.message.reply_to_message.id)) and chat.id in lastmsg_map:
             #if lastmsg_map[chat.id].id != update.message.reply_to_message.id:
             #    return
             async def _generate() -> None:
