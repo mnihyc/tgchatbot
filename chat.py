@@ -11,6 +11,9 @@ whitelist = [w.strip() for w in whitelist.strip().split(',') if w.strip()]
 keywords = os.getenv('TGBOT_KEYWORDS')
 keywords = [k.strip() for k in keywords.strip().split(',') if k.strip()]
 
+ignore_keywords = os.getenv('TGBOT_IGNORE_KEYWORDS')
+ignore_keywords = [k.strip() for k in ignore_keywords.strip().split(',') if k.strip()]
+
 import time, asyncio, functools, random, os, io, base64, json
 from datetime import datetime, timedelta, timezone
 from typing import AsyncIterator, Callable, Dict, List
@@ -225,7 +228,25 @@ async def rollback_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await send('[BOT] Unable to revoke initial message; reset instead.')
         return
     del lastmsg_map[chat.id]
-    message = await send('[BOT] Rollbacked last conversation. Reply here.')
+    message = await send(f'[BOT] Rollbacked to {len(chatbot.history)}. Reply here.')
+    lastmsg_map[chat.id] = message
+
+async def revoke_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    message = update.effective_message
+    send = message.reply_text if is_group(chat) else chat.send_message
+    if not is_started(chat):
+        await send('[BOT] Not started.')
+        return
+    chatbot = chatbot_map[chat.id]
+    if chat.id not in lastmsg_map:
+        await send('[BOT] Still updating.')
+        return
+    if not await chatbot.revoke_message():
+        await send('[BOT] Unable to revoke initial message; reset instead.')
+        return
+    del lastmsg_map[chat.id]
+    message = await send(f'[BOT] Revoked to {len(chatbot.history)}. Reply here.')
     lastmsg_map[chat.id] = message
 
 async def retry_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -380,6 +401,8 @@ async def group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not is_started(chat):
         #await send('[BOT] Not started.')
         return
+    if prompt and any(k.lower() in prompt.lower() for k in ignore_keywords):
+        return
     chatbot = chatbot_map[chat.id]
     async with chatmsglock_map.setdefault(chat.id, asyncio.Lock()):
         chatmsgint_map.setdefault(chat.id, 0)
@@ -413,6 +436,7 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CommandHandler("neko", neko_command))
     app.add_handler(CommandHandler("rollback", rollback_command))
+    app.add_handler(CommandHandler("revoke", revoke_command))
     app.add_handler(CommandHandler("retry", retry_command))
     app.add_handler(CommandHandler("system", system_command))
     app.add_handler(CommandHandler("reset_full", reset_full_command))

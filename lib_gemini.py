@@ -6,7 +6,7 @@ API_KEY = os.getenv('GEMINI_API_KEY')
 assert API_KEY, 'GEMINI_API_KEY not set'
 API_KEY = [k.strip() for k in API_KEY.split() if k.strip()]
 
-from typing import AsyncIterator, Dict, List
+from typing import AsyncIterator, Dict, List, override
 import google.generativeai as genai
 import random
 def select_api_key(api_key: str = None) -> None:
@@ -50,6 +50,22 @@ class GeminiChat(LChat):
         self.history.append({'role': rolestr, 'parts': parts})
         if self.a_m_c:
             self.a_m_c()
+    
+    @override
+    async def rollback_message(self) -> bool:
+        await self.revoke_message()
+        if len(self.history) > 1:
+            self.history.pop()
+            return True
+        return False
+    
+    async def revoke_message(self) -> bool:
+        while len(self.history) > 1:
+            if self.history[-1]['role'] == 'user':
+                self.history.pop()
+            else:
+                return True
+        return False
     
     async def count_tokens(self) -> int:
         #return sum(len(p) for m in self.history for p in m['parts'])

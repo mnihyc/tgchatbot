@@ -52,6 +52,10 @@ class LChat:
             self.history.pop()
             return True
         return False
+    
+    @abstractmethod
+    async def revoke_message(self) -> bool:
+        pass
 
     @abstractmethod
     async def cut_history(self, max_tokens: int = MAX_RCTOKENS, max_images: int = MAX_IMAGES) -> None:
