@@ -2,4 +2,5 @@ python-dotenv
 pillow
 requests[socks]
 python-telegram-bot
-google-generativeai
+google-genai
+tiktoken
