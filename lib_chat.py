@@ -78,9 +78,28 @@ class LChat:
                 return True
         return False
 
-    @abstractmethod
-    async def cut_history(self, max_tokens: int = 0, max_images: int = 0) -> None:
-        pass
+    async def cut_history(self, max_tokens: int = None, max_images: int = None) -> tuple[int]:
+        if max_tokens is None:
+            max_tokens = self.MAX_RCTOKENS
+        if max_images is None:
+            max_images = self.MAX_IMAGES
+        cuts = len(self.history)
+        imgs, i = 0, len(self.history)
+        while i > 0:
+            i -= 1
+            if self.history[i]['role'] == 'system':
+                continue
+            if isinstance(self.history[i]['parts'][0], dict):
+                imgs += 1
+            if imgs > max_images:
+                self.history.pop(i)
+        while (cur := await self.count_tokens()) > max_tokens:
+            for i in range(len(self.history)):
+                if self.history[i]['role'] == 'system':
+                    continue
+                self.history.pop(i)
+                break
+        return (cuts - len(self.history), cur)
     
     @abstractmethod
     async def count_tokens(self) -> int:
