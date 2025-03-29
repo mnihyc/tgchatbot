@@ -75,7 +75,8 @@ async def generate(message: Message, chatbot: LChat, prompt: str|List[object], r
         if isinstance(prompt, str):
             prompt = [prompt]
         await chatbot.add_message(prompt, role)
-    await chatbot.cut_history()
+    cuts = await chatbot.cut_history()
+    logger.info(f'Cut history for {chatbot.NAME}, cid {chatbot.cid}, cuts {cuts}')
     async def _ask() -> str:
         prev = sent = ''
         last = time.perf_counter()
