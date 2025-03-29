@@ -15,12 +15,12 @@ def getclient() -> genai.Client:
     return client
 print('Initialized Gemini Models: ', [m.name for m in getclient().models.list()])
 
-import tiktoken
+import tiktoken, base64
 from lib_chat import LChat
 
 class GeminiChat(LChat):
     NAME = 'gemini-2.0-flash'
-    MAX_RCTOKENS = 1048576
+    MAX_RCTOKENS = 1000000
     MAX_IMAGES = 3000
 
     def __init__(self, cid: int, tid: int):
@@ -36,25 +36,6 @@ class GeminiChat(LChat):
         encoding = tiktoken.get_encoding("cl100k_base")
         return sum(len(encoding.encode(p))+1 if isinstance(p, str) else 258*4 for m in self.history for p in m['parts'])
 
-    async def cut_history(self, max_tokens: int = MAX_RCTOKENS, max_images: int = MAX_IMAGES) -> int:
-        cuts = len(self.history)
-        imgs, i = 0, len(self.history)
-        while i > 0:
-            i -= 1
-            if self.history[i]['role'] == 'system':
-                continue
-            if isinstance(self.history[i]['parts'][0], dict):
-                imgs += 1
-            if imgs >= max_images:
-                self.history.pop(i)
-        while await self.count_tokens() > max_tokens:
-            for i in range(len(self.history)):
-                if self.history[i]['role'] == 'system':
-                    continue
-                self.history.pop(i)
-                break
-        return cuts - len(self.history)
-
     async def ask(self) -> AsyncIterator[str]:
         client = getclient()
         hist = []
@@ -67,9 +48,9 @@ class GeminiChat(LChat):
                 if isinstance(p, str):
                     parts.append(types.Part.from_text(text=p))
                 elif isinstance(p, dict):
-                    parts.append(types.Part.from_bytes(mime_type=p['mime_type'], data=p['data']))
+                    parts.append(types.Part.from_bytes(mime_type=p['mime_type'], data=base64.b64decode(p['data'])))
             hist.append(types.Content(role=role, parts=parts))
-        text = ''
+        hist.append(types.Content(role='user', parts=[types.Part.from_text(text='[Strictly follow system prompt and reply]:\n')])) # optional
         async for chunk in await client.aio.models.generate_content_stream(
             model = self.NAME,
             contents = hist,
@@ -100,7 +81,6 @@ class GeminiChat(LChat):
                 ],
             ),
         ):
-            text += chunk.text
-            yield text
+            yield chunk.text
 
 __all__  = ['GeminiChat']

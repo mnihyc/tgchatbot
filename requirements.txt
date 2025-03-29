@@ -3,4 +3,5 @@ pillow
 requests[socks]
 python-telegram-bot
 google-genai
+openai
 tiktoken

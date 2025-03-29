@@ -69,6 +69,7 @@ async def keep_typing_while(message: Message, func: Callable[[None], T]) -> T:
 from lib_chat import LChat, LRole, LType
 from google.api_core.exceptions import InternalServerError, ResourceExhausted
 from lib_gemini import GeminiChat
+from lib_deepseek import DeepseekChat
 
 async def generate(message: Message, chatbot: LChat, prompt: str|List[object], role: LRole = LRole.USER) -> bool:
     if prompt:
@@ -76,21 +77,26 @@ async def generate(message: Message, chatbot: LChat, prompt: str|List[object], r
             prompt = [prompt]
         await chatbot.add_message(prompt, role)
     cuts = await chatbot.cut_history()
-    logger.info(f'Cut history for {chatbot.NAME}, cid {chatbot.cid}, cuts {cuts}')
+    logger.info(f'Cut history for {chatbot.NAME}, cid {chatbot.cid}, cuts/cur {cuts}')
     async def _ask() -> str:
-        prev = sent = ''
+        prev = sent = text = answer = ''
         last = time.perf_counter()
         async for data in chatbot.ask():
-            if data.strip() == prev.strip():
+            if isinstance(data, str):
+                answer += data
+            else:
+                data = data[1]
+            text += data
+            if not data.strip():
                 continue
-            prev = data
+            prev = text
             now = time.perf_counter()
-            if now-last>5.0 or (now-last>2.5 and len(data)-len(sent)>25):
+            if now-last>5.0 or (now-last>2.5 and len(text)-len(sent)>25):
                 last = now
-                await message.edit_text(sent := data)
+                await message.edit_text(sent := text)
         if prev != sent:
             await message.edit_text(prev)
-        return prev
+        return answer
     for retries in range(3):
         try:
             try:
@@ -138,7 +144,7 @@ def load_preset(name: str, is_group: bool = False) -> str:
     grs = 'g' if is_group else 'p'
     with open(f'presets/{grs}_{name}.txt', 'r', encoding='utf-8') as f:
         c = f.read().strip()
-    return c
+    return '[System prompt]: ' + c
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
@@ -162,6 +168,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             #     chatcls = GPT4Chat1
             # case 'gpt35' | 'gpt-3.5' | 'g35' | 'g3':
             #     chatcls = GPT35Chat
+            case 'ds' | 'deepseek' | 'deep-seek':
+                chatcls = DeepseekChat
     except:
         pass
     chatbot_map[chat.id] = chatbot = chatcls(random.getrandbits(31), chat.id)
@@ -297,10 +305,10 @@ async def close_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if chat.id not in lastmsg_map:
         await send('[BOT] Still updating.')
         #return
-    lastmsg_map[chat.id]
-    chatbot_map[chat.id]
-    chatmsglock_map[chat.id]
-    chatmsgint_map[chat.id]
+    del lastmsg_map[chat.id]
+    del chatbot_map[chat.id]
+    del chatmsglock_map[chat.id]
+    del chatmsgint_map[chat.id]
     await send('[BOT] Closed.')
     logger.info(f'/close by chatid {chat.id}, cid {chatbot.cid}')
 
