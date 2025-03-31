@@ -81,6 +81,7 @@ class GeminiChat(LChat):
                 ],
             ),
         ):
-            yield chunk.text
+            if chunk.text:
+                yield chunk.text
 
 __all__  = ['GeminiChat']
