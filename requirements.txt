@@ -1,7 +1,8 @@
-python-dotenv
-pillow
-requests[socks]
-python-telegram-bot
-google-genai
-openai
-tiktoken
+python-dotenv>=1.0.1
+httpx>=0.27.0
+python-telegram-bot>=22.0
+pillow>=10.4.0
+av>=12.3.0
+pydantic>=2.8.2
+telegramify_markdown>=1.1.1
+numpy>=2.4.3
