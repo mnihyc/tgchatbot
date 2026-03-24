@@ -2,3 +2,10 @@ __pycache__
 .env
 presets/*
 cache/*
+data/*
+tests/*
+*_NOTES.md
+*.zip
+*.bak
+sticker-retriever
+retriever/target
