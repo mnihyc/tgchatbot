@@ -7,8 +7,9 @@ from typing import Any
 import httpx
 
 from tgchatbot.config import GeminiConfig
+from tgchatbot.core.token_estimator import TokenEstimator
 from tgchatbot.domain.models import ConversationMessage, MessageRole, PartKind, ProviderResponse, SessionSettings, ToolCall, UsageInfo
-from tgchatbot.providers.base import ControlDescriptor, ProviderCapabilities
+from tgchatbot.providers.base import ControlDescriptor, ProviderCapabilities, RequestTokenEstimate, estimate_json_schema_tokens
 from tgchatbot.settings_schema import (
     GEMINI_THINKING_BUDGET_MAX,
     GEMINI_THINKING_BUDGET_MIN,
@@ -100,6 +101,71 @@ class GeminiProvider:
             'max_output_tokens': ControlDescriptor(True, str(settings.max_output_tokens if settings.max_output_tokens is not None else self.config.max_output_tokens), 'session' if settings.max_output_tokens is not None else 'default'),
         }
 
+    def _build_request_tools(self, settings: SessionSettings, tools: list[ToolSpec]) -> tuple[list[dict[str, Any]], dict[str, Any], bool]:
+        effective_native_web = self._native_web_search_enabled(settings)
+        can_combine_native_and_custom_tools = gemini_supports_tool_combination(settings.model)
+        tool_declarations = [tool.gemini_function_declaration() for tool in tools]
+        request_tools: list[dict[str, Any]] = []
+        server_side_tool_enabled = effective_native_web and (not tool_declarations or can_combine_native_and_custom_tools)
+        if server_side_tool_enabled:
+            request_tools.append({'googleSearch': {}})
+        if tool_declarations:
+            request_tools.append({'functionDeclarations': tool_declarations})
+
+        tool_config: dict[str, Any] = {}
+        if tool_declarations:
+            mode = 'VALIDATED' if server_side_tool_enabled else 'AUTO'
+            tool_config['functionCallingConfig'] = {'mode': mode}
+        if server_side_tool_enabled:
+            tool_config['includeServerSideToolInvocations'] = True
+        return request_tools, tool_config, server_side_tool_enabled
+
+    def estimate_request_tokens(
+        self,
+        *,
+        settings: SessionSettings,
+        messages: list[ConversationMessage],
+        instructions: str,
+        tools: list[ToolSpec],
+        extra_input_items: list[dict] | None = None,
+        response_schema: dict[str, Any] | None = None,
+        response_schema_name: str | None = None,
+        history_tokens_override: int | None = None,
+    ) -> RequestTokenEstimate:
+        history_tokens = int(history_tokens_override) if history_tokens_override is not None else sum(
+            self._estimate_content_tokens(content)
+            for message in messages
+            for content in self._message_to_contents(message)
+        )
+        instructions_tokens = TokenEstimator.estimate_text(instructions)
+        request_tools, tool_config, server_side_tool_enabled = self._build_request_tools(settings, tools)
+        tools_tokens = sum(self._estimate_request_tool_tokens(tool_entry) for tool_entry in request_tools)
+        if tool_config:
+            tools_tokens += self._estimate_semantic_value_tokens(tool_config)
+        if response_schema:
+            tools_tokens += estimate_json_schema_tokens(response_schema, name=response_schema_name or 'structured_output')
+        extra_input_tokens = sum(
+            self._estimate_content_tokens(item)
+            for item in (extra_input_items or [])
+            if isinstance(item, dict)
+        )
+        thinking = self._thinking_config_for_model(settings)
+        framing_tokens = 40
+        framing_tokens += TokenEstimator.estimate_text(str(settings.temperature if settings.temperature is not None else self.config.temperature))
+        framing_tokens += TokenEstimator.estimate_text(str(settings.top_p if settings.top_p is not None else self.config.top_p))
+        framing_tokens += TokenEstimator.estimate_text(str(settings.top_k if settings.top_k is not None else self.config.top_k))
+        if thinking:
+            framing_tokens += self._estimate_semantic_value_tokens(thinking)
+        if server_side_tool_enabled:
+            framing_tokens += 12
+        return RequestTokenEstimate.compose(
+            history_tokens=history_tokens,
+            instructions_tokens=instructions_tokens,
+            tools_tokens=tools_tokens,
+            extra_input_tokens=extra_input_tokens,
+            framing_tokens=framing_tokens,
+        )
+
     async def generate(
         self,
         *,
@@ -130,22 +196,7 @@ class GeminiProvider:
             generation_config['responseMimeType'] = 'application/json'
             generation_config['responseJsonSchema'] = response_schema
 
-        effective_native_web = self._native_web_search_enabled(settings)
-        can_combine_native_and_custom_tools = gemini_supports_tool_combination(settings.model)
-        tool_declarations = [tool.gemini_function_declaration() for tool in tools]
-        request_tools: list[dict[str, Any]] = []
-        server_side_tool_enabled = effective_native_web and (not tool_declarations or can_combine_native_and_custom_tools)
-        if server_side_tool_enabled:
-            request_tools.append({'googleSearch': {}})
-        if tool_declarations:
-            request_tools.append({'functionDeclarations': tool_declarations})
-
-        tool_config: dict[str, Any] = {}
-        if tool_declarations:
-            mode = 'VALIDATED' if server_side_tool_enabled else 'AUTO'
-            tool_config['functionCallingConfig'] = {'mode': mode}
-        if server_side_tool_enabled:
-            tool_config['includeServerSideToolInvocations'] = True
+        request_tools, tool_config, _server_side_tool_enabled = self._build_request_tools(settings, tools)
 
         payload: dict[str, Any] = {
             'systemInstruction': {'parts': [{'text': instructions}]},
@@ -337,6 +388,76 @@ class GeminiProvider:
             ),
             raw=body,
         )
+
+    def _estimate_request_tool_tokens(self, tool_entry: dict[str, Any]) -> int:
+        if not isinstance(tool_entry, dict):
+            return 0
+        if 'googleSearch' in tool_entry:
+            return 20
+        declarations = tool_entry.get('functionDeclarations')
+        if isinstance(declarations, list):
+            return 16 + sum(self._estimate_function_declaration_tokens(declaration) for declaration in declarations if isinstance(declaration, dict))
+        return 8 + self._estimate_semantic_value_tokens(tool_entry)
+
+    def _estimate_function_declaration_tokens(self, declaration: dict[str, Any]) -> int:
+        return (
+            20
+            + TokenEstimator.estimate_text(declaration.get('name'))
+            + TokenEstimator.estimate_text(declaration.get('description'))
+            + estimate_json_schema_tokens(declaration.get('parameters') if isinstance(declaration.get('parameters'), dict) else None)
+        )
+
+    def _estimate_content_tokens(self, content: dict[str, Any]) -> int:
+        if not isinstance(content, dict):
+            return 0
+        total = 8 + TokenEstimator.estimate_text(content.get('role'))
+        for part in content.get('parts', []) or []:
+            if not isinstance(part, dict):
+                continue
+            total += self._estimate_part_tokens(part)
+        return total
+
+    def _estimate_part_tokens(self, part: dict[str, Any]) -> int:
+        if 'text' in part:
+            return 4 + TokenEstimator.estimate_text(part.get('text'))
+        if 'inlineData' in part and isinstance(part.get('inlineData'), dict):
+            inline = part['inlineData']
+            return TokenEstimator.IMAGE_TOKENS + 8 + TokenEstimator.estimate_text(inline.get('mimeType'))
+        if 'functionCall' in part and isinstance(part.get('functionCall'), dict):
+            call = part['functionCall']
+            return 24 + TokenEstimator.estimate_text(call.get('name')) + TokenEstimator.estimate_text(call.get('id')) + self._estimate_semantic_value_tokens(call.get('args') or {})
+        if 'functionResponse' in part and isinstance(part.get('functionResponse'), dict):
+            response = part['functionResponse']
+            return 24 + TokenEstimator.estimate_text(response.get('name')) + TokenEstimator.estimate_text(response.get('id')) + self._estimate_semantic_value_tokens(response.get('response') or {})
+        if part.get('thought') is True:
+            total = 12 + TokenEstimator.estimate_text(part.get('text'))
+            if part.get('thoughtSignature'):
+                total += min(TokenEstimator.estimate_text(part.get('thoughtSignature')), 128)
+            return total
+        if 'toolCall' in part or 'toolResponse' in part:
+            return 20 + self._estimate_semantic_value_tokens(part)
+        return 4 + self._estimate_semantic_value_tokens(part)
+
+    def _estimate_semantic_value_tokens(self, value: Any) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, str):
+            return TokenEstimator.estimate_text(value)
+        if isinstance(value, (int, float, bool)):
+            return TokenEstimator.estimate_text(str(value))
+        if isinstance(value, list):
+            return 2 + sum(self._estimate_semantic_value_tokens(item) for item in value)
+        if isinstance(value, dict):
+            total = 4
+            for key, item in value.items():
+                key_text = str(key)
+                if key_text == 'data':
+                    total += TokenEstimator.IMAGE_TOKENS
+                    continue
+                total += TokenEstimator.estimate_text(key_text)
+                total += self._estimate_semantic_value_tokens(item)
+            return total
+        return TokenEstimator.estimate_text(str(value))
 
     def persistent_history_items(self, response: ProviderResponse) -> list[dict]:
         items = response.continuation_items or []

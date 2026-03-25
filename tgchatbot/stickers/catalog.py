@@ -8,13 +8,17 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from tgchatbot.stickers.persona import build_persona_dict, compact_persona_dict, merge_persona_dicts, persona_affect_profile, persona_has_values, persona_visual_identity
 from tgchatbot.stickers.plan import StickerRetrievalPlan
 from tgchatbot.stickers.retrieval_client import TantivyRetrieverClient
 from tgchatbot.stickers.schema import STICKER_SCHEMA_VERSION
 from tgchatbot.stickers.semantic_index import EmbeddingProvider, SemanticIndex
 from tgchatbot.stickers.session_style import SessionStyleMemory, SessionStyleState, normalize_style_goal
+
+if TYPE_CHECKING:
+    from tgchatbot.storage.sqlite_store import SQLiteStore
 
 _WORD_RE = re.compile(r"[\w+\-']+", re.UNICODE)
 _CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]")
@@ -143,9 +147,10 @@ class StickerMatch:
 
 
 class StickerCatalog:
-    def __init__(self, index_db_path: Path, sticker_root: Path) -> None:
+    def __init__(self, index_db_path: Path, sticker_root: Path, persona_store: 'SQLiteStore | None' = None) -> None:
         self.index_db_path = Path(index_db_path)
         self.sticker_root = Path(sticker_root)
+        self.persona_store = persona_store
         self._loaded = False
         self._stats_cache: dict[str, int | bool] = {'loaded': False, 'stickers': 0, 'packs': 0, 'animated': 0, 'static': 0}
         self.entries_by_id: dict[str, StickerIndexEntry] = {}
@@ -213,9 +218,101 @@ class StickerCatalog:
     def describe_style_context(self, session_id: str = 'default') -> dict[str, Any]:
         if not self._loaded:
             self.load()
-        return self.style_memory.get(session_id).to_context_dict()
+        return self._ensure_session_state(session_id).to_context_dict()
 
-    def choose(self, *, plan: StickerRetrievalPlan, session_id: str = 'default') -> list[StickerMatch]:
+    def describe_persona_context(self, session_id: str = 'default', plan: StickerRetrievalPlan | None = None) -> dict[str, Any]:
+        if not self._loaded:
+            self.load()
+        state = self._ensure_session_state(session_id)
+        return self._resolve_persona_context(session_id=session_id, state=state, plan=plan, persist=False)
+
+    def prepare_query_context(self, *, plan: StickerRetrievalPlan, session_id: str, persist_persona: bool) -> tuple[SessionStyleState, dict[str, Any]]:
+        if not self._loaded:
+            self.load()
+        state = self._ensure_session_state(session_id)
+        persona_context = self._resolve_persona_context(session_id=session_id, state=state, plan=plan, persist=persist_persona)
+        return state, persona_context
+
+    def _ensure_session_state(self, session_id: str) -> SessionStyleState:
+        state = self.style_memory.get(session_id)
+        if getattr(state, 'session_persona_loaded', False):
+            return state
+        persona = None
+        persona_store = getattr(self, 'persona_store', None)
+        if persona_store is not None:
+            persona = persona_store.get_sticker_persona_sync(session_id)
+        state.set_session_persona(persona)
+        return state
+
+    def _resolve_persona_context(
+        self,
+        *,
+        session_id: str,
+        state: SessionStyleState,
+        plan: StickerRetrievalPlan | None,
+        persist: bool,
+    ) -> dict[str, Any]:
+        session_persona = compact_persona_dict(state.session_persona)
+        requested_persona = compact_persona_dict(plan.persona.as_dict()) if plan is not None else {}
+        recent_implicit = state.recent_implicit_persona()
+        mode = plan.persona_mode if plan is not None else 'inherit'
+        feedback_summary = ''
+
+        if plan is not None and mode == 'clear_session_persona':
+            session_persona = {}
+            state.clear_session_persona()
+            persona_store = getattr(self, 'persona_store', None)
+            if persist and persona_store is not None:
+                persona_store.clear_sticker_persona_sync(session_id)
+            feedback_summary = 'Cleared the stored session sticker persona; only slight recent sticker continuity remains.'
+
+        effective_persona: dict[str, Any] = {}
+        if requested_persona:
+            if mode == 'merge_and_remember':
+                effective_persona = merge_persona_dicts(session_persona, requested_persona)
+                session_persona = compact_persona_dict(effective_persona)
+                if persist:
+                    state.set_session_persona(session_persona)
+                    persona_store = getattr(self, 'persona_store', None)
+                    if persona_store is not None:
+                        persona_store.save_sticker_persona_sync(session_id, session_persona)
+                feedback_summary = 'Using and remembering this session sticker persona; recent sticker continuity only nudges close variants.'
+            elif mode == 'use_once':
+                effective_persona = merge_persona_dicts(session_persona, requested_persona)
+                feedback_summary = 'Using a one-off sticker persona overlay for this query; the stored session persona stays unchanged.'
+            else:
+                effective_persona = merge_persona_dicts(session_persona, requested_persona)
+                feedback_summary = 'Using the stored session sticker persona with the current query persona blended in softly.'
+        elif session_persona:
+            effective_persona = session_persona
+            feedback_summary = 'Using the stored session sticker persona; recent sticker continuity only nudges close variants.'
+        elif persona_has_values(recent_implicit):
+            effective_persona = compact_persona_dict(recent_implicit)
+            feedback_summary = 'No stored session persona; using slight continuity inferred from recent stickers and recent shortlists.'
+        else:
+            feedback_summary = 'No stored or recent sticker persona; ranking relies on the current query intent and subtle cues only.'
+
+        context = state.persona_context(
+            effective_persona=effective_persona,
+            feedback_summary=feedback_summary,
+        )
+        context['persona_mode'] = mode
+        if requested_persona:
+            context['confidence'] = 0.88
+        elif session_persona:
+            context['confidence'] = 0.9
+        elif persona_has_values(recent_implicit):
+            context['confidence'] = round(float(recent_implicit.get('confidence', 0.0) or 0.0), 4)
+        return context
+
+    def choose(
+        self,
+        *,
+        plan: StickerRetrievalPlan,
+        session_id: str = 'default',
+        session_state: SessionStyleState | None = None,
+        persona_context: dict[str, Any] | None = None,
+    ) -> list[StickerMatch]:
         if not self._loaded:
             self.load()
         if not plan.send or not plan.intent_core:
@@ -239,9 +336,10 @@ class StickerCatalog:
         for hit in semantic_hits:
             semantic_by_id[hit.sticker_id][hit.channel] = hit.score
         candidate_ids = list(dict.fromkeys([*lexical_map.keys(), *semantic_by_id.keys()]))
-        session_style = self.style_memory.get(session_id)
+        session_style = session_state or self._ensure_session_state(session_id)
+        persona_context = persona_context or self._resolve_persona_context(session_id=session_id, state=session_style, plan=plan, persist=False)
+        query_delta = session_style.query_delta(plan.memory_query_bundle())
         request_terms = plan.request_terms()
-        style_terms = plan.style_request_terms()
         scored: list[StickerMatch] = []
         for sticker_id in candidate_ids:
             entry = self.entries_by_id.get(sticker_id)
@@ -268,97 +366,161 @@ class StickerCatalog:
             matched_terms: list[str] = []
 
             text_bonus = _caption_evidence_bonus(entry=entry, query_text=caption_query_text, text_priority=plan.text_priority)
-            if text_bonus:
-                score_breakdown['caption_evidence'] = text_bonus
 
             keyword_bonus, keyword_terms = _keyword_bonus(entry, request_terms)
             matched_terms.extend(keyword_terms)
             if keyword_bonus:
-                score_breakdown['request_overlap'] = keyword_bonus
+                score_breakdown['retrieval_overlap'] = keyword_bonus
 
             compatibility = _compatibility_adjustment(entry=entry, plan=plan)
             if compatibility:
-                score_breakdown['compatibility'] = compatibility
+                score_breakdown['compatibility_fit'] = compatibility
 
+            simple_score, simple_profile = _simple_hint_adjustment(entry=entry, plan=plan)
             semantic_score, semantic_profile = _semantic_axis_adjustment(entry=entry, plan=plan)
-            if semantic_score:
-                score_breakdown['semantic_axis_fit'] = semantic_score
-
             visual_score, visual_profile = _visual_axis_adjustment(entry=entry, plan=plan)
-            if visual_score:
-                score_breakdown['visual_axis_fit'] = visual_score
-
             text_constraint_score, text_profile = _text_constraint_adjustment(entry=entry, plan=plan)
-            if text_constraint_score:
-                score_breakdown['text_constraint_fit'] = text_constraint_score
-
-            style_hint_score, style_hint_profile = _style_hint_adjustment(entry=entry, style_terms=style_terms, style_hints=plan.style_hints)
-            if style_hint_score:
-                score_breakdown['style_hint_fit'] = style_hint_score
-
-            preferred_pack_score, preferred_pack_profile = _preferred_pack_adjustment(entry=entry, prefer_pack=plan.prefer_pack)
-            if preferred_pack_score:
-                score_breakdown['preferred_pack_fit'] = preferred_pack_score
-
+            lens_score, lens_profile = _selection_lens_adjustment(entry=entry, plan=plan)
+            effective_persona = compact_persona_dict(persona_context.get('effective_persona'))
+            session_persona = compact_persona_dict(persona_context.get('session_persona'))
+            recent_implicit_persona = compact_persona_dict((persona_context.get('recent_implicit_persona') or {}))
+            persona_affect_score, persona_affect_profile = _persona_affect_adjustment(entry=entry, persona=effective_persona)
+            persona_visual_score, persona_visual_profile = _persona_visual_identity_adjustment(entry=entry, persona=effective_persona)
+            style_hint_score, style_hint_profile = _style_hint_adjustment(
+                entry=entry,
+                style_terms=plan.style_request_terms(),
+                style_hints=plan.style_hints,
+            )
+            effective_pack = plan.prefer_pack or str(persona_visual_identity(effective_persona).get('prefer_pack') or '')
+            effective_cluster = plan.prefer_cluster or str(persona_visual_identity(effective_persona).get('prefer_cluster') or '')
+            preferred_pack_score, preferred_pack_profile = _preferred_pack_adjustment(entry=entry, prefer_pack=effective_pack)
             preferred_cluster_score, preferred_cluster_profile = _preferred_cluster_adjustment(
                 entry=entry,
-                prefer_cluster=plan.prefer_cluster,
+                prefer_cluster=effective_cluster,
                 cluster_profiles=getattr(self, 'cluster_style_profiles', {}),
             )
-            if preferred_cluster_score:
-                score_breakdown['preferred_cluster_fit'] = preferred_cluster_score
-
-            style_fit = session_style.style_bonus(
-                candidate_style_cluster=entry.style_cluster,
-                candidate_source_pack_id=entry.source_pack_id,
+            continuity_score, continuity_profile = _continuity_adjustment(
+                entry=entry,
+                session_style=session_style,
+                session_persona=session_persona,
+                recent_implicit_persona=recent_implicit_persona,
                 style_goal=plan.style_goal,
             )
-            if style_fit:
-                score_breakdown['style_memory_fit'] = style_fit
-
             safety_fit = _safety_fit_bonus(entry=entry, plan=plan)
-            if safety_fit:
-                score_breakdown['safety_fit'] = safety_fit
 
-            repeat_penalty = session_style.repeat_penalty(
+            delta_score, delta_profile = _query_delta_adjustment(entry=entry, query_delta=query_delta)
+
+            diversity_profile = session_style.repeat_penalty(
                 sticker_id=entry.sticker_id,
                 source_pack_id=entry.source_pack_id,
                 style_cluster=entry.style_cluster,
+                diversity_preference=plan.diversity_preference,
             )
-            if repeat_penalty:
-                score_breakdown['repeat_penalty'] = -repeat_penalty
-
-            total_score = sum(score_breakdown.values())
+            diversity_penalty = float(diversity_profile.get('penalty', 0.0) or 0.0)
             style_relation = session_style.relation(
                 candidate_style_cluster=entry.style_cluster,
                 candidate_source_pack_id=entry.source_pack_id,
                 style_goal=plan.style_goal,
             )
+            style_relation = {
+                **style_relation,
+                'matched_style_hints': style_hint_profile['matched'],
+                'missing_style_hints': style_hint_profile['missing'],
+                'preferred_pack_requested': preferred_pack_profile['requested'],
+                'preferred_pack_match': preferred_pack_profile['match_label'],
+                'preferred_pack_similarity': preferred_pack_profile['similarity'],
+                'preferred_pack_overlap': preferred_pack_profile['matched_terms'],
+                'preferred_cluster_requested': preferred_cluster_profile['requested'],
+                'preferred_cluster_match': preferred_cluster_profile['match_label'],
+                'preferred_cluster_similarity': preferred_cluster_profile['similarity'],
+                'preferred_cluster_overlap': preferred_cluster_profile['matched_terms'],
+            }
+
+            message_intent_score = semantic_score + _profile_detail_score(simple_profile, {'social_goal'}) + _profile_detail_score(lens_profile, {'social_read', 'subtext', 'avoid_misread_as'})
+            affect_score = visual_score + _profile_detail_score(simple_profile, {'emotion_tone', 'visual_hint'}) + _profile_detail_score(lens_profile, {'face_and_pose'}) + persona_affect_score
+            visual_identity_score = style_hint_score + preferred_pack_score + preferred_cluster_score + persona_visual_score
+            text_fit_score = text_bonus + text_constraint_score
+            freshness_score = -diversity_penalty
+            continuity_score += _profile_detail_score(lens_profile, {'continuity_note'})
+
+            if message_intent_score:
+                score_breakdown['message_intent_fit'] = round(message_intent_score, 4)
+            if affect_score:
+                score_breakdown['affect_fit'] = round(affect_score, 4)
+            if visual_identity_score:
+                score_breakdown['visual_identity_fit'] = round(visual_identity_score, 4)
+            if continuity_score:
+                score_breakdown['continuity_fit'] = round(continuity_score, 4)
+            if text_fit_score:
+                score_breakdown['text_fit'] = round(text_fit_score, 4)
+            if freshness_score:
+                score_breakdown['freshness_fit'] = round(freshness_score, 4)
+            if safety_fit:
+                score_breakdown['safety_fit'] = round(safety_fit, 4)
+            if delta_score:
+                score_breakdown['query_delta_fit'] = round(delta_score, 4)
+
+            total_score = sum(score_breakdown.values())
+            if semantic_score:
+                score_breakdown['semantic_axis_fit'] = round(semantic_score, 4)
+            if visual_score:
+                score_breakdown['visual_axis_fit'] = round(visual_score, 4)
+            if preferred_pack_score:
+                score_breakdown['preferred_pack_fit'] = round(preferred_pack_score, 4)
+            if preferred_cluster_score:
+                score_breakdown['preferred_cluster_fit'] = round(preferred_cluster_score, 4)
+            if diversity_penalty:
+                score_breakdown['variant_diversity_penalty'] = round(-diversity_penalty, 4)
             hard_mismatches = _hard_mismatches(plan=plan, style_relation=style_relation, semantic_profile=semantic_profile, visual_profile=visual_profile, text_profile=text_profile)
             reasons = {name: value for name, value in score_breakdown.items() if value}
             match_profile = {
+                'message_intent': {
+                    'score': round(message_intent_score, 4),
+                    'social_goal': simple_profile.get('details', {}).get('social_goal', {}),
+                    'semantic_axes': semantic_profile,
+                    'selection_lens': {
+                        key: lens_profile.get('details', {}).get(key, {})
+                        for key in ('social_read', 'subtext')
+                        if lens_profile.get('details', {}).get(key)
+                    },
+                },
+                'affect': {
+                    'score': round(affect_score, 4),
+                    'simple_hints': {
+                        key: simple_profile.get('details', {}).get(key, {})
+                        for key in ('emotion_tone', 'visual_hint')
+                        if simple_profile.get('details', {}).get(key)
+                    },
+                    'visual_axes': visual_profile,
+                    'selection_lens': {
+                        key: lens_profile.get('details', {}).get(key, {})
+                        for key in ('face_and_pose',)
+                        if lens_profile.get('details', {}).get(key)
+                    },
+                    'persona_affect': persona_affect_profile,
+                },
+                'visual_identity': {
+                    'score': round(visual_identity_score, 4),
+                    'style_hints': style_hint_profile,
+                    'persona_visual_identity': persona_visual_profile,
+                },
+                'simple_hints': simple_profile,
                 'semantic_axes': semantic_profile,
                 'visual_cues': visual_profile,
+                'selection_lens': lens_profile,
+                'persona_affect': persona_affect_profile,
+                'persona_visual_identity': persona_visual_profile,
                 'text_fit': text_profile,
-                'style_relation': {
-                    **style_relation,
-                    'matched_style_hints': style_hint_profile['matched'],
-                    'missing_style_hints': style_hint_profile['missing'],
-                    'preferred_pack_requested': preferred_pack_profile['requested'],
-                    'preferred_pack_match': preferred_pack_profile['match_label'],
-                    'preferred_pack_similarity': preferred_pack_profile['similarity'],
-                    'preferred_pack_overlap': preferred_pack_profile['matched_terms'],
-                    'preferred_cluster_requested': preferred_cluster_profile['requested'],
-                    'preferred_cluster_match': preferred_cluster_profile['match_label'],
-                    'preferred_cluster_similarity': preferred_cluster_profile['similarity'],
-                    'preferred_cluster_overlap': preferred_cluster_profile['matched_terms'],
-                },
+                'query_delta': delta_profile,
+                'style_relation': style_relation,
+                'continuity': continuity_profile,
                 'safety': {
                     'harshness_level': entry.harshness_level,
                     'intimacy_level': entry.intimacy_level,
                     'meme_dependence_level': entry.meme_dependence_level,
                     'limits': plan.intensity_limits.as_dict(),
                 },
+                'diversity_relation': diversity_profile,
                 'hard_mismatches': hard_mismatches,
             }
             scored.append(
@@ -374,7 +536,14 @@ class StickerCatalog:
                 )
             )
         scored.sort(key=lambda item: (-item.score, item.entry.relative_path))
-        return _select_with_style_goal(scored, top_k=plan.candidate_budget, session_style=session_style, style_goal=plan.style_goal)
+        selected = _select_with_style_goal(scored, top_k=plan.candidate_budget, session_style=session_style, style_goal=plan.style_goal)
+        if selected:
+            session_style.record_query(
+                query_bundle=plan.memory_query_bundle(),
+                shortlist_ids=[match.entry.sticker_id for match in selected],
+                shortlist_persona_snapshots=[_entry_persona_snapshot(match.entry) for match in selected],
+            )
+        return selected
 
     def record_selection(self, *, session_id: str, sticker_id: str) -> None:
         if not self._loaded:
@@ -382,10 +551,11 @@ class StickerCatalog:
         entry = self.entries_by_id.get(sticker_id)
         if entry is None:
             return
-        self.style_memory.get(session_id).record_selection(
+        self._ensure_session_state(session_id).record_selection(
             sticker_id=entry.sticker_id,
             source_pack_id=entry.source_pack_id,
             style_cluster=entry.style_cluster,
+            persona_snapshot=_entry_persona_snapshot(entry),
         )
 
     def _search_lexical(self, *, caption_query_text: str, sticker_query_text: str, caption_importance: str, allow_animation: bool, limit: int) -> list[Any]:
@@ -502,6 +672,253 @@ def _compatibility_adjustment(*, entry: StickerIndexEntry, plan: StickerRetrieva
     return score
 
 
+def _simple_hint_adjustment(*, entry: StickerIndexEntry, plan: StickerRetrievalPlan) -> tuple[float, dict[str, Any]]:
+    requested = {key: value for key, value in plan.simple_hints.as_dict().items() if key != 'diversity_preference' and value}
+    if not requested:
+        return 0.0, {'requested': {}, 'matched': [], 'missing': [], 'details': {}}
+    details: dict[str, Any] = {}
+    matched: list[str] = []
+    missing: list[str] = []
+    total = 0.0
+    sources = _simple_hint_sources(entry)
+    for field_name, request_text in requested.items():
+        score, detail = _score_requested_field(
+            request_text,
+            sources.get(field_name, []),
+            full_match_score=0.24,
+            partial_base=0.09,
+            partial_scale=0.13,
+            miss_penalty=-0.04,
+        )
+        detail['score'] = round(score, 4)
+        details[field_name] = detail
+        total += score
+        if score > 0:
+            matched.append(field_name)
+        else:
+            missing.append(field_name)
+    return total, {'requested': requested, 'matched': matched, 'missing': missing, 'details': details}
+
+
+def _selection_lens_adjustment(*, entry: StickerIndexEntry, plan: StickerRetrievalPlan) -> tuple[float, dict[str, Any]]:
+    requested = {key: value for key, value in plan.selection_lens.as_dict().items() if value}
+    if not requested:
+        return 0.0, {'requested': {}, 'matched': [], 'missing': [], 'details': {}}
+    details: dict[str, Any] = {}
+    matched: list[str] = []
+    missing: list[str] = []
+    total = 0.0
+    sources = _selection_lens_sources(entry)
+    for field_name, request_text in requested.items():
+        miss_penalty = -0.06 if field_name == 'avoid_misread_as' else -0.02
+        score, detail = _score_requested_field(
+            request_text,
+            sources.get(field_name, []),
+            full_match_score=0.16,
+            partial_base=0.06,
+            partial_scale=0.10,
+            miss_penalty=miss_penalty,
+        )
+        if field_name == 'avoid_misread_as' and score > 0:
+            score = -abs(score)
+        detail['score'] = round(score, 4)
+        details[field_name] = detail
+        total += score
+        if score > 0:
+            matched.append(field_name)
+        elif score < 0:
+            missing.append(field_name)
+    return total, {'requested': requested, 'matched': matched, 'missing': missing, 'details': details}
+
+
+def _profile_detail_score(profile: dict[str, Any], field_names: set[str]) -> float:
+    details = dict(profile.get('details') or {})
+    total = 0.0
+    for field_name in field_names:
+        detail = dict(details.get(field_name) or {})
+        try:
+            total += float(detail.get('score', 0.0) or 0.0)
+        except Exception:
+            total += 0.0
+    return total
+
+
+def _persona_affect_adjustment(*, entry: StickerIndexEntry, persona: dict[str, Any]) -> tuple[float, dict[str, Any]]:
+    affect = persona_affect_profile(persona)
+    if not affect:
+        return 0.0, {'requested': {}, 'matched': [], 'missing': [], 'details': {}}
+    details: dict[str, Any] = {}
+    matched: list[str] = []
+    missing: list[str] = []
+    total = 0.0
+    sources = _persona_affect_sources(entry)
+    for field_name, request_text in affect.items():
+        score, detail = _score_requested_field(
+            str(request_text),
+            sources.get(field_name, []),
+            full_match_score=0.14,
+            partial_base=0.05,
+            partial_scale=0.07,
+            miss_penalty=0.0,
+        )
+        detail['score'] = round(score, 4)
+        details[field_name] = detail
+        total += score
+        if score > 0:
+            matched.append(field_name)
+        else:
+            missing.append(field_name)
+    return total, {'requested': affect, 'matched': matched, 'missing': missing, 'details': details}
+
+
+def _persona_visual_identity_adjustment(*, entry: StickerIndexEntry, persona: dict[str, Any]) -> tuple[float, dict[str, Any]]:
+    visual = persona_visual_identity(persona)
+    if not visual:
+        return 0.0, {'requested': {}, 'matched': [], 'missing': [], 'details': {}}
+    details: dict[str, Any] = {}
+    matched: list[str] = []
+    missing: list[str] = []
+    total = 0.0
+    sources = _persona_visual_identity_sources(entry)
+    for field_name, request_text in visual.items():
+        if field_name in {'style_hints', 'prefer_pack', 'prefer_cluster'}:
+            continue
+        score, detail = _score_requested_field(
+            str(request_text),
+            sources.get(field_name, []),
+            full_match_score=0.14,
+            partial_base=0.05,
+            partial_scale=0.08,
+            miss_penalty=0.0,
+        )
+        detail['score'] = round(score, 4)
+        details[field_name] = detail
+        total += score
+        if score > 0:
+            matched.append(field_name)
+        else:
+            missing.append(field_name)
+    style_hints = list(visual.get('style_hints') or [])
+    if style_hints:
+        style_score, style_profile = _style_hint_adjustment(entry=entry, style_terms=_tokenize(style_hints), style_hints=style_hints)
+        total += style_score * 0.8
+        details['style_hints'] = {'requested': style_hints, 'matched': style_profile['matched'], 'missing': style_profile['missing'], 'score': round(style_score * 0.8, 4)}
+        if style_profile['matched']:
+            matched.append('style_hints')
+        elif style_profile['missing']:
+            missing.append('style_hints')
+    return total, {'requested': visual, 'matched': matched, 'missing': missing, 'details': details}
+
+
+def _continuity_adjustment(
+    *,
+    entry: StickerIndexEntry,
+    session_style: SessionStyleState,
+    session_persona: dict[str, Any],
+    recent_implicit_persona: dict[str, Any],
+    style_goal: str,
+) -> tuple[float, dict[str, Any]]:
+    allow_persona_continuity = normalize_style_goal(style_goal) not in {'prefer_switch', 'ignore_style'}
+    style_memory_fit = session_style.style_bonus(
+        candidate_style_cluster=entry.style_cluster,
+        candidate_source_pack_id=entry.source_pack_id,
+        style_goal=style_goal,
+    )
+    explicit_bonus = 0.0
+    explicit_profile: dict[str, Any] = {'used': False}
+    if allow_persona_continuity and persona_has_values(session_persona):
+        explicit_bonus, explicit_profile = _persona_alignment_adjustment(entry=entry, persona=session_persona, full_match_score=0.10, partial_base=0.03, partial_scale=0.05)
+        explicit_profile['used'] = True
+    implicit_bonus = 0.0
+    implicit_profile: dict[str, Any] = {'used': False}
+    if allow_persona_continuity and not persona_has_values(session_persona) and persona_has_values(recent_implicit_persona):
+        implicit_bonus, implicit_profile = _persona_alignment_adjustment(entry=entry, persona=recent_implicit_persona, full_match_score=0.08, partial_base=0.03, partial_scale=0.04)
+        implicit_profile['used'] = True
+    total = style_memory_fit + explicit_bonus + implicit_bonus
+    note = (
+        'stored session persona is active'
+        if explicit_profile.get('used')
+        else 'recent stickers provide a slight persona continuity nudge'
+        if implicit_profile.get('used')
+        else 'no persona continuity anchor'
+    )
+    return total, {
+        'style_memory_fit': round(style_memory_fit, 4),
+        'session_persona_fit': round(explicit_bonus, 4),
+        'recent_implicit_fit': round(implicit_bonus, 4),
+        'session_persona_used': explicit_profile.get('used', False),
+        'recent_implicit_used': implicit_profile.get('used', False),
+        'session_persona_profile': explicit_profile,
+        'recent_implicit_profile': implicit_profile,
+        'note': note,
+    }
+
+
+def _persona_alignment_adjustment(
+    *,
+    entry: StickerIndexEntry,
+    persona: dict[str, Any],
+    full_match_score: float,
+    partial_base: float,
+    partial_scale: float,
+) -> tuple[float, dict[str, Any]]:
+    requested = merge_persona_dicts(persona, {})
+    visual = persona_visual_identity(requested)
+    affect = persona_affect_profile(requested)
+    details: dict[str, Any] = {}
+    matched: list[str] = []
+    total = 0.0
+    visual_sources = _persona_visual_identity_sources(entry)
+    affect_sources = _persona_affect_sources(entry)
+    for field_name, request_text in visual.items():
+        if field_name in {'style_hints', 'prefer_pack', 'prefer_cluster'}:
+            continue
+        score, detail = _score_requested_field(
+            str(request_text),
+            visual_sources.get(field_name, []),
+            full_match_score=full_match_score,
+            partial_base=partial_base,
+            partial_scale=partial_scale,
+            miss_penalty=0.0,
+        )
+        detail['score'] = round(score, 4)
+        details[field_name] = detail
+        total += score
+        if score > 0:
+            matched.append(field_name)
+    for field_name, request_text in affect.items():
+        score, detail = _score_requested_field(
+            str(request_text),
+            affect_sources.get(field_name, []),
+            full_match_score=full_match_score,
+            partial_base=partial_base,
+            partial_scale=partial_scale,
+            miss_penalty=0.0,
+        )
+        detail['score'] = round(score, 4)
+        details[field_name] = detail
+        total += score
+        if score > 0:
+            matched.append(field_name)
+    if visual.get('prefer_pack'):
+        pack_score, pack_profile = _preferred_pack_adjustment(entry=entry, prefer_pack=str(visual.get('prefer_pack')))
+        total += max(0.0, pack_score) * 0.45
+        details['prefer_pack'] = {'score': round(max(0.0, pack_score) * 0.45, 4), **pack_profile}
+        if pack_score > 0:
+            matched.append('prefer_pack')
+    if visual.get('prefer_cluster'):
+        cluster_score, cluster_profile = _preferred_cluster_adjustment(
+            entry=entry,
+            prefer_cluster=str(visual.get('prefer_cluster')),
+            cluster_profiles={},
+        )
+        total += max(0.0, cluster_score) * 0.45
+        details['prefer_cluster'] = {'score': round(max(0.0, cluster_score) * 0.45, 4), **cluster_profile}
+        if cluster_score > 0:
+            matched.append('prefer_cluster')
+    return total, {'requested': requested, 'matched': matched, 'details': details}
+
+
 def _select_with_style_goal(scored: list[StickerMatch], *, top_k: int, session_style: SessionStyleState, style_goal: str) -> list[StickerMatch]:
     if not scored:
         return []
@@ -571,6 +988,37 @@ def _select_with_style_goal(scored: list[StickerMatch], *, top_k: int, session_s
 
 def _select_with_style_policy(scored: list[StickerMatch], *, top_k: int, session_style: SessionStyleState, style_policy: str) -> list[StickerMatch]:
     return _select_with_style_goal(scored, top_k=top_k, session_style=session_style, style_goal=style_policy)
+
+
+def _query_delta_adjustment(*, entry: StickerIndexEntry, query_delta: dict[str, Any]) -> tuple[float, dict[str, Any]]:
+    changed = dict(query_delta.get('changed_values') or {})
+    if not changed:
+        return 0.0, {'changed_fields': [], 'matched': [], 'details': {}}
+    sources = _simple_hint_sources(entry)
+    total = 0.0
+    matched: list[str] = []
+    details: dict[str, Any] = {}
+    for field_name, request_text in changed.items():
+        if field_name not in sources:
+            continue
+        score, detail = _score_requested_field(
+            request_text,
+            sources.get(field_name, []),
+            full_match_score=0.12,
+            partial_base=0.04,
+            partial_scale=0.07,
+            miss_penalty=0.0,
+        )
+        detail['score'] = round(score, 4)
+        details[field_name] = detail
+        total += score
+        if score > 0:
+            matched.append(field_name)
+    return total, {
+        'changed_fields': list(query_delta.get('changed_fields') or []),
+        'matched': matched,
+        'details': details,
+    }
 
 
 def _semantic_axis_adjustment(*, entry: StickerIndexEntry, plan: StickerRetrievalPlan) -> tuple[float, dict[str, Any]]:
@@ -826,12 +1274,22 @@ def _hard_mismatches(*, plan: StickerRetrievalPlan, style_relation: dict[str, An
 
 def _build_selection_summary(*, entry: StickerIndexEntry, plan: StickerRetrievalPlan, match_profile: dict[str, Any]) -> str:
     parts: list[str] = []
+    simple_profile = match_profile.get('simple_hints', {})
     semantic_profile = match_profile['semantic_axes']
     visual_profile = match_profile['visual_cues']
     text_profile = match_profile['text_fit']
     style_relation = match_profile['style_relation']
+    continuity = match_profile.get('continuity', {})
+    selection_lens = match_profile.get('selection_lens', {})
+    diversity_relation = match_profile.get('diversity_relation', {})
+    matched_simple = simple_profile.get('matched', [])
     matched_semantic = semantic_profile.get('matched', [])
     matched_visual = visual_profile.get('matched', [])
+    if matched_simple:
+        requested = simple_profile.get('requested', {})
+        phrases = [requested[field] for field in matched_simple[:2] if requested.get(field)]
+        if phrases:
+            parts.append('matches: ' + ', '.join(phrases))
     if matched_semantic:
         requested = semantic_profile.get('requested', {})
         phrases = [requested[field] for field in matched_semantic[:2] if requested.get(field)]
@@ -844,6 +1302,11 @@ def _build_selection_summary(*, entry: StickerIndexEntry, plan: StickerRetrieval
         phrases = [requested[field] for field in matched_visual[:2] if requested.get(field)]
         if phrases:
             parts.append('visual cues: ' + ', '.join(phrases))
+    lens_details = selection_lens.get('details', {})
+    if lens_details.get('social_read', {}).get('score', 0.0) > 0:
+        parts.append('social read matches the intended subtext')
+    elif lens_details.get('subtext', {}).get('score', 0.0) > 0:
+        parts.append('subtext lands correctly')
     if text_profile.get('matched_must_include'):
         parts.append('caption supports: ' + ', '.join(text_profile['matched_must_include'][:2]))
     elif text_profile.get('has_visible_text') and plan.text_priority != 'ignore':
@@ -869,11 +1332,99 @@ def _build_selection_summary(*, entry: StickerIndexEntry, plan: StickerRetrieval
         parts.append('intentionally switches style')
     elif relation_label == 'style_switch' and plan.style_goal == 'keep_current':
         parts.append('switches style despite the continuity preference')
+    if diversity_relation.get('mode') == 'prefer_fresh_variant':
+        labels = diversity_relation.get('labels') or []
+        if not labels:
+            parts.append('fresh relative to recent sticker variants')
+        elif 'recently_sent_exact_sticker' in labels:
+            parts.append('de-weighted because it was sent recently')
+        elif 'recently_surfaced_exact_sticker' in labels:
+            parts.append('slightly de-weighted because it was already surfaced recently')
+    if continuity.get('session_persona_used'):
+        parts.append('aligns with the stored sticker persona')
+    elif continuity.get('recent_implicit_used'):
+        parts.append('leans toward recent sticker continuity')
     tone = str(entry.sticker_card.get('fused_pragmatic_meaning') or entry.summary or entry.preview_text or 'Sticker choice').strip().rstrip('.')
     detail = '; '.join(parts[:3]).strip()
     if detail:
         return f'{tone}. {detail}.'
     return tone + '.'
+
+
+def _simple_hint_sources(entry: StickerIndexEntry) -> dict[str, list[str]]:
+    return {
+        'emotion_tone': [
+            entry.sticker_card.get('sticker_emotional_valence', ''),
+            entry.subtle_cue_card.get('visual_emotional_valence', ''),
+            entry.sticker_card.get('sticker_visual_emotion', ''),
+            entry.sticker_card.get('fused_pragmatic_meaning', ''),
+            entry.summary,
+        ],
+        'social_goal': [
+            entry.sticker_card.get('fused_pragmatic_meaning', ''),
+            entry.caption_card.get('caption_pragmatic_meaning', ''),
+            entry.caption_card.get('caption_social_stance', ''),
+            entry.sticker_card.get('sticker_reaction_type', ''),
+            entry.summary,
+        ],
+        'visual_hint': [
+            entry.subtle_cue_card.get('dominant_signal', ''),
+            entry.subtle_cue_card.get('eye_signal', ''),
+            entry.subtle_cue_card.get('mouth_signal', ''),
+            entry.subtle_cue_card.get('motion_signal', ''),
+            entry.sticker_card.get('sticker_delivery_style', ''),
+            entry.sticker_card.get('sticker_humor_style', ''),
+        ],
+        'text_hint': [
+            entry.source_overlay_text_normalized,
+            entry.caption_meaning_en,
+            entry.caption_meaning_zh,
+            entry.caption_semantic_text,
+            entry.caption_card.get('caption_literal_meaning', ''),
+            entry.caption_card.get('caption_pragmatic_meaning', ''),
+        ],
+    }
+
+
+def _selection_lens_sources(entry: StickerIndexEntry) -> dict[str, list[str]]:
+    return {
+        'social_read': [
+            entry.caption_card.get('caption_pragmatic_meaning', ''),
+            entry.caption_card.get('caption_social_stance', ''),
+            entry.subtle_cue_card.get('visual_social_stance', ''),
+            entry.sticker_card.get('fused_pragmatic_meaning', ''),
+            entry.summary,
+        ],
+        'subtext': [
+            entry.sticker_card.get('fused_pragmatic_meaning', ''),
+            entry.caption_card.get('caption_pragmatic_meaning', ''),
+            entry.sticker_card.get('sticker_irony_strength', ''),
+            entry.sticker_card.get('sticker_humor_style', ''),
+            entry.caption_card.get('caption_use_when', ''),
+            entry.sticker_card.get('sticker_use_when', ''),
+        ],
+        'face_and_pose': [
+            entry.subtle_cue_card.get('dominant_signal', ''),
+            entry.subtle_cue_card.get('micro_expression', ''),
+            entry.subtle_cue_card.get('eye_signal', ''),
+            entry.subtle_cue_card.get('mouth_signal', ''),
+            entry.subtle_cue_card.get('pose_signal', ''),
+            entry.subtle_cue_card.get('motion_signal', ''),
+            entry.sticker_card.get('sticker_visual_emotion', ''),
+        ],
+        'continuity_note': [
+            entry.style_cluster or '',
+            entry.source_pack_id or '',
+            _entry_style_text(entry),
+        ],
+        'avoid_misread_as': [
+            entry.sticker_card.get('fused_pragmatic_meaning', ''),
+            entry.caption_card.get('caption_pragmatic_meaning', ''),
+            entry.sticker_card.get('sticker_reaction_type', ''),
+            entry.sticker_card.get('sticker_humor_style', ''),
+            entry.summary,
+        ],
+    }
 
 
 def _semantic_axis_sources(entry: StickerIndexEntry) -> dict[str, list[str]]:
@@ -948,6 +1499,86 @@ def _visual_axis_sources(entry: StickerIndexEntry) -> dict[str, list[str]]:
             entry.style_card.get('meme_intensity', ''),
         ],
     }
+
+
+def _persona_visual_identity_sources(entry: StickerIndexEntry) -> dict[str, list[str]]:
+    return {
+        'character_archetype': [
+            entry.style_card.get('style_character_family', ''),
+            entry.style_text,
+            entry.summary,
+        ],
+        'rendering_style': [
+            entry.style_card.get('style_rendering_type', ''),
+            entry.style_card.get('line_weight', ''),
+            entry.style_text,
+        ],
+        'palette_mood': [
+            entry.style_card.get('style_palette_family', ''),
+            entry.style_text,
+        ],
+    }
+
+
+def _persona_affect_sources(entry: StickerIndexEntry) -> dict[str, list[str]]:
+    return {
+        'default_tone': [
+            entry.sticker_card.get('sticker_emotional_valence', ''),
+            entry.subtle_cue_card.get('visual_emotional_valence', ''),
+            entry.sticker_card.get('sticker_visual_emotion', ''),
+            entry.sticker_card.get('fused_pragmatic_meaning', ''),
+        ],
+        'expression_bias': [
+            entry.subtle_cue_card.get('micro_expression', ''),
+            entry.subtle_cue_card.get('dominant_signal', ''),
+            entry.subtle_cue_card.get('eye_signal', ''),
+            entry.subtle_cue_card.get('mouth_signal', ''),
+        ],
+        'pose_bias': [
+            entry.subtle_cue_card.get('pose_signal', ''),
+            entry.subtle_cue_card.get('motion_signal', ''),
+            entry.subtle_cue_card.get('head_signal', ''),
+            entry.subtle_cue_card.get('hand_signal', ''),
+        ],
+        'delivery_bias': [
+            entry.sticker_card.get('sticker_delivery_style', ''),
+            entry.sticker_card.get('sticker_general_usefulness', ''),
+        ],
+        'humor_bias': [
+            entry.sticker_card.get('sticker_humor_style', ''),
+            entry.sticker_card.get('fused_pragmatic_meaning', ''),
+            entry.style_card.get('meme_intensity', ''),
+        ],
+    }
+
+
+def _entry_persona_snapshot(entry: StickerIndexEntry) -> dict[str, Any]:
+    return build_persona_dict(
+        visual_identity={
+            'character_archetype': entry.style_card.get('style_character_family', ''),
+            'rendering_style': entry.style_card.get('style_rendering_type', ''),
+            'palette_mood': entry.style_card.get('style_palette_family', ''),
+            'style_hints': [
+                value
+                for value in [
+                    entry.style_card.get('style_rendering_type', ''),
+                    entry.style_card.get('style_palette_family', ''),
+                    entry.style_card.get('line_weight', ''),
+                    entry.style_card.get('style_character_family', ''),
+                ]
+                if str(value or '').strip()
+            ],
+            'prefer_pack': entry.source_pack_id or '',
+            'prefer_cluster': entry.style_cluster or '',
+        },
+        affect_profile={
+            'default_tone': entry.sticker_card.get('sticker_emotional_valence', '') or entry.subtle_cue_card.get('visual_emotional_valence', ''),
+            'expression_bias': entry.subtle_cue_card.get('micro_expression', '') or entry.subtle_cue_card.get('dominant_signal', ''),
+            'pose_bias': entry.subtle_cue_card.get('pose_signal', '') or entry.subtle_cue_card.get('motion_signal', ''),
+            'delivery_bias': entry.sticker_card.get('sticker_delivery_style', ''),
+            'humor_bias': entry.sticker_card.get('sticker_humor_style', ''),
+        },
+    )
 
 
 def _score_requested_field(

@@ -50,12 +50,15 @@ def build_system_prompt(settings: SessionSettings) -> str:
         sticker_guidance = (
             'Two sticker tools are available: sticker_query and sticker_send_selected. Use them sparingly when a sticker adds a precise social reaction that plain text alone would not. '
             'Query first, inspect the ranked shortlist, then explicitly send one sticker by sticker_id. '
-            'When querying, always provide intent_core and add secondary_goals only when they materially refine the reaction. '
-            'Use semantic_focus for reaction_type, reply_force, emotional_valence, irony_strength, social_stance, conversation_role, or relationship_fit when those details matter. '
-            'Use visual_focus for eye_signal, mouth_signal, motion_signal, delivery_style, or humor_style when subtle expression matters. '
-            'Use text_constraints when visible overlay text should dominate, must include a certain meaning, or avoid a certain meaning. '
-            'Use style_focus.style_goal=keep_current by default, add style_hints only when you know the visual family you want, add style_focus.prefer_pack when you want a specific pack or nearby pack family, add style_focus.prefer_cluster when you want one style cluster or nearby cluster family, and inspect style_context plus each candidate score_breakdown and match_profile before sending. '
-            'Default to static stickers unless intensity_limits.allow_animation=true is materially better.'
+            'When querying, always provide intent_core and usually stop there. Add at most one or two simple helper hints only when they clearly matter: emotion_tone, social_goal, visual_hint, text_hint, prefer_pack, or prefer_cluster. '
+            'Think in this order when choosing stickers: what social message it sends, what hidden subtext or implication it carries, what face and pose deliver that, what visual family it should stay in, and only then how different it should be from recent stickers. '
+            'Use persona when the sticker should keep a recurring visual family or expressive bias across the session. '
+            'Use selection_lens when subtle human factors matter, such as social read, hidden implication, face-and-pose delivery, continuity note, or avoid_misread_as. '
+            'Use diversity_preference=prefer_fresh_variant only when the reaction is close to a recent one but a slightly different suitable variant is preferable. '
+            'Use advanced only when you intentionally need axis-level control such as semantic_focus, visual_focus, text_constraints, or style_focus.style_goal. '
+            'Do not put usernames, bot names, mentions, ids, paths, or tool names into sticker intent fields. '
+            'Inspect selection_summary, social_read, expression_fit, persona_fit, continuity_note, fit_signals, and warnings first. Use candidate.debug.score_breakdown only when you need to compare close alternatives. '
+            'Default to static stickers unless allow_animation=true or advanced.intensity_limits.allow_animation=true is materially better.'
         )
 
 
