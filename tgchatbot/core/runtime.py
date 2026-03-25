@@ -33,7 +33,7 @@ from tgchatbot.domain.models import (
     TurnResult,
 )
 from tgchatbot.logging_config import clip_for_log
-from tgchatbot.providers.base import ModelProvider
+from tgchatbot.providers.base import ModelProvider, RequestTokenEstimate
 from tgchatbot.settings_schema import (
     COMPACT_KEEP_RECENT_RATIO_MAX,
     COMPACT_KEEP_RECENT_RATIO_MIN,
@@ -62,7 +62,7 @@ from tgchatbot.settings_schema import (
     format_optional_disabled_int,
 )
 from tgchatbot.storage.sqlite_store import SQLiteStore
-from tgchatbot.tools.base import ToolContext
+from tgchatbot.tools.base import ToolContext, ToolSpec
 from tgchatbot.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -83,6 +83,7 @@ class AgentRuntime:
         self.tool_registry = tool_registry
         self.providers = providers
         self._live_sessions: dict[str, LiveConversationState] = {}
+        self._request_estimate_bias: dict[tuple[str, str, str], float] = {}
 
     @staticmethod
     def _session_log_id(session_id: str) -> str:
@@ -248,8 +249,20 @@ class AgentRuntime:
             else []
         )
         latest_preview = self._message_text_preview(state.raw_messages[-1].message) if state.raw_messages else ''
-        est_ctx_tokens = state.estimated_tokens
-        est_req_tokens = self._estimate_request_tokens(state, instructions, len(tools))
+        est_ctx_tokens = self._estimate_request_breakdown(
+            state=state,
+            settings=settings,
+            provider=provider,
+            instructions='',
+            tools=[],
+        ).history_tokens
+        est_req_tokens = self._estimate_request_breakdown(
+            state=state,
+            settings=settings,
+            provider=provider,
+            instructions=instructions,
+            tools=tools,
+        ).total_tokens
         logger.info(
             'turn.start sid=%s trigger=%s provider=%s/%s mode=%s rounds=%s raw=%s blocks=%s est_ctx=%s est_req=%s preview=%s',
             self._session_log_id(session_id),
@@ -270,7 +283,7 @@ class AgentRuntime:
             provider=provider,
             state=state,
             instructions=instructions,
-            tool_count=len(tools),
+            tools=tools,
             emit=emit,
         )
 
@@ -291,8 +304,38 @@ class AgentRuntime:
                 # per the runtime audit notes, forces a best-effort final reply instead of letting the
                 # model extend the same user turn forever with more tool calls.
                 iteration_instructions = instructions + "\n\n[Internal control note]: this is the final interaction round for this turn. Keep the established personality and preset voice exactly as intended by the system prompt. This note is not a user message. Do not call any more tools. Use the conversation so far and give the best final reply now."
-            extra_token_estimate = TokenEstimator.estimate_text(json.dumps(accumulated_items, ensure_ascii=False)) if accumulated_items else 0
-            logger.info('turn.iter sid=%s step=%s/%s final=%s tools=%s extra=%s est_req=%s', self._session_log_id(session_id), iteration + 1, total_steps, int(final_iteration), len(current_tools), len(accumulated_items), self._estimate_request_tokens(state, iteration_instructions, len(current_tools)) + extra_token_estimate)
+            raw_request_estimate = provider.estimate_request_tokens(
+                settings=settings,
+                messages=history,
+                instructions=iteration_instructions,
+                tools=current_tools,
+                extra_input_items=accumulated_items or None,
+                history_tokens_override=self._estimate_history_tokens_for_messages(
+                    state=state,
+                    provider=provider,
+                    settings=settings,
+                    selected_blocks=self._select_blocks_for_prompt(state, settings=settings),
+                    messages=history,
+                ),
+            )
+            adjusted_request_estimate = self._apply_request_estimate_bias(
+                raw_request_estimate,
+                provider_name=provider.name,
+                model=settings.model,
+                tool_history_mode=settings.tool_history_mode,
+            )
+            logger.info(
+                'turn.iter sid=%s step=%s/%s final=%s tools=%s extra=%s est_req=%s raw_req=%s bias=%.3f',
+                self._session_log_id(session_id),
+                iteration + 1,
+                total_steps,
+                int(final_iteration),
+                len(current_tools),
+                len(accumulated_items),
+                adjusted_request_estimate.total_tokens,
+                raw_request_estimate.total_tokens,
+                self._request_estimate_bias_for(provider_name=provider.name, model=settings.model, tool_history_mode=settings.tool_history_mode),
+            )
             if emit and settings.process_visibility != ProcessVisibility.OFF:
                 await emit(RuntimeEvent(kind='phase', title='Step', detail=f'iteration {iteration + 1}/{total_steps}'))
 
@@ -305,6 +348,13 @@ class AgentRuntime:
                 extra_input_items=accumulated_items or None,
             )
             last_usage = response.usage
+            self._update_request_estimate_bias(
+                provider_name=provider.name,
+                model=settings.model,
+                tool_history_mode=settings.tool_history_mode,
+                raw_estimate_total=raw_request_estimate.total_tokens,
+                actual_input_tokens=getattr(last_usage, 'input_tokens', None),
+            )
             logger.info('turn.model sid=%s step=%s/%s tool_calls=%s native_calls=%s continue=%s text_chars=%s usage=%s', self._session_log_id(session_id), iteration + 1, total_steps, len(response.tool_calls), len(getattr(response, 'native_tool_calls', []) or []), len(response.continuation_items), len(response.final_text or ''), self._usage_log_text(last_usage))
 
             if emit and settings.process_visibility in {ProcessVisibility.VERBOSE, ProcessVisibility.FULL}:
@@ -443,7 +493,10 @@ class AgentRuntime:
         state = await self._get_live_state(session_id)
         settings = await self.store.get_or_create_session(session_id, self.config.default_session_settings())
         provider = self._require_provider(settings.provider)
-        tool_count = len(self.tool_registry.list_tools(allow_python_exec=policy_for_mode(settings.mode).allow_python_exec, allow_stickers=(settings.sticker_mode == StickerMode.AUTO)))
+        tools = self.tool_registry.list_tools(
+            allow_python_exec=policy_for_mode(settings.mode).allow_python_exec,
+            allow_stickers=(settings.sticker_mode == StickerMode.AUTO),
+        )
         instructions = build_system_prompt(settings)
         sticker_stats = self.tool_registry.sticker_catalog.stats()
         remote = self.tool_registry.remote_workspace
@@ -454,6 +507,13 @@ class AgentRuntime:
         native_web_search_max = self._effective_native_web_search_max(settings)
         max_input_images = self._effective_max_input_images(provider, settings)
         compact_target_images = self._effective_compact_target_images(provider, settings)
+        request_estimate = self._estimate_request_breakdown(
+            state=state,
+            settings=settings,
+            provider=provider,
+            instructions=instructions,
+            tools=tools,
+        )
         return {
             'provider': settings.provider,
             'model': settings.model,
@@ -533,8 +593,8 @@ class AgentRuntime:
             'raw_messages': len(state.raw_messages),
             'tool_history_messages': sum(1 for item in state.raw_messages if item.message.role == MessageRole.TOOL),
             'memory_blocks': len(state.blocks),
-            'estimated_history_tokens': state.estimated_tokens,
-            'estimated_request_tokens': self._estimate_request_tokens(state, instructions, tool_count),
+            'estimated_history_tokens': request_estimate.history_tokens,
+            'estimated_request_tokens': request_estimate.total_tokens,
             'estimated_request_images': self._estimate_request_images(state),
             'max_input_images': format_optional_disabled_int(max_input_images, disabled_label='unlimited'),
             'max_input_images_source': 'session' if settings.max_input_images is not None else 'default',
@@ -747,10 +807,190 @@ class AgentRuntime:
         state.estimated_images += stored_message.image_count
         state.provider_history_dirty = True
         state.provider_history_cache_key = None
+        state.provider_history_token_cache.clear()
 
     @staticmethod
     def _clone_message(message: ConversationMessage, *, metadata: dict[str, Any] | None = None) -> ConversationMessage:
         return ConversationMessage(role=message.role, parts=list(message.parts), name=message.name, metadata=metadata if metadata is not None else dict(message.metadata or {}))
+
+    @staticmethod
+    def _history_cache_key(
+        *,
+        provider_name: str,
+        model: str,
+        tool_history_mode: ToolHistoryMode,
+        selected_block_ids: tuple[int, ...],
+        latest_id: int,
+    ) -> tuple[str, str, str, tuple[int, ...], int]:
+        return (provider_name, model, tool_history_mode.value, selected_block_ids, latest_id)
+
+    @staticmethod
+    def _request_estimate_bias_key(*, provider_name: str, model: str, tool_history_mode: ToolHistoryMode) -> tuple[str, str, str]:
+        return (provider_name, model, tool_history_mode.value)
+
+    def _request_estimate_bias_for(self, *, provider_name: str, model: str, tool_history_mode: ToolHistoryMode) -> float:
+        key = self._request_estimate_bias_key(provider_name=provider_name, model=model, tool_history_mode=tool_history_mode)
+        return max(1.0, float(self._request_estimate_bias.get(key, 1.0)))
+
+    def _apply_request_estimate_bias(
+        self,
+        estimate: RequestTokenEstimate,
+        *,
+        provider_name: str,
+        model: str,
+        tool_history_mode: ToolHistoryMode,
+    ) -> RequestTokenEstimate:
+        multiplier = self._request_estimate_bias_for(provider_name=provider_name, model=model, tool_history_mode=tool_history_mode)
+        return estimate.scaled(multiplier) if multiplier > 1.0 else estimate
+
+    def _update_request_estimate_bias(
+        self,
+        *,
+        provider_name: str,
+        model: str,
+        tool_history_mode: ToolHistoryMode,
+        raw_estimate_total: int,
+        actual_input_tokens: int | None,
+    ) -> None:
+        actual = int(actual_input_tokens or 0)
+        if actual <= 0 or raw_estimate_total <= 0:
+            return
+        key = self._request_estimate_bias_key(provider_name=provider_name, model=model, tool_history_mode=tool_history_mode)
+        current = max(1.0, float(self._request_estimate_bias.get(key, 1.0)))
+        target = min(4.0, max(1.0, (float(actual) / float(max(1, raw_estimate_total))) * 1.05))
+        if target <= current:
+            return
+        updated = max(current, min(4.0, (current * 0.75) + (target * 0.25)))
+        self._request_estimate_bias[key] = updated
+        logger.debug(
+            'estimate.bias provider=%s model=%s mode=%s raw=%s actual=%s bias=%.3f->%.3f',
+            provider_name,
+            model,
+            tool_history_mode.value,
+            raw_estimate_total,
+            actual,
+            current,
+            updated,
+        )
+
+    def _estimate_history_tokens_for_messages(
+        self,
+        *,
+        state: LiveConversationState,
+        provider: ModelProvider,
+        settings: SessionSettings,
+        selected_blocks: list[MemoryBlock],
+        messages: list[ConversationMessage],
+    ) -> int:
+        latest_id = state.raw_messages[-1].db_id if state.raw_messages else 0
+        cache_key = self._history_cache_key(
+            provider_name=provider.name,
+            model=settings.model,
+            tool_history_mode=settings.tool_history_mode,
+            selected_block_ids=tuple(block.block_id for block in selected_blocks),
+            latest_id=latest_id,
+        )
+        cached = state.provider_history_token_cache.get(cache_key)
+        if cached is not None:
+            return int(cached)
+        estimate = provider.estimate_request_tokens(
+            settings=settings,
+            messages=messages,
+            instructions='',
+            tools=[],
+        )
+        state.provider_history_token_cache[cache_key] = int(estimate.history_tokens)
+        return int(estimate.history_tokens)
+
+    def _estimate_request_breakdown(
+        self,
+        *,
+        state: LiveConversationState,
+        settings: SessionSettings,
+        provider: ModelProvider,
+        instructions: str,
+        tools: list[ToolSpec],
+        extra_input_items: list[dict] | None = None,
+    ) -> RequestTokenEstimate:
+        history = self._build_provider_history(state, settings=settings, provider_name=provider.name)
+        selected_blocks = self._select_blocks_for_prompt(state, settings=settings)
+        history_tokens = self._estimate_history_tokens_for_messages(
+            state=state,
+            provider=provider,
+            settings=settings,
+            selected_blocks=selected_blocks,
+            messages=history,
+        )
+        raw_estimate = provider.estimate_request_tokens(
+            settings=settings,
+            messages=history,
+            instructions=instructions,
+            tools=tools,
+            extra_input_items=extra_input_items,
+            history_tokens_override=history_tokens,
+        )
+        return self._apply_request_estimate_bias(
+            raw_estimate,
+            provider_name=provider.name,
+            model=settings.model,
+            tool_history_mode=settings.tool_history_mode,
+        )
+
+    def _estimate_raw_history_tokens(self, state: LiveConversationState, *, settings: SessionSettings, provider: ModelProvider) -> int:
+        latest_id = state.raw_messages[-1].db_id if state.raw_messages else 0
+        cache_key = self._history_cache_key(
+            provider_name=provider.name,
+            model=settings.model,
+            tool_history_mode=settings.tool_history_mode,
+            selected_block_ids=(),
+            latest_id=latest_id,
+        )
+        cached = state.provider_history_token_cache.get(cache_key)
+        if cached is not None:
+            return int(cached)
+        raw_messages: list[ConversationMessage] = []
+        for item in state.raw_messages:
+            mapped = self._history_message_for_provider(settings=settings, provider_name=provider.name, message=item.message)
+            if mapped is not None:
+                raw_messages.append(mapped)
+        estimate = provider.estimate_request_tokens(
+            settings=settings,
+            messages=raw_messages,
+            instructions='',
+            tools=[],
+        )
+        state.provider_history_token_cache[cache_key] = int(estimate.history_tokens)
+        return int(estimate.history_tokens)
+
+    def _estimate_stored_messages_prompt_tokens(
+        self,
+        messages: list[StoredConversationMessage],
+        *,
+        settings: SessionSettings,
+        provider: ModelProvider,
+        sequence_token_cache: dict[tuple[int, ...], int] | None = None,
+    ) -> int:
+        if not messages:
+            return 0
+        cache_key = tuple(int(item.db_id) for item in messages)
+        if sequence_token_cache is not None:
+            cached = sequence_token_cache.get(cache_key)
+            if cached is not None:
+                return int(cached)
+        mapped_messages = [
+            self._history_message_for_provider(settings=settings, provider_name=provider.name, message=item.message)
+            for item in messages
+        ]
+        estimate = provider.estimate_request_tokens(
+            settings=settings,
+            messages=mapped_messages,
+            instructions='',
+            tools=[],
+        )
+        total = int(estimate.history_tokens)
+        if sequence_token_cache is not None:
+            sequence_token_cache[cache_key] = total
+        return total
 
     @staticmethod
     def _history_position_for_block(block: MemoryBlock) -> tuple[int, int]:
@@ -797,8 +1037,13 @@ class AgentRuntime:
     def _build_provider_history(self, state: LiveConversationState, *, settings: SessionSettings, provider_name: str) -> list[ConversationMessage]:
         latest_id = state.raw_messages[-1].db_id if state.raw_messages else 0
         selected_blocks = self._select_blocks_for_prompt(state, settings=settings)
-        selected_block_ids = tuple(block.block_id for block in selected_blocks)
-        cache_key = (provider_name, settings.tool_history_mode.value, selected_block_ids, latest_id)
+        cache_key = self._history_cache_key(
+            provider_name=provider_name,
+            model=settings.model,
+            tool_history_mode=settings.tool_history_mode,
+            selected_block_ids=tuple(block.block_id for block in selected_blocks),
+            latest_id=latest_id,
+        )
         if not state.provider_history_dirty and state.provider_history_cache and state.provider_history_cache_key == cache_key:
             return state.provider_history_cache
         entries: list[tuple[tuple[int, int], ConversationMessage]] = []
@@ -819,7 +1064,8 @@ class AgentRuntime:
         if not blocks:
             return []
         target_tokens = self._effective_compact_target_tokens(settings)
-        raw_tokens = sum(item.estimated_tokens for item in state.raw_messages)
+        provider = self._require_provider(settings.provider)
+        raw_tokens = self._estimate_raw_history_tokens(state, settings=settings, provider=provider)
         if raw_tokens > target_tokens * 0.75:
             budget_fraction = 0.08
         elif raw_tokens > target_tokens * 0.5:
@@ -893,10 +1139,17 @@ class AgentRuntime:
         provider: ModelProvider,
         state: LiveConversationState,
         instructions: str,
-        tool_count: int,
+        tools: list[ToolSpec] | None = None,
         emit: EventCallback | None,
     ) -> None:
-        total_estimate = self._estimate_request_tokens(state, instructions, tool_count, settings=settings)
+        tools = tools or []
+        total_estimate = self._estimate_request_tokens(
+            state,
+            settings=settings,
+            provider=provider,
+            instructions=instructions,
+            tools=tools,
+        )
         image_limit = self._effective_max_input_images(provider, settings)
         image_count = self._estimate_request_images(state)
         compact_trigger_tokens = self._effective_compact_trigger_tokens(settings)
@@ -923,7 +1176,13 @@ class AgentRuntime:
                 if not changed:
                     logger.warning('Unable to compact session %s below target; remaining estimate=%s images=%s', session_id, total_estimate, image_count)
                     break
-                total_estimate = self._estimate_request_tokens(state, instructions, tool_count, settings=settings)
+                total_estimate = self._estimate_request_tokens(
+                    state,
+                    settings=settings,
+                    provider=provider,
+                    instructions=instructions,
+                    tools=tools,
+                )
                 image_count = self._estimate_request_images(state)
 
         image_count = self._estimate_request_images(state)
@@ -939,13 +1198,24 @@ class AgentRuntime:
             if not removed_images and image_count > image_limit:
                 logger.warning('Unable to compact images for session %s below limit; remaining images=%s limit=%s target=%s', session_id, image_count, image_limit, image_target_limit)
 
-    def _estimate_request_tokens(self, state: LiveConversationState, instructions: str, tool_count: int, *, settings: SessionSettings | None = None) -> int:
-        instruction_tokens = TokenEstimator.estimate_text(instructions)
-        tool_tokens = tool_count * 80
-        framing_tokens = 128
-        block_tokens = sum(block.estimated_tokens for block in (self._select_blocks_for_prompt(state, settings=settings) if settings is not None else state.blocks))
-        raw_tokens = sum(item.estimated_tokens for item in state.raw_messages)
-        return block_tokens + raw_tokens + instruction_tokens + tool_tokens + framing_tokens
+    def _estimate_request_tokens(
+        self,
+        state: LiveConversationState,
+        *,
+        settings: SessionSettings,
+        provider: ModelProvider,
+        instructions: str,
+        tools: list[ToolSpec],
+        extra_input_items: list[dict] | None = None,
+    ) -> int:
+        return self._estimate_request_breakdown(
+            state=state,
+            settings=settings,
+            provider=provider,
+            instructions=instructions,
+            tools=tools,
+            extra_input_items=extra_input_items,
+        ).total_tokens
 
     def _estimate_request_images(self, state: LiveConversationState) -> int:
         return state.estimated_images
@@ -1037,6 +1307,7 @@ class AgentRuntime:
         skipped_message_ids: set[int] = set()
         skipped_block_ids: set[int] = set()
         skipped_digest_shards: set[tuple[int, ...]] = set()
+        sequence_token_cache: dict[tuple[int, ...], int] = {}
         max_attempts = 24
         attempts = 0
         while attempts < max_attempts:
@@ -1044,8 +1315,10 @@ class AgentRuntime:
             tool_slice = self._select_tool_heavy_raw_slice(
                 state.raw_messages,
                 settings=settings,
+                provider=provider,
                 pressure=pressure,
                 excluded_message_ids=skipped_message_ids,
+                sequence_token_cache=sequence_token_cache,
             )
             if tool_slice:
                 candidate = await self._make_toolspan_block_candidate(provider, settings, tool_slice)
@@ -1079,25 +1352,33 @@ class AgentRuntime:
                 state.blocks.append(block)
                 state.raw_messages = [item for item in state.raw_messages if item.db_id not in consumed_ids]
                 state.rebuild_estimate()
+                tool_slice_tokens = self._estimate_stored_messages_prompt_tokens(
+                    tool_slice,
+                    settings=settings,
+                    provider=provider,
+                    sequence_token_cache=sequence_token_cache,
+                )
                 logger.info(
                     'compact.l0 sid=%s raw_messages=%s raw_tokens=%s->%s tool_user_ratio_threshold=%.2f',
                     self._session_log_id(session_id),
                     len(tool_slice),
-                    sum(item.estimated_tokens for item in tool_slice),
+                    tool_slice_tokens,
                     block.estimated_tokens,
                     self._effective_compact_tool_ratio_threshold(settings),
                 )
                 if emit and settings.process_visibility != ProcessVisibility.OFF:
                     await emit(RuntimeEvent(kind='phase', title='Compacting context',
-                            detail=f'compact.l0 raw_messages={len(tool_slice)} raw_tokens={sum(item.estimated_tokens for item in tool_slice)}->{block.estimated_tokens}'))
+                            detail=f'compact.l0 raw_messages={len(tool_slice)} raw_tokens={tool_slice_tokens}->{block.estimated_tokens}'))
                 return True
 
             history_slice = self._select_oldest_history_slice(
                 state,
                 settings=settings,
+                provider=provider,
                 pressure=pressure,
                 excluded_message_ids=skipped_message_ids,
                 excluded_block_ids=skipped_block_ids,
+                sequence_token_cache=sequence_token_cache,
             )
             if history_slice:
                 candidate = await self._make_episode_block_candidate(provider, settings, history_slice['source_messages'], history_slice['raw_messages'], history_slice['parent_blocks'])
@@ -1164,18 +1445,24 @@ class AgentRuntime:
                 consumed_ids = set(raw_ids)
                 state.raw_messages = [item for item in state.raw_messages if item.db_id not in consumed_ids]
                 state.rebuild_estimate()
+                raw_history_tokens = self._estimate_stored_messages_prompt_tokens(
+                    history_slice['raw_messages'],
+                    settings=settings,
+                    provider=provider,
+                    sequence_token_cache=sequence_token_cache,
+                ) + sum(parent.estimated_tokens for parent in history_slice['parent_blocks'])
                 logger.info(
                     'compact.episode sid=%s raw_messages=%s parent_blocks=%s raw_tokens=%s->%s keep_ratio=%.2f',
                     self._session_log_id(session_id),
                     len(raw_ids),
                     len(parent_ids),
-                    raw_token0 := sum(item.estimated_tokens for item in history_slice['raw_messages']) + sum(parent.estimated_tokens for parent in history_slice['parent_blocks']),
+                    raw_history_tokens,
                     block.estimated_tokens,
                     self._effective_compact_keep_recent_ratio(settings),
                 )
                 if emit and settings.process_visibility != ProcessVisibility.OFF:
                     await emit(RuntimeEvent(kind='phase', title='Compacting context',
-                            detail=f'compact.episode raw_messages={len(raw_ids)} parent_blocks={len(parent_ids)} raw_tokens={raw_token0}->{block.estimated_tokens}'))
+                            detail=f'compact.episode raw_messages={len(raw_ids)} parent_blocks={len(parent_ids)} raw_tokens={raw_history_tokens}->{block.estimated_tokens}'))
                 return True
 
             if not self._digest_needed(state, settings, pressure=pressure):
@@ -1262,13 +1549,29 @@ class AgentRuntime:
         logger.warning('compact.skip_exhausted sid=%s pressure=%s', self._session_log_id(session_id), int(pressure))
         return False
 
-    def _protected_recent_raw_units(self, messages: list[StoredConversationMessage], *, settings: SessionSettings, pressure: bool = False) -> tuple[list[list[StoredConversationMessage]], list[list[StoredConversationMessage]]]:
+    def _protected_recent_raw_units(
+        self,
+        messages: list[StoredConversationMessage],
+        *,
+        settings: SessionSettings,
+        provider: ModelProvider,
+        pressure: bool = False,
+        sequence_token_cache: dict[tuple[int, ...], int] | None = None,
+    ) -> tuple[list[list[StoredConversationMessage]], list[list[StoredConversationMessage]]]:
         if not messages:
             return [], []
         units = self._group_raw_compaction_units(messages)
         if len(units) < 2:
             return units, []
-        total_raw_tokens = sum(item.estimated_tokens for item in messages)
+        total_raw_tokens = sum(
+            self._estimate_stored_messages_prompt_tokens(
+                unit,
+                settings=settings,
+                provider=provider,
+                sequence_token_cache=sequence_token_cache,
+            )
+            for unit in units
+        )
         keep_ratio = self._effective_compact_keep_recent_ratio(settings)
         if pressure:
             keep_ratio = min(keep_ratio, 0.20)
@@ -1286,7 +1589,12 @@ class AgentRuntime:
         for unit in reversed(units):
             if keep_units >= max_keep_units:
                 break
-            unit_tokens = sum(item.estimated_tokens for item in unit)
+            unit_tokens = self._estimate_stored_messages_prompt_tokens(
+                unit,
+                settings=settings,
+                provider=provider,
+                sequence_token_cache=sequence_token_cache,
+            )
             if keep_units < minimum_keep_units or keep_units == 0 or kept_tokens < retain_budget:
                 keep_units += 1
                 kept_tokens += unit_tokens
@@ -1298,8 +1606,23 @@ class AgentRuntime:
             return units, []
         return units[:-keep_units], units[-keep_units:]
 
-    def _eligible_compaction_units(self, messages: list[StoredConversationMessage], *, settings: SessionSettings, pressure: bool = False, excluded_message_ids: set[int] | None = None) -> list[list[StoredConversationMessage]]:
-        eligible_units, _protected_units = self._protected_recent_raw_units(messages, settings=settings, pressure=pressure)
+    def _eligible_compaction_units(
+        self,
+        messages: list[StoredConversationMessage],
+        *,
+        settings: SessionSettings,
+        provider: ModelProvider,
+        pressure: bool = False,
+        excluded_message_ids: set[int] | None = None,
+        sequence_token_cache: dict[tuple[int, ...], int] | None = None,
+    ) -> list[list[StoredConversationMessage]]:
+        eligible_units, _protected_units = self._protected_recent_raw_units(
+            messages,
+            settings=settings,
+            provider=provider,
+            pressure=pressure,
+            sequence_token_cache=sequence_token_cache,
+        )
         if not eligible_units:
             return []
         if not excluded_message_ids:
@@ -1322,14 +1645,34 @@ class AgentRuntime:
             runs.append(current)
         return runs
 
-    def _select_tool_heavy_raw_slice(self, messages: list[StoredConversationMessage], *, settings: SessionSettings, pressure: bool = False, excluded_message_ids: set[int] | None = None) -> list[StoredConversationMessage]:
+    def _select_tool_heavy_raw_slice(
+        self,
+        messages: list[StoredConversationMessage],
+        *,
+        settings: SessionSettings,
+        provider: ModelProvider,
+        pressure: bool = False,
+        excluded_message_ids: set[int] | None = None,
+        sequence_token_cache: dict[tuple[int, ...], int] | None = None,
+    ) -> list[StoredConversationMessage]:
         if not messages:
             return []
-        older_units, _protected_units = self._protected_recent_raw_units(messages, settings=settings, pressure=pressure)
+        older_units, _protected_units = self._protected_recent_raw_units(
+            messages,
+            settings=settings,
+            provider=provider,
+            pressure=pressure,
+            sequence_token_cache=sequence_token_cache,
+        )
         if len(older_units) < 3:
             return []
         scan_end = len(older_units)
-        while scan_end > 0 and not self._toolspan_unit_stats(older_units[scan_end - 1])['has_tool']:
+        while scan_end > 0 and not self._toolspan_unit_stats(
+            older_units[scan_end - 1],
+            settings=settings,
+            provider=provider,
+            sequence_token_cache=sequence_token_cache,
+        )['has_tool']:
             scan_end -= 1
         scan_units = older_units[:scan_end] if scan_end > 0 else []
         if len(scan_units) < 2:
@@ -1343,7 +1686,15 @@ class AgentRuntime:
         for run_units in runs:
             if len(run_units) < max_gap_units:
                 continue
-            stats = [self._toolspan_unit_stats(unit) for unit in run_units]
+            stats = [
+                self._toolspan_unit_stats(
+                    unit,
+                    settings=settings,
+                    provider=provider,
+                    sequence_token_cache=sequence_token_cache,
+                )
+                for unit in run_units
+            ]
             start = None
             last_tool = None
             gap_units = 0
@@ -1359,7 +1710,12 @@ class AgentRuntime:
                 if start is None:
                     continue
                 gap_units += 1
-                gap_user_messages += self._user_messages_for_unit(run_units[idx])
+                gap_user_messages += self._user_messages_for_unit(
+                    run_units[idx],
+                    settings=settings,
+                    provider=provider,
+                    sequence_token_cache=sequence_token_cache,
+                )
                 if (gap_units > max_gap_units or gap_user_messages > max_gap_user_messages) and last_tool is not None:
                     candidate = self._toolspan_slice_from_unit_range(run_units, stats, start, last_tool, max_tokens=max_span_tokens, min_tokens=min_tokens, ratio_threshold=ratio_threshold)
                     if candidate:
@@ -1374,8 +1730,23 @@ class AgentRuntime:
                     return candidate
         return []
 
-    def _user_messages_for_unit(self, unit: list[StoredConversationMessage]) -> int:
-        if any(self._stored_message_tool_profile(item)['has_tool'] for item in unit):
+    def _user_messages_for_unit(
+        self,
+        unit: list[StoredConversationMessage],
+        *,
+        settings: SessionSettings,
+        provider: ModelProvider,
+        sequence_token_cache: dict[tuple[int, ...], int] | None = None,
+    ) -> int:
+        if any(
+            self._stored_message_tool_profile(
+                item,
+                settings=settings,
+                provider=provider,
+                sequence_token_cache=sequence_token_cache,
+            )['has_tool']
+            for item in unit
+        ):
             return 0
         return sum(1 for item in unit if item.message.role == MessageRole.USER and not self._is_auto_note_message(item.message))
 
@@ -1410,7 +1781,14 @@ class AgentRuntime:
         while flattened and flattened[-1].message.role == MessageRole.USER and not self._is_tool_call_message(flattened[-1].message):
             flattened.pop()
         return flattened
-    def _toolspan_unit_stats(self, unit: list[StoredConversationMessage]) -> dict[str, float | int | bool]:
+    def _toolspan_unit_stats(
+        self,
+        unit: list[StoredConversationMessage],
+        *,
+        settings: SessionSettings,
+        provider: ModelProvider,
+        sequence_token_cache: dict[tuple[int, ...], int] | None = None,
+    ) -> dict[str, float | int | bool]:
         total_tokens = 0
         tool_tokens = 0
         user_tokens = 0
@@ -1418,7 +1796,12 @@ class AgentRuntime:
         other_tokens = 0
         has_tool = False
         for item in unit:
-            profile = self._stored_message_tool_profile(item)
+            profile = self._stored_message_tool_profile(
+                item,
+                settings=settings,
+                provider=provider,
+                sequence_token_cache=sequence_token_cache,
+            )
             total_tokens += int(profile['total_tokens'])
             tool_tokens += int(profile['tool_tokens'])
             user_tokens += int(profile['user_tokens'])
@@ -1433,8 +1816,20 @@ class AgentRuntime:
             'other_tokens': other_tokens,
             'has_tool': has_tool,
         }
-    def _stored_message_tool_profile(self, item: StoredConversationMessage) -> dict[str, int | bool]:
-        total_tokens = int(item.estimated_tokens)
+    def _stored_message_tool_profile(
+        self,
+        item: StoredConversationMessage,
+        *,
+        settings: SessionSettings,
+        provider: ModelProvider,
+        sequence_token_cache: dict[tuple[int, ...], int] | None = None,
+    ) -> dict[str, int | bool]:
+        total_tokens = self._estimate_stored_messages_prompt_tokens(
+            [item],
+            settings=settings,
+            provider=provider,
+            sequence_token_cache=sequence_token_cache,
+        )
         has_tool = item.message.role == MessageRole.TOOL or self._message_has_tool_context(item.message)
         role = item.message.role
         tool_tokens = total_tokens if has_tool else 0
@@ -1449,13 +1844,26 @@ class AgentRuntime:
             'other_tokens': other_tokens,
             'has_tool': has_tool,
         }
-    def _history_entry_for_raw_unit(self, unit: list[StoredConversationMessage], excluded_message_ids: set[int]) -> dict[str, Any]:
+    def _history_entry_for_raw_unit(
+        self,
+        unit: list[StoredConversationMessage],
+        excluded_message_ids: set[int],
+        *,
+        settings: SessionSettings,
+        provider: ModelProvider,
+        sequence_token_cache: dict[tuple[int, ...], int] | None = None,
+    ) -> dict[str, Any]:
         return {
             'kind': 'raw',
             'messages': unit,
             'block': None,
             'sort_key': (int(unit[-1].db_id), 1),
-            'estimated_tokens': sum(item.estimated_tokens for item in unit),
+            'estimated_tokens': self._estimate_stored_messages_prompt_tokens(
+                unit,
+                settings=settings,
+                provider=provider,
+                sequence_token_cache=sequence_token_cache,
+            ),
             'source_message_count': len(unit),
             'excluded': any(item.db_id in excluded_message_ids for item in unit),
         }
@@ -1471,12 +1879,37 @@ class AgentRuntime:
             'excluded': block.block_id in excluded_block_ids,
         }
 
-    def _eligible_history_entries(self, state: LiveConversationState, *, settings: SessionSettings, pressure: bool = False, excluded_message_ids: set[int] | None = None, excluded_block_ids: set[int] | None = None) -> list[dict[str, Any]]:
+    def _eligible_history_entries(
+        self,
+        state: LiveConversationState,
+        *,
+        settings: SessionSettings,
+        provider: ModelProvider,
+        pressure: bool = False,
+        excluded_message_ids: set[int] | None = None,
+        excluded_block_ids: set[int] | None = None,
+        sequence_token_cache: dict[tuple[int, ...], int] | None = None,
+    ) -> list[dict[str, Any]]:
         excluded_message_ids = excluded_message_ids or set()
         excluded_block_ids = excluded_block_ids or set()
-        older_units, protected_units = self._protected_recent_raw_units(state.raw_messages, settings=settings, pressure=pressure)
+        older_units, protected_units = self._protected_recent_raw_units(
+            state.raw_messages,
+            settings=settings,
+            provider=provider,
+            pressure=pressure,
+            sequence_token_cache=sequence_token_cache,
+        )
         protected_start_id = protected_units[0][0].db_id if protected_units else None
-        entries: list[dict[str, Any]] = [self._history_entry_for_raw_unit(unit, excluded_message_ids) for unit in older_units]
+        entries: list[dict[str, Any]] = [
+            self._history_entry_for_raw_unit(
+                unit,
+                excluded_message_ids,
+                settings=settings,
+                provider=provider,
+                sequence_token_cache=sequence_token_cache,
+            )
+            for unit in older_units
+        ]
         for block in state.blocks:
             if block.lifecycle != 'sealed' or block.kind != 'toolspan' or block.level != 0:
                 continue
@@ -1500,13 +1933,25 @@ class AgentRuntime:
             runs.append(current)
         return runs
 
-    def _select_oldest_history_slice(self, state: LiveConversationState, *, settings: SessionSettings, pressure: bool = False, excluded_message_ids: set[int] | None = None, excluded_block_ids: set[int] | None = None) -> dict[str, Any] | None:
+    def _select_oldest_history_slice(
+        self,
+        state: LiveConversationState,
+        *,
+        settings: SessionSettings,
+        provider: ModelProvider,
+        pressure: bool = False,
+        excluded_message_ids: set[int] | None = None,
+        excluded_block_ids: set[int] | None = None,
+        sequence_token_cache: dict[tuple[int, ...], int] | None = None,
+    ) -> dict[str, Any] | None:
         entries = self._eligible_history_entries(
             state,
             settings=settings,
+            provider=provider,
             pressure=pressure,
             excluded_message_ids=excluded_message_ids,
             excluded_block_ids=excluded_block_ids,
+            sequence_token_cache=sequence_token_cache,
         )
         if not entries:
             return None

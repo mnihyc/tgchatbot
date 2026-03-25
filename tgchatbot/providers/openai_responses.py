@@ -7,8 +7,9 @@ import httpx
 import logging
 
 from tgchatbot.config import OpenAIConfig
+from tgchatbot.core.token_estimator import TokenEstimator
 from tgchatbot.domain.models import ChatMode, ConversationMessage, MessageRole, PartKind, ProviderResponse, SessionSettings, ToolCall, UsageInfo
-from tgchatbot.providers.base import ControlDescriptor, ProviderCapabilities
+from tgchatbot.providers.base import ControlDescriptor, ProviderCapabilities, RequestTokenEstimate, estimate_json_schema_tokens
 from tgchatbot.settings_schema import NATIVE_WEB_SEARCH_MAX_MAX, effective_optional_disabled_int, effective_reasoning_summary
 from tgchatbot.tools.base import ToolSpec
 from tgchatbot.logging_config import dump_llm_exchange
@@ -43,6 +44,56 @@ class OpenAIResponsesProvider:
             'max_output_tokens': ControlDescriptor(True, str(settings.max_output_tokens if settings.max_output_tokens is not None else self.config.max_output_tokens), 'session' if settings.max_output_tokens is not None else 'default'),
         }
 
+    def _tool_defs_for_request(self, settings: SessionSettings, tools: list[ToolSpec]) -> list[dict[str, Any]]:
+        tool_defs = [tool.openai_tool() for tool in tools]
+        native_web_search_enabled = self.config.enable_native_web_search
+        if settings.native_web_search_mode == 'on':
+            native_web_search_enabled = True
+        elif settings.native_web_search_mode == 'off':
+            native_web_search_enabled = False
+        if native_web_search_enabled and settings.mode != ChatMode.CHAT:
+            tool_defs.append({'type': 'web_search', 'search_context_size': 'low', 'user_location': None})
+        return tool_defs
+
+    def estimate_request_tokens(
+        self,
+        *,
+        settings: SessionSettings,
+        messages: list[ConversationMessage],
+        instructions: str,
+        tools: list[ToolSpec],
+        extra_input_items: list[dict] | None = None,
+        response_schema: dict[str, Any] | None = None,
+        response_schema_name: str | None = None,
+        history_tokens_override: int | None = None,
+    ) -> RequestTokenEstimate:
+        history_tokens = int(history_tokens_override) if history_tokens_override is not None else sum(
+            self._estimate_input_item_tokens(item)
+            for message in messages
+            for item in self._message_to_input_items(message)
+        )
+        instructions_tokens = TokenEstimator.estimate_text(instructions)
+        tool_defs = self._tool_defs_for_request(settings, tools)
+        tools_tokens = sum(self._estimate_tool_definition_tokens(tool_def) for tool_def in tool_defs)
+        if response_schema:
+            tools_tokens += estimate_json_schema_tokens(response_schema, name=response_schema_name or 'structured_output')
+        extra_input_tokens = sum(self._estimate_input_item_tokens(item) for item in (extra_input_items or []))
+        reasoning_summary = effective_reasoning_summary(settings.reasoning_summary or self.config.reasoning_summary, provider='openai', default='off')
+        framing_tokens = 48
+        framing_tokens += TokenEstimator.estimate_text(settings.reasoning_effort or self.config.reasoning_effort)
+        framing_tokens += TokenEstimator.estimate_text(settings.text_verbosity or self.config.text_verbosity)
+        if reasoning_summary != 'off':
+            framing_tokens += TokenEstimator.estimate_text(reasoning_summary) + 8
+        if tool_defs:
+            framing_tokens += 16
+        return RequestTokenEstimate.compose(
+            history_tokens=history_tokens,
+            instructions_tokens=instructions_tokens,
+            tools_tokens=tools_tokens,
+            extra_input_tokens=extra_input_tokens,
+            framing_tokens=framing_tokens,
+        )
+
     async def generate(
         self,
         *,
@@ -58,14 +109,8 @@ class OpenAIResponsesProvider:
         if extra_input_items:
             input_items.extend(extra_input_items)
 
-        tool_defs = [tool.openai_tool() for tool in tools]
-        native_web_search_enabled = self.config.enable_native_web_search
-        if settings.native_web_search_mode == 'on':
-            native_web_search_enabled = True
-        elif settings.native_web_search_mode == 'off':
-            native_web_search_enabled = False
-        if native_web_search_enabled and settings.mode != ChatMode.CHAT:
-            tool_defs.append({'type': 'web_search', 'search_context_size': 'low', 'user_location': None})
+        tool_defs = self._tool_defs_for_request(settings, tools)
+        native_web_search_enabled = any(str(tool_def.get('type') or '') == 'web_search' for tool_def in tool_defs)
 
         include: list[str] = ['reasoning.encrypted_content']
         if native_web_search_enabled and settings.mode != ChatMode.CHAT:
@@ -170,6 +215,83 @@ class OpenAIResponsesProvider:
             usage=UsageInfo(input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=total_tokens),
             raw=body,
         )
+
+    def _estimate_tool_definition_tokens(self, tool_def: dict[str, Any]) -> int:
+        tool_type = str(tool_def.get('type') or '').strip().lower()
+        if tool_type == 'function':
+            return (
+                24
+                + TokenEstimator.estimate_text(tool_def.get('name'))
+                + TokenEstimator.estimate_text(tool_def.get('description'))
+                + estimate_json_schema_tokens(tool_def.get('parameters') if isinstance(tool_def.get('parameters'), dict) else None)
+            )
+        if tool_type == 'web_search':
+            return 24 + TokenEstimator.estimate_text(tool_def.get('search_context_size')) + 8
+        return 12 + self._estimate_semantic_value_tokens(tool_def)
+
+    def _estimate_input_item_tokens(self, item: dict[str, Any]) -> int:
+        if not isinstance(item, dict):
+            return 0
+        if 'role' in item and isinstance(item.get('content'), list):
+            return 8 + TokenEstimator.estimate_text(item.get('role')) + sum(
+                self._estimate_input_item_tokens(content_item)
+                for content_item in item.get('content', [])
+                if isinstance(content_item, dict)
+            )
+        item_type = str(item.get('type') or '').strip().lower()
+        if item_type in {'input_text', 'output_text'}:
+            return 4 + TokenEstimator.estimate_text(item.get('text'))
+        if item_type == 'input_image':
+            return TokenEstimator.IMAGE_TOKENS + 8 + TokenEstimator.estimate_text(item.get('detail'))
+        if item_type == 'function_call':
+            return (
+                24
+                + TokenEstimator.estimate_text(item.get('name'))
+                + TokenEstimator.estimate_text(item.get('call_id'))
+                + TokenEstimator.estimate_text(item.get('arguments'))
+            )
+        if item_type == 'function_call_output':
+            return 24 + TokenEstimator.estimate_text(item.get('call_id')) + TokenEstimator.estimate_text(item.get('output'))
+        if item_type == 'reasoning':
+            total = 16
+            for summary_item in item.get('summary') or []:
+                if not isinstance(summary_item, dict):
+                    continue
+                total += TokenEstimator.estimate_text(summary_item.get('text'))
+            encrypted = item.get('encrypted_content')
+            if encrypted:
+                total += min(TokenEstimator.estimate_text(encrypted), 256)
+            return total
+        if item_type == 'message':
+            return 8 + TokenEstimator.estimate_text(item.get('role')) + sum(
+                self._estimate_input_item_tokens(content_item)
+                for content_item in item.get('content', [])
+                if isinstance(content_item, dict)
+            )
+        if item_type == 'web_search_call':
+            return 24 + self._estimate_semantic_value_tokens(item.get('action')) + TokenEstimator.estimate_text(item.get('status'))
+        return 8 + self._estimate_semantic_value_tokens(item)
+
+    def _estimate_semantic_value_tokens(self, value: Any) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, str):
+            return TokenEstimator.estimate_text(value)
+        if isinstance(value, (int, float, bool)):
+            return TokenEstimator.estimate_text(str(value))
+        if isinstance(value, list):
+            return 2 + sum(self._estimate_semantic_value_tokens(item) for item in value)
+        if isinstance(value, dict):
+            total = 4
+            for key, item in value.items():
+                key_text = str(key)
+                if key_text in {'image_url', 'data'}:
+                    total += TokenEstimator.IMAGE_TOKENS
+                    continue
+                total += TokenEstimator.estimate_text(key_text)
+                total += self._estimate_semantic_value_tokens(item)
+            return total
+        return TokenEstimator.estimate_text(str(value))
 
     def persistent_history_items(self, response: ProviderResponse) -> list[dict]:
         items = response.continuation_items or []

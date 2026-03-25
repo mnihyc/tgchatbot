@@ -61,11 +61,13 @@ class LiveConversationState:
     estimated_images: int = 0
     loaded: bool = False
     provider_history_cache: list[ConversationMessage] = field(default_factory=list)
-    provider_history_cache_key: tuple[str, str, tuple[int, ...], int] | None = None
+    provider_history_cache_key: tuple[str, str, str, tuple[int, ...], int] | None = None
+    provider_history_token_cache: dict[tuple[str, str, str, tuple[int, ...], int], int] = field(default_factory=dict)
     provider_history_dirty: bool = True
     def rebuild_estimate(self) -> int:
         self.estimated_tokens = sum(block.estimated_tokens for block in self.blocks) + sum(item.estimated_tokens for item in self.raw_messages)
         self.estimated_images = sum(item.image_count for item in self.raw_messages)
         self.provider_history_dirty = True
         self.provider_history_cache_key = None
+        self.provider_history_token_cache.clear()
         return self.estimated_tokens

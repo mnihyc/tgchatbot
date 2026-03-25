@@ -221,6 +221,12 @@ class SQLiteStore:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE INDEX IF NOT EXISTS idx_compaction_blocks_session_id ON compaction_blocks(session_id, sequence_no);
+
+                CREATE TABLE IF NOT EXISTS sticker_personas (
+                    session_id TEXT PRIMARY KEY,
+                    persona_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
                 """
             )
             session_columns = {row['name'] for row in conn.execute("PRAGMA table_info(sessions)")}
@@ -482,6 +488,50 @@ class SQLiteStore:
                 """,
                 (session_id, *self._session_values(settings)),
             )
+
+    async def get_sticker_persona(self, session_id: str) -> dict[str, object] | None:
+        return await asyncio.to_thread(self.get_sticker_persona_sync, session_id)
+
+    def get_sticker_persona_sync(self, session_id: str) -> dict[str, object] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT persona_json FROM sticker_personas WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            parsed = json.loads(str(row['persona_json'] or '{}'))
+        except Exception:
+            parsed = {}
+        return parsed if isinstance(parsed, dict) and parsed else None
+
+    async def save_sticker_persona(self, session_id: str, persona: dict[str, object] | None) -> None:
+        await asyncio.to_thread(self.save_sticker_persona_sync, session_id, persona)
+
+    def save_sticker_persona_sync(self, session_id: str, persona: dict[str, object] | None) -> None:
+        if not persona:
+            self.clear_sticker_persona_sync(session_id)
+            return
+        payload = json.dumps(persona, ensure_ascii=False)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO sticker_personas (session_id, persona_json)
+                VALUES (?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    persona_json = excluded.persona_json,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (session_id, payload),
+            )
+
+    async def clear_sticker_persona(self, session_id: str) -> None:
+        await asyncio.to_thread(self.clear_sticker_persona_sync, session_id)
+
+    def clear_sticker_persona_sync(self, session_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM sticker_personas WHERE session_id = ?", (session_id,))
 
     async def append_message(self, session_id: str, message: ConversationMessage, estimated_tokens: int | None = None) -> StoredConversationMessage:
         return await asyncio.to_thread(self._append_message_sync, session_id, message, estimated_tokens)

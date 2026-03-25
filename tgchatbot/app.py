@@ -58,7 +58,7 @@ def main() -> None:
     store = SQLiteStore(config.db_path)
     persisted_sessions = store._count_sessions_sync()
     remote = RemoteWorkspaceClient(config)
-    sticker_catalog = StickerCatalog(config.sticker_index_path, config.sticker_dir)
+    sticker_catalog = StickerCatalog(config.sticker_index_path, config.sticker_dir, persona_store=store)
     sticker_catalog.load()
     sticker_stats = sticker_catalog.stats()
 
