@@ -330,6 +330,19 @@ class TelegramMessageRenderer:
 
         await self._replace_with_chunked_text(self.state.answer)
 
+    async def complete_without_answer(self) -> None:
+        if self.message is None or self._is_none():
+            return
+        if self._is_minimal():
+            await self._delete_message_if_possible(self.message)
+            self.message = None
+            return
+        if self._is_full():
+            header = self.state.live_text.strip()
+        else:
+            header = '\n'.join(line for line in self.state.lines if line.strip()).strip()
+        await self._edit_text(header or 'Done', force=True)
+
     async def _flush(self, final: bool = False, force: bool = False) -> None:
         if self._is_none() or self._is_minimal():
             return

@@ -293,6 +293,8 @@ class AgentRuntime:
         collected_artifacts = []
         collected_stickers: list[OutboundSticker] = []
         last_usage = None
+        deferred_tool_texts: list[str] = []
+        emitted_tool_text = False
 
         total_steps = max_tool_rounds + 1
         for iteration in range(total_steps):
@@ -356,6 +358,7 @@ class AgentRuntime:
                 actual_input_tokens=getattr(last_usage, 'input_tokens', None),
             )
             logger.info('turn.model sid=%s step=%s/%s tool_calls=%s native_calls=%s continue=%s text_chars=%s usage=%s', self._session_log_id(session_id), iteration + 1, total_steps, len(response.tool_calls), len(getattr(response, 'native_tool_calls', []) or []), len(response.continuation_items), len(response.final_text or ''), self._usage_log_text(last_usage))
+            persistent_history_items = provider.persistent_history_items(response) if hasattr(provider, 'persistent_history_items') else []
 
             if emit and settings.process_visibility in {ProcessVisibility.VERBOSE, ProcessVisibility.FULL}:
                 summary = clip_for_log(' | '.join(getattr(response, "reasoning_summaries", [])), limit=220, rlimit=80)
@@ -394,8 +397,29 @@ class AgentRuntime:
                         )
 
             if response.tool_calls:
+                tool_turn_text = (response.final_text or self._provider_visible_text_from_items(persistent_history_items)).strip()
+                if tool_turn_text:
+                    logger.info(
+                        'turn.tool_text sid=%s step=%s/%s chars=%s',
+                        self._session_log_id(session_id),
+                        iteration + 1,
+                        total_steps,
+                        len(tool_turn_text),
+                    )
+                    if emit is not None:
+                        await emit(
+                            RuntimeEvent(
+                                kind='assistant_text',
+                                title='Assistant',
+                                detail=tool_turn_text,
+                                payload={'text': tool_turn_text},
+                            )
+                        )
+                        emitted_tool_text = True
+                    else:
+                        deferred_tool_texts.append(tool_turn_text)
                 accumulated_items.extend(response.continuation_items)
-                native_items = provider.persistent_history_items(response) if hasattr(provider, 'persistent_history_items') else []
+                native_items = persistent_history_items
                 for tool_index, tool_call in enumerate(response.tool_calls):
                     metadata_update = None
                     if native_items and tool_index == 0:
@@ -473,7 +497,16 @@ class AgentRuntime:
                     accumulated_items.extend(provider.make_tool_result_items(tool_call, tool_output))
                 continue
 
-            final_text = response.final_text or '(empty response)'
+            final_text = (response.final_text or self._provider_visible_text_from_items(persistent_history_items)).strip()
+            if deferred_tool_texts:
+                segments = [*deferred_tool_texts]
+                if final_text and (not segments or segments[-1] != final_text):
+                    segments.append(final_text)
+                final_text = '\n\n'.join(segment for segment in segments if segment).strip()
+            elif not final_text and emitted_tool_text:
+                final_text = ''
+            elif not final_text:
+                final_text = '(empty response)'
             logger.info('turn.done sid=%s trigger=%s text_chars=%s artifacts=%s stickers=%s usage=%s', self._session_log_id(session_id), trigger_message_id, len(final_text), len(collected_artifacts), len(collected_stickers), self._usage_log_text(last_usage))
             if emit:
                 await emit(RuntimeEvent(kind='final', title='Done', detail=f'trigger message #{trigger_message_id}'))
@@ -483,7 +516,7 @@ class AgentRuntime:
                 usage=last_usage,
                 stickers=collected_stickers,
                 provider_name=provider.name,
-                provider_history_items=(provider.persistent_history_items(response) if hasattr(provider, 'persistent_history_items') else []),
+                provider_history_items=persistent_history_items,
             )
 
         logger.warning('turn.limit sid=%s trigger=%s rounds=%s usage=%s', self._session_log_id(session_id), trigger_message_id, max_tool_rounds, self._usage_log_text(last_usage))
@@ -978,8 +1011,9 @@ class AgentRuntime:
             if cached is not None:
                 return int(cached)
         mapped_messages = [
-            self._history_message_for_provider(settings=settings, provider_name=provider.name, message=item.message)
+            mapped
             for item in messages
+            if (mapped := self._history_message_for_provider(settings=settings, provider_name=provider.name, message=item.message)) is not None
         ]
         estimate = provider.estimate_request_tokens(
             settings=settings,
@@ -1004,7 +1038,37 @@ class AgentRuntime:
         # if any
         return [item for item in items if isinstance(item, dict)]
 
-    def _history_message_for_provider(self, *, settings: SessionSettings, provider_name: str, message: ConversationMessage) -> ConversationMessage:
+    def _provider_visible_text_from_items(self, items: list[dict[str, Any]]) -> str:
+        texts: list[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get('type') or '').strip().lower()
+            if item_type == 'message':
+                content_items = item.get('content') if isinstance(item.get('content'), list) else []
+                for content in content_items:
+                    if not isinstance(content, dict) or str(content.get('type') or '').strip().lower() != 'output_text':
+                        continue
+                    text = str(content.get('text') or '').strip()
+                    if text:
+                        texts.append(text)
+                continue
+            parts = item.get('parts') if isinstance(item.get('parts'), list) else []
+            for part in parts:
+                if not isinstance(part, dict) or part.get('thought') is True:
+                    continue
+                text = str(part.get('text') or '').strip()
+                if text:
+                    texts.append(text)
+        return '\n\n'.join(texts).strip()
+
+    def _provider_native_visible_text(self, message: ConversationMessage) -> str:
+        metadata = message.metadata if isinstance(message.metadata, dict) else {}
+        provider_native = metadata.get('provider_native') if isinstance(metadata.get('provider_native'), dict) else {}
+        items = provider_native.get('items') if isinstance(provider_native.get('items'), list) else []
+        return self._provider_visible_text_from_items(items)
+
+    def _history_message_for_provider(self, *, settings: SessionSettings, provider_name: str, message: ConversationMessage) -> ConversationMessage | None:
         metadata = message.metadata if isinstance(message.metadata, dict) else {}
         base_metadata = {key: value for key, value in metadata.items() if key not in {'provider_native', 'provider_native_skip_same_provider'}}
         provider_native = metadata.get('provider_native') if isinstance(metadata.get('provider_native'), dict) else None
@@ -1021,9 +1085,17 @@ class AgentRuntime:
             return prepared
         phase = str(metadata.get('tool_phase') or '').strip().lower()
         origin_provider = str(metadata.get('tool_provider') or '').strip().lower()
+        if (
+            settings.tool_history_mode == ToolHistoryMode.NATIVE_SAME_PROVIDER
+            and origin_provider == provider_name
+            and bool(metadata.get('provider_native_skip_same_provider'))
+            and phase in {'call', 'result'}
+        ):
+            return None
         if settings.tool_history_mode == ToolHistoryMode.NATIVE_SAME_PROVIDER and origin_provider == provider_name and phase in {'call', 'result'}:
             return prepared
         texts = [part.text.strip() for part in message.parts if part.text and part.text.strip()]
+        provider_visible_text = self._provider_native_visible_text(message)
         if not texts:
             name = message.name or 'tool'
             payload = metadata.get('tool_payload')
@@ -1031,6 +1103,8 @@ class AgentRuntime:
         translated_metadata = {'source_role': 'tool', 'tool_name': message.name, 'tool_phase': phase or 'event'}
         translated_text = '\n'.join(texts)
         if phase == 'call':
+            if provider_visible_text and provider_visible_text not in translated_text:
+                translated_text = f'{provider_visible_text}\n\n{translated_text}' if translated_text else provider_visible_text
             return ConversationMessage.assistant_text(translated_text, metadata=translated_metadata)
         return ConversationMessage.user_text(translated_text, metadata=translated_metadata)
 
@@ -2544,23 +2618,34 @@ class AgentRuntime:
         call_payload = call_meta.get('tool_payload') if isinstance(call_meta.get('tool_payload'), dict) else {}
         result_payload = result_meta.get('tool_payload') if isinstance(result_meta.get('tool_payload'), dict) else {}
         name = call_message.name or result_message.name or 'tool'
+        visible_text = self._provider_native_visible_text(call_message)
         action = self._describe_tool_call(name, call_payload)
         outcome = self._describe_tool_result(name, result_payload)
+        summary = ''
         if action and outcome:
-            return f'{action}. Result: {outcome}'
-        return action or outcome
+            summary = f'{action}. Result: {outcome}'
+        else:
+            summary = action or outcome
+        if visible_text and summary and visible_text not in summary:
+            return f'{visible_text}\n\n{summary}'
+        return visible_text or summary
 
     def _normalize_single_tool_message(self, message: ConversationMessage) -> ConversationMessage | None:
         metadata = message.metadata if isinstance(message.metadata, dict) else {}
         payload = metadata.get('tool_payload') if isinstance(metadata.get('tool_payload'), dict) else {}
         phase = str(metadata.get('tool_phase') or '').strip().lower()
         name = message.name or 'tool'
+        visible_text = self._provider_native_visible_text(message)
         if phase == 'call':
             text = self._describe_tool_call(name, payload)
         elif phase == 'result':
             text = self._describe_tool_result(name, payload)
         else:
             text = self._normalize_regular_message_text(message)
+        if visible_text and text and visible_text not in text:
+            text = f'{visible_text}\n\n{text}'
+        elif visible_text and not text:
+            text = visible_text
         return ConversationMessage.assistant_text(text, metadata={'source_role': 'tool'}) if text else None
 
     def _describe_tool_call(self, name: str, payload: dict[str, Any]) -> str:
