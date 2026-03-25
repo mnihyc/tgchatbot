@@ -1391,6 +1391,13 @@ class TelegramBotApp:
             raise RuntimeError('Telegram text delivery produced no message')
         return last_message
 
+    async def _record_delivered_assistant_text(self, *, session_id: str, result: TurnResult) -> None:
+        text = (result.text or '').strip()
+        if not text:
+            return
+        assistant_metadata = {'provider_native': {'provider': result.provider_name, 'items': result.provider_history_items}} if result.provider_name and result.provider_history_items else None
+        await self.runtime.record_assistant_text(session_id=session_id, text=text, metadata=assistant_metadata)
+
     async def _notify_user_error(self, source_message: Message, text: str, *, renderer: TelegramMessageRenderer | None = None) -> None:
         if renderer is not None and renderer.message is not None:
             try:
@@ -1596,6 +1603,11 @@ class TelegramBotApp:
                             payload=receipt,
                         )
                 return
+            if event.kind == 'assistant_text':
+                text = (event.detail or str(event.payload.get('text') or '')).strip()
+                if text:
+                    await renderer.send_text(text)
+                return
             if should_show_status:
                 await renderer.emit(event)
 
@@ -1643,8 +1655,7 @@ class TelegramBotApp:
         logger.info('tg.reply.result chat=%s msg=%s text_chars=%s artifacts=%s stickers=%s usage=in=%s out=%s total=%s', self._chat_log_id(chat.id), candidate.stored_message_id, len(result.text), len(result.artifacts), len(result.stickers), result.usage.input_tokens, result.usage.output_tokens, result.usage.total_tokens)
         try:
             await self._deliver_result(message, renderer, settings, result, sent_before_receipts=sent_before_receipts)
-            assistant_metadata = {'provider_native': {'provider': result.provider_name, 'items': result.provider_history_items}} if result.provider_name and result.provider_history_items else None
-            await self.runtime.record_assistant_text(session_id=session_id, text=result.text, metadata=assistant_metadata)
+            await self._record_delivered_assistant_text(session_id=session_id, result=result)
         except Exception as exc:
             logger.exception('tg.deliver.failed chat=%s msg=%s', self._chat_log_id(chat.id), candidate.stored_message_id)
             try:
@@ -1672,10 +1683,13 @@ class TelegramBotApp:
     ) -> None:
         after_stickers = [sticker for sticker in result.stickers if sticker.timing == StickerTiming.AFTER_FINAL]
         logger.info('tg.deliver.start chat=%s process=%s text_chars=%s artifacts=%s after_stickers=%s usage=in=%s out=%s total=%s', self._chat_log_id(source_message.chat.id), settings.process_visibility.value, len(result.text), len(result.artifacts), len(after_stickers), result.usage.input_tokens, result.usage.output_tokens, result.usage.total_tokens)
-        if settings.process_visibility in {ProcessVisibility.OFF, ProcessVisibility.MINIMAL}:
-            await self._send_text_message(source_message, result.text)
-        else:
-            await renderer.finalize(result.text)
+        if (result.text or '').strip():
+            if settings.process_visibility in {ProcessVisibility.OFF, ProcessVisibility.MINIMAL}:
+                await self._send_text_message(source_message, result.text)
+            else:
+                await renderer.finalize(result.text)
+        elif settings.process_visibility not in {ProcessVisibility.OFF}:
+            await renderer.complete_without_answer()
         if result.artifacts:
             if settings.process_visibility in {ProcessVisibility.OFF, ProcessVisibility.MINIMAL}:
                 for artifact in result.artifacts:

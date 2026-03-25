@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-EventKind = Literal["phase", "tool_call", "tool_result", "sticker", "final"]
+EventKind = Literal["phase", "thinking", "tool_call", "tool_result", "sticker", "assistant_text", "final"]
 
 
 @dataclass(slots=True)
