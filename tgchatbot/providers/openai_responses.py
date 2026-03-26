@@ -341,7 +341,7 @@ class OpenAIResponsesProvider:
                 descriptor += ']'
                 content_items.append({'type': text_item_type, 'text': descriptor})
             elif part.kind == PartKind.STICKER:
-                content_items.append({'type': text_item_type, 'text': part.text or f"[Sticker: {part.filename or 'sticker'}]"})
+                content_items.append({'type': text_item_type, 'text': part.text or '[Sticker]'})
         if not content_items:
             return []
         return [{'role': role, 'content': content_items}]

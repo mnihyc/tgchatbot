@@ -1334,11 +1334,9 @@ class TelegramBotApp:
                 user_parts = [MessagePart(kind=PartKind.TEXT, text='')]
             envelope = ConversationMessage(
                 role=MessageRole.USER,
-                parts=user_parts,
+                parts=[*auto_note_parts, *user_parts],
                 metadata={'telegram_message_id': message.message_id, 'is_edit': is_edit, 'media_group_id': message.media_group_id},
             )
-            if auto_note_parts:
-                await self.runtime.record_auto_user_note(session_id=session_id, parts=auto_note_parts, metadata={'telegram_message_id': message.message_id, 'source': 'telegram_ingest'})
             stored = await self.runtime.ingest_user_message(session_id=session_id, incoming_message=envelope)
             candidate = ReplyCandidate(
                 stored_message_id=stored.db_id,
