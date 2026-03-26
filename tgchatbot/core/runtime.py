@@ -2506,7 +2506,7 @@ class AgentRuntime:
             return self._normalize_single_tool_message(message)
         metadata = message.metadata if isinstance(message.metadata, dict) else {}
         synthetic_role = str(metadata.get('synthetic_role') or '').strip().lower()
-        is_auto_note = synthetic_role == 'auto_user_note' or any((part.origin or '') == 'auto_note' for part in message.parts)
+        is_auto_note = synthetic_role == 'auto_user_note'
         if is_auto_note:
             text = self._normalize_auto_note_message(message)
             return ConversationMessage.assistant_text(text, metadata={'source_role': 'transport'}) if text else None
@@ -2520,7 +2520,11 @@ class AgentRuntime:
     def _normalize_regular_message_text(self, message: ConversationMessage) -> str:
         text_parts: list[str] = []
         attachment_parts: list[str] = []
+        auto_note_parts: list[MessagePart] = []
         for part in message.parts:
+            if (part.origin or '').strip().lower() == 'auto_note':
+                auto_note_parts.append(part)
+                continue
             if part.kind == PartKind.TEXT:
                 text = (part.text or '').strip()
                 if text:
@@ -2532,6 +2536,9 @@ class AgentRuntime:
                 attachment_parts.append(self._describe_attachment_part(part))
         reasoning_summaries = self._message_reasoning_summaries(message)
         lines: list[str] = []
+        transport_text = self._normalize_auto_note_parts(auto_note_parts)
+        if transport_text:
+            lines.append(transport_text)
         if text_parts:
             lines.append(' '.join(text_parts))
         for summary in reasoning_summaries[:2]:
@@ -2572,45 +2579,18 @@ class AgentRuntime:
         return False
 
     def _normalize_auto_note_message(self, message: ConversationMessage) -> str:
-        username = None
-        nickname = None
-        timestamp = None
-        synced_attachments: list[str] = []
-        other_notes: list[str] = []
-        for part in message.parts:
+        return self._normalize_auto_note_parts(message.parts)
+
+    def _normalize_auto_note_parts(self, parts: list[MessagePart]) -> str:
+        texts: list[str] = []
+        for part in parts:
             if part.kind != PartKind.TEXT:
                 continue
             text = (part.text or '').strip()
             if not text or text == '[Auto-generated bot message, do not reply.]':
                 continue
-            meta_match = re.match(r'^\[Message metadata:\s*username=(?P<username>\S+)\s+nickname="(?P<nickname>[^"]*)"\s+time=(?P<time>[^\]]+)\]$', text)
-            if meta_match:
-                username = meta_match.group('username')
-                nickname = meta_match.group('nickname')
-                timestamp = meta_match.group('time')
-                continue
-            synced_match = re.match(r'^\[Attachment synced to remote for tool use:\s*(?P<filename>.+?)\s*->\s*(?P<path>.+)\]$', text)
-            if synced_match:
-                synced_attachments.append(f"{synced_match.group('filename')} -> {synced_match.group('path')}")
-                continue
-            other_notes.append(text)
-        fragments: list[str] = []
-        if username or nickname or timestamp:
-            who_bits = []
-            if username:
-                who_bits.append(username)
-            if nickname:
-                who_bits.append(f'nickname="{nickname}"')
-            who_text = ' '.join(who_bits).strip()
-            if timestamp:
-                fragments.append(f'User transport metadata: {who_text}; message time={timestamp}.' if who_text else f'User transport metadata: message time={timestamp}.')
-            elif who_text:
-                fragments.append(f'User transport metadata: {who_text}.')
-        if synced_attachments:
-            fragments.append('Attachments synced to remote workspace: ' + '; '.join(synced_attachments) + '.')
-        if other_notes:
-            fragments.append('Transport notes: ' + ' '.join(other_notes))
-        return '\n'.join(fragment for fragment in fragments if fragment).strip()
+            texts.append(text)
+        return '\n'.join(texts).strip()
 
     def _normalize_tool_pair(self, call_message: ConversationMessage, result_message: ConversationMessage) -> str:
         call_meta = call_message.metadata if isinstance(call_message.metadata, dict) else {}

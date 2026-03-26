@@ -24,9 +24,10 @@ def build_system_prompt(settings: SessionSettings) -> str:
 
     memory_guidance = ('This conversation is persistent across interactions. Keep recent working context verbatim when practical.'
                        'Older context may be represented by durable episode memory blocks and auxiliary digest memory blocks; do not assume every memory block is equally authoritative.')
-    metadata_guidance = ('Some user messages may begin with an automatic metadata (sender) header'
-                         'in the form [username=<handle> nickname="<display name>" time=<local timestamp>] or similar.'
-                         'Treat these headers as transport context, not as text the user wrote. ')
+    metadata_guidance = ('Some user messages may include prepended automatic transport auto-notes on the same message, '
+                         'such as [Message metadata: username=<handle> nickname="<display name>" time=<local timestamp>], '
+                         '[Link prefetched, content: ...], or attachment sync notes. '
+                         'Treat these prepended notes as transport context attached to that user turn, not as text the user wrote. ')
     style_guidance = 'Respond in either plaintext or Markdown. '
     attachment_guidance = ('Images, stickers, and files in message history are part of the ongoing conversation context.'
                            'Earlier files may change after shell or Python edits.') if settings.mode != ChatMode.CHAT else ''
@@ -94,6 +95,7 @@ def build_compaction_prompt(*, mode: str) -> str:
         'For user_intent_or_shared_context: in task_execution, record the ask or problem to solve; in chat_or_sharing, record what and which user shared, reacted to, wanted acknowledged, or wanted the assistant to keep in mind.',
         'For why_it_mattered: in task_execution, record motivation, stakes, blockers, deadlines, or success criteria; in chat_or_sharing, record emotional significance, relationship context, reason for sharing, or why the topic mattered. Leave empty rather than inventing detail.',
         'For results_or_takeaways: in task_execution, record the answer, fix, output, or verified conclusion; in chat_or_sharing, record the main takeaway, updated understanding, social outcome, or memory-worthy point. It is fine if the result is simply that the user shared an update and no action was required.',
+        'Some user turns may start with prepended transport auto-note lines such as [Message metadata: ...], [Link prefetched, content: ...], or [Attachment synced to remote for tool use: ...]. These lines belong to that same user turn and are transport context, not separate speakers.',
     ]
     field_guidance = {
         'toolspan': [

@@ -216,11 +216,10 @@ async def extract_message_parts(
         sticker_bytes = buf.getvalue()
         is_video = bool(getattr(message.sticker, 'is_video', False))
         is_animated = bool(getattr(message.sticker, 'is_animated', False))
-        sticker_ext = '.webm' if is_video else '.tgs' if is_animated else '.webp'
         sticker_kind = 'video' if is_video else 'animated' if is_animated else 'static'
         sticker_emoji = getattr(message.sticker, 'emoji', None)
         hint = f'[User sent {sticker_kind} sticker' + (f' {sticker_emoji}' if sticker_emoji else '') + ']'
-        parts.append(MessagePart(kind=PartKind.STICKER, text=hint, filename=f'sticker{sticker_ext}', remote_sync=False))
+        parts.append(MessagePart(kind=PartKind.STICKER, text=hint, remote_sync=False))
         if telegram_config.max_sticker_bytes <= 0 or telegram_config.max_sticker_frames <= 0:
             parts.append(MessagePart(kind=PartKind.TEXT, text='[Sticker preview disabled by config]', origin='auto_note'))
         else:

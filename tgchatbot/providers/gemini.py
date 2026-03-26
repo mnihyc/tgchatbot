@@ -512,7 +512,7 @@ class GeminiProvider:
                 descriptor += ']'
                 parts.append({'text': descriptor})
             elif part.kind == PartKind.STICKER:
-                parts.append({'text': part.text or f"[Sticker: {part.filename or 'sticker'}]"})
+                parts.append({'text': part.text or '[Sticker]'})
         if not parts:
             return []
         return [{'role': role, 'parts': parts}]
