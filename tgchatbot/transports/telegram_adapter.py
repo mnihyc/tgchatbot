@@ -81,6 +81,7 @@ class ReplyCandidate:
     stored_message_id: int
     user_display_name: str
     source_message: Message
+    spontaneous: bool = False
 
 
 @dataclass(slots=True)
@@ -1342,17 +1343,22 @@ class TelegramBotApp:
                 stored_message_id=stored.db_id,
                 user_display_name=user_name,
                 source_message=message,
+                spontaneous=bool(is_group and not group_explicit_reply),
             )
         finally:
             await self._mark_ingest_finished(state)
             logger.info('tg.ingest.done chat=%s msg=%s inflight=%s', self._chat_log_id(chat.id), message.message_id, state.ingest_inflight)
 
+        if is_group:
+            await self._clear_pending_spontaneous_candidate(chat.id, newer_message_id=candidate.stored_message_id)
+
         if should_reply:
             if is_group:
                 settings = await self.store.get_or_create_session(session_id, self._default_settings())
                 delay_s = self.runtime._effective_group_reply_delay_s(settings) if group_explicit_reply else self.runtime._effective_group_spontaneous_reply_delay_s(settings)
+                delay_param = 'group_reply_delay_s' if group_explicit_reply else 'group_spontaneous_reply_delay_s'
                 token = await self._next_reply_token(state)
-                logger.info('tg.reply.schedule chat=%s msg=%s token=%s delay_s=%.2f group=1 explicit=%s', self._chat_log_id(chat.id), candidate.stored_message_id, token, delay_s, int(bool(group_explicit_reply)))
+                logger.info('tg.reply.schedule chat=%s msg=%s token=%s delay_s=%.2f delay_param=%s group=1 explicit=%s', self._chat_log_id(chat.id), candidate.stored_message_id, token, delay_s, delay_param, int(bool(group_explicit_reply)))
                 if group_explicit_reply:
                     asyncio.create_task(self._promote_candidate_after_delay(chat.id, token, candidate, delay_s))
                 else:
@@ -1360,7 +1366,7 @@ class TelegramBotApp:
             else:
                 delay_s = self.runtime._effective_private_reply_delay_s(settings)
                 token = await self._next_reply_token(state)
-                logger.info('tg.reply.schedule chat=%s msg=%s token=%s delay_s=%.2f group=0', self._chat_log_id(chat.id), candidate.stored_message_id, token, delay_s)
+                logger.info('tg.reply.schedule chat=%s msg=%s token=%s delay_s=%.2f delay_param=%s group=0', self._chat_log_id(chat.id), candidate.stored_message_id, token, delay_s, 'private_reply_delay_s')
                 asyncio.create_task(self._promote_candidate_after_delay(chat.id, token, candidate, delay_s))
         else:
             if is_group:
@@ -1784,6 +1790,22 @@ class TelegramBotApp:
         async with state.mutex:
             state.latest_reply_token += 1
             return state.latest_reply_token
+
+    async def _clear_pending_spontaneous_candidate(self, chat_id: int, *, newer_message_id: int) -> None:
+        state = self._flow_state(chat_id)
+        cleared_message_id: int | None = None
+        async with state.mutex:
+            pending = state.latest_reply_candidate
+            if pending and pending.spontaneous and pending.stored_message_id < newer_message_id:
+                cleared_message_id = pending.stored_message_id
+                state.latest_reply_candidate = None
+        if cleared_message_id is not None:
+            logger.info(
+                'tg.reply.spontaneous.cancel chat=%s pending_msg=%s newer_msg=%s',
+                self._chat_log_id(chat_id),
+                cleared_message_id,
+                newer_message_id,
+            )
 
     async def _cancel_pending_reply(self, chat_id: int) -> None:
         state = self._flow_state(chat_id)
