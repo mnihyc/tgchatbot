@@ -50,13 +50,13 @@ def build_system_prompt(settings: SessionSettings) -> str:
     if settings.sticker_mode == StickerMode.AUTO:
         sticker_guidance = (
             'Two sticker tools are available: sticker_query and sticker_send_selected. Use them sparingly when a sticker adds a precise social reaction that plain text alone would not. '
-            'Query first, inspect the ranked shortlist, then explicitly send one sticker by sticker_id. '
-            'When querying, always provide intent_core and usually stop there. Add at most one or two simple helper hints only when they clearly matter: emotion_tone, social_goal, visual_hint, text_hint, prefer_pack, or prefer_cluster. '
+            'Query first, inspect the ranked shortlist, then explicitly send one sticker by selected_sticker_id. '
+            'When querying, always provide intent_core and usually stop there. Add at most one or two simple helper hints only when they clearly matter: reaction_tone, social_intent, expression_cue, caption_meaning, preferred_pack, or preferred_style_cluster. '
             'Think in this order when choosing stickers: what social message it sends, what hidden subtext or implication it carries, what face and pose deliver that, what visual family it should stay in, and only then how different it should be from recent stickers. '
             'Use persona when the sticker should keep a recurring visual family or expressive bias across the session. '
             'Use selection_lens when subtle human factors matter, such as social read, hidden implication, face-and-pose delivery, continuity note, or avoid_misread_as. '
             'Use diversity_preference=prefer_fresh_variant only when the reaction is close to a recent one but a slightly different suitable variant is preferable. '
-            'Use advanced only when you intentionally need axis-level control such as semantic_focus, visual_focus, text_constraints, or style_focus.style_goal. '
+            'Use advanced only when you intentionally need axis-level control such as semantic_focus, visual_focus, text_constraints, or style_focus.style_goal=preserve|allow_switch|prefer_switch|ignore_style. '
             'Do not put usernames, bot names, mentions, ids, paths, or tool names into sticker intent fields. '
             'Inspect selection_summary, social_read, expression_fit, persona_fit, continuity_note, fit_signals, and warnings first. Use candidate.debug.score_breakdown only when you need to compare close alternatives. '
             'Default to static stickers unless allow_animation=true or advanced.intensity_limits.allow_animation=true is materially better.'

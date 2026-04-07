@@ -531,18 +531,10 @@ class TelegramMessageRenderer:
         reply_to_message_id = self._reply_to_message_id()
         receipts: list[dict[str, object]] = []
         for sticker in stickers:
-            receipt: dict[str, object] = {
-                'sticker_id': sticker.source_id,
-                'relative_path': str(sticker.path),
-                'label': sticker.label,
-                'timing': sticker.timing.value,
-                'emoji': sticker.emoji,
-                'delivery_state': 'failed',
-                'sent': False,
-            }
+            receipt: dict[str, object] = sticker.delivery_receipt()
             if not sticker.path.exists():
                 receipt['error'] = 'missing_file'
-                logger.warning('Sticker file missing: %s', sticker.path)
+                logger.warning('Sticker file missing for %s', sticker.display_reference())
                 receipts.append(receipt)
                 continue
             try:
@@ -552,7 +544,7 @@ class TelegramMessageRenderer:
                 receipt['sent'] = True
                 receipt['telegram_message_id'] = getattr(sent_message, 'message_id', None)
             except Exception as exc:
-                logger.exception('Failed to send sticker %s', sticker.path)
+                logger.exception('Failed to send sticker %s', sticker.display_reference())
                 receipt['error'] = exc.__class__.__name__
             receipts.append(receipt)
         return receipts

@@ -180,6 +180,19 @@ class OutboundSticker:
     telegram_message_id: int | None = None
     error: str | None = None
 
+    def display_reference(self) -> str:
+        return str(self.source_id or self.label or self.path.stem or 'sticker').strip() or 'sticker'
+
+    def delivery_receipt(self) -> dict[str, Any]:
+        return {
+            'sticker_id': self.source_id or self.path.stem,
+            'sticker_label': self.label,
+            'delivery_timing': self.timing.value,
+            'emoji': self.emoji,
+            'delivery_state': 'failed',
+            'sent': False,
+        }
+
 
 @dataclass(slots=True)
 class ToolResult:

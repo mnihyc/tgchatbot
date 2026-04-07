@@ -1730,15 +1730,7 @@ class TelegramBotApp:
     async def _send_stickers_direct(self, source_message: Message, stickers: list[OutboundSticker]) -> list[dict[str, object]]:
         receipts: list[dict[str, object]] = []
         for sticker in stickers:
-            receipt: dict[str, object] = {
-                'sticker_id': sticker.source_id,
-                'relative_path': str(sticker.path),
-                'label': sticker.label,
-                'timing': sticker.timing.value,
-                'emoji': sticker.emoji,
-                'delivery_state': 'failed',
-                'sent': False,
-            }
+            receipt: dict[str, object] = sticker.delivery_receipt()
             if not sticker.path.exists():
                 receipt['error'] = 'missing_file'
                 receipts.append(receipt)
@@ -1747,11 +1739,11 @@ class TelegramBotApp:
                 with sticker.path.open('rb') as fh:
                     sent_message = await source_message.get_bot().send_sticker(chat_id=source_message.chat.id, sticker=fh, emoji=sticker.emoji, reply_to_message_id=self._reply_to_message_id(source_message))
                 receipt['delivery_state'] = 'sent'
-                logger.info('tg.sticker.sent chat=%s sticker=%s timing=%s', self._chat_log_id(source_message.chat.id), clip_for_log(sticker.source_id or sticker.path.name, limit=48), sticker.timing.value)
+                logger.info('tg.sticker.sent chat=%s sticker=%s timing=%s', self._chat_log_id(source_message.chat.id), clip_for_log(sticker.display_reference(), limit=48), sticker.timing.value)
                 receipt['sent'] = True
                 receipt['telegram_message_id'] = getattr(sent_message, 'message_id', None)
             except Exception as exc:
-                logger.exception('Failed to send sticker %s', sticker.path)
+                logger.exception('Failed to send sticker %s', sticker.display_reference())
                 receipt['error'] = exc.__class__.__name__
             receipts.append(receipt)
         return receipts
