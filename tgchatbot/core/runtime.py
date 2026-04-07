@@ -533,6 +533,9 @@ class AgentRuntime:
         state = await self._get_live_state(session_id)
         settings = await self.store.get_or_create_session(session_id, self.config.default_session_settings())
         provider = self._require_provider(settings.provider)
+        l0_blocks = sum(1 for block in state.blocks if block.level == 0)
+        l1_blocks = sum(1 for block in state.blocks if block.level == 1)
+        l2_blocks = sum(1 for block in state.blocks if block.level == 2)
         tools = self.tool_registry.list_tools(
             allow_python_exec=policy_for_mode(settings.mode).allow_python_exec,
             allow_stickers=(settings.sticker_mode == StickerMode.AUTO),
@@ -633,6 +636,9 @@ class AgentRuntime:
             'raw_messages': len(state.raw_messages),
             'tool_history_messages': sum(1 for item in state.raw_messages if item.message.role == MessageRole.TOOL),
             'memory_blocks': len(state.blocks),
+            'l0_blocks': l0_blocks,
+            'l1_blocks': l1_blocks,
+            'l2_blocks': l2_blocks,
             'estimated_history_tokens': request_estimate.history_tokens,
             'estimated_request_tokens': request_estimate.total_tokens,
             'estimated_request_images': self._estimate_request_images(state),

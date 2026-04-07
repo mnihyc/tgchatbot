@@ -347,7 +347,7 @@ class TelegramBotApp:
             'Session',
             f"provider={session_status['provider']} model={session_status['model']}",
             f"mode={session_status['mode']} process={session_status['process']} delivery={session_status['delivery']} stickers={session_status['stickers']}",
-            f"raw_messages={session_status['raw_messages']} memory_blocks={session_status['memory_blocks']} provider_history_messages={session_status['provider_history_messages']}",
+            f"raw_messages={session_status['raw_messages']} memory_blocks={session_status['memory_blocks']} l0_blocks={session_status['l0_blocks']} l1_blocks={session_status['l1_blocks']} l2_blocks={session_status['l2_blocks']} provider_history_messages={session_status['provider_history_messages']}",
             f"estimated_request_tokens={session_status['estimated_request_tokens']} estimated_request_images={session_status['estimated_request_images']}",
             f"compact_trigger_tokens={session_status['compact_trigger_tokens']} compact_target_tokens={session_status['compact_target_tokens']}",
             f"reply_running={flow['reply_running']} ingest_inflight={flow['ingest_inflight']}",
@@ -360,7 +360,7 @@ class TelegramBotApp:
         lines.extend([
             '',
             'Context',
-            f"raw_messages={session_status['raw_messages']} tool_history_messages={session_status['tool_history_messages']} memory_blocks={session_status['memory_blocks']} provider_history_messages={session_status['provider_history_messages']}",
+            f"raw_messages={session_status['raw_messages']} tool_history_messages={session_status['tool_history_messages']} memory_blocks={session_status['memory_blocks']} l0_blocks={session_status['l0_blocks']} l1_blocks={session_status['l1_blocks']} l2_blocks={session_status['l2_blocks']} provider_history_messages={session_status['provider_history_messages']}",
             f"estimated_history_tokens={session_status['estimated_history_tokens']} estimated_request_tokens={session_status['estimated_request_tokens']}",
             f"estimated_request_images={session_status['estimated_request_images']} max_input_images={session_status['max_input_images']} compact_target_images={session_status['compact_target_images']}",
             f"compact_trigger_tokens={session_status['compact_trigger_tokens']} compact_target_tokens={session_status['compact_target_tokens']} compact_batch_tokens={session_status['compact_batch_tokens']} compact_keep_recent_ratio={session_status['compact_keep_recent_ratio']} compact_tool_ratio_threshold={session_status['compact_tool_ratio_threshold']} compact_tool_min_tokens={session_status['compact_tool_min_tokens']} compact_min_messages={session_status['compact_min_messages']} min_raw_messages_reserve={session_status['min_raw_messages_reserve']}",
