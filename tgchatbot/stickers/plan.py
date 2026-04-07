@@ -7,10 +7,10 @@ from typing import Any
 from tgchatbot.stickers.persona import PERSONA_MODES, build_persona_dict, persona_has_values
 
 _TEXT_PRIORITIES = {'require', 'prefer', 'ignore'}
-_STYLE_GOALS = {'keep_current', 'allow_switch', 'prefer_switch', 'ignore_style'}
+_STYLE_GOALS = {'preserve', 'allow_switch', 'prefer_switch', 'ignore_style'}
 _DIVERSITY_PREFERENCES = {'default', 'prefer_fresh_variant'}
 _LEGACY_STYLE_POLICY_TO_GOAL = {
-    'continue': 'keep_current',
+    'continue': 'preserve',
     'neutral': 'allow_switch',
     'prefer_switch': 'prefer_switch',
     'hard_switch': 'ignore_style',
@@ -184,7 +184,7 @@ class VisualFocus:
 
 @dataclass(slots=True)
 class StyleFocus:
-    style_goal: str = 'keep_current'
+    style_goal: str = 'preserve'
     style_hints: list[str] = field(default_factory=list)
     prefer_pack: str = ''
     prefer_cluster: str = ''
@@ -195,6 +195,14 @@ class StyleFocus:
             'style_hints': list(self.style_hints),
             'prefer_pack': self.prefer_pack,
             'prefer_cluster': self.prefer_cluster,
+        }
+
+    def display_dict(self) -> dict[str, Any]:
+        return {
+            'style_goal': self.style_goal,
+            'style_hints': list(self.style_hints),
+            'preferred_pack': self.prefer_pack,
+            'preferred_style_cluster': self.prefer_cluster,
         }
 
 
@@ -248,6 +256,15 @@ class SimpleHints:
     def request_texts(self) -> list[str]:
         return [value for value in [self.emotion_tone, self.social_goal, self.visual_hint, self.text_hint] if value]
 
+    def display_dict(self) -> dict[str, Any]:
+        return {
+            'reaction_tone': self.emotion_tone,
+            'social_intent': self.social_goal,
+            'expression_cue': self.visual_hint,
+            'caption_meaning': self.text_hint,
+            'diversity_preference': self.diversity_preference,
+        }
+
 
 @dataclass(slots=True)
 class PersonaVisualIdentity:
@@ -274,6 +291,16 @@ class PersonaVisualIdentity:
     def request_texts(self) -> list[str]:
         fields = list(self.active_fields().values())
         return [*fields, *list(self.style_hints)]
+
+    def display_dict(self) -> dict[str, Any]:
+        return {
+            'character_archetype': self.character_archetype,
+            'rendering_style': self.rendering_style,
+            'palette_mood': self.palette_mood,
+            'style_hints': list(self.style_hints),
+            'preferred_pack': self.prefer_pack,
+            'preferred_style_cluster': self.prefer_cluster,
+        }
 
 
 @dataclass(slots=True)
@@ -316,6 +343,21 @@ class StickerPersona:
 
     def request_texts(self) -> list[str]:
         return [*self.visual_identity.request_texts(), *self.affect_profile.request_texts()]
+
+    def display_dict(self) -> dict[str, Any]:
+        visual_identity = self.visual_identity.display_dict()
+        affect_profile = self.affect_profile.as_dict()
+        payload: dict[str, Any] = {}
+        has_visual_identity = any(bool(value) for key, value in visual_identity.items() if key == 'style_hints') or any(
+            str(value or '').strip()
+            for key, value in visual_identity.items()
+            if key != 'style_hints'
+        )
+        if has_visual_identity:
+            payload['visual_identity'] = visual_identity
+        if affect_profile:
+            payload['affect_profile'] = affect_profile
+        return payload
 
 
 @dataclass(slots=True)
@@ -372,6 +414,12 @@ class StickerRetrievalPlan:
         advanced = _norm_mapping(data.get('advanced'))
         deprecated_aliases_used: dict[str, Any] = {}
         for key in (
+            'emotion_tone',
+            'social_goal',
+            'visual_hint',
+            'text_hint',
+            'prefer_pack',
+            'prefer_cluster',
             'semantic_focus',
             'visual_focus',
             'style_focus',
@@ -414,10 +462,10 @@ class StickerRetrievalPlan:
             return cleaned
 
         simple_hints = SimpleHints(
-            emotion_tone=sanitize_from(field_name='emotion_tone', primary=data.get('emotion_tone')),
-            social_goal=sanitize_from(field_name='social_goal', primary=data.get('social_goal')),
-            visual_hint=sanitize_from(field_name='visual_hint', primary=data.get('visual_hint')),
-            text_hint=sanitize_from(field_name='text_hint', primary=data.get('text_hint')),
+            emotion_tone=sanitize_from(field_name='reaction_tone', primary=data.get('reaction_tone'), fallback=data.get('emotion_tone')),
+            social_goal=sanitize_from(field_name='social_intent', primary=data.get('social_intent'), fallback=data.get('social_goal')),
+            visual_hint=sanitize_from(field_name='expression_cue', primary=data.get('expression_cue'), fallback=data.get('visual_hint')),
+            text_hint=sanitize_from(field_name='caption_meaning', primary=data.get('caption_meaning'), fallback=data.get('text_hint')),
             diversity_preference=_normalize_diversity_preference(data.get('diversity_preference')),
         )
         persona_source = _norm_mapping(data.get('persona'))
@@ -441,6 +489,14 @@ class StickerRetrievalPlan:
 
         legacy_text_priority = _norm_text(data.get('text_priority', '')).lower()
         legacy_style_policy = _norm_text(data.get('style_policy', '')).lower()
+        if 'prefer_pack' in style_source:
+            deprecated_aliases_used['advanced.style_focus.prefer_pack'] = style_source.get('prefer_pack')
+        if 'prefer_cluster' in style_source:
+            deprecated_aliases_used['advanced.style_focus.prefer_cluster'] = style_source.get('prefer_cluster')
+        if 'prefer_pack' in persona_visual_source:
+            deprecated_aliases_used['persona.visual_identity.prefer_pack'] = persona_visual_source.get('prefer_pack')
+        if 'prefer_cluster' in persona_visual_source:
+            deprecated_aliases_used['persona.visual_identity.prefer_cluster'] = persona_visual_source.get('prefer_cluster')
 
         semantic_focus = SemanticFocus(
             reaction_type=sanitize_from(field_name='advanced.semantic_focus.reaction_type', primary=semantic_source.get('reaction_type')),
@@ -466,12 +522,12 @@ class StickerRetrievalPlan:
         field_warnings.extend(warnings)
         raw_style_goal = _norm_text(style_source.get('style_goal', '')).lower()
         if raw_style_goal not in _STYLE_GOALS:
-            raw_style_goal = _LEGACY_STYLE_POLICY_TO_GOAL.get(legacy_style_policy, 'keep_current')
+            raw_style_goal = _LEGACY_STYLE_POLICY_TO_GOAL.get(legacy_style_policy, 'preserve')
         style_focus = StyleFocus(
             style_goal=raw_style_goal,
             style_hints=style_hints,
-            prefer_pack=_norm_text(style_source.get('prefer_pack', data.get('prefer_pack', ''))),
-            prefer_cluster=_norm_text(style_source.get('prefer_cluster', data.get('prefer_cluster', ''))),
+            prefer_pack=_norm_text(style_source.get('preferred_pack', style_source.get('prefer_pack', data.get('preferred_pack', data.get('prefer_pack', ''))))),
+            prefer_cluster=_norm_text(style_source.get('preferred_style_cluster', style_source.get('prefer_cluster', data.get('preferred_style_cluster', data.get('prefer_cluster', ''))))),
         )
         must_include, dropped, warnings = _sanitize_text_list('advanced.text_constraints.must_include', text_source.get('must_include'))
         dropped_noise_terms.extend(dropped)
@@ -499,8 +555,8 @@ class StickerRetrievalPlan:
                 rendering_style=sanitize_from(field_name='persona.visual_identity.rendering_style', primary=persona_visual_source.get('rendering_style')),
                 palette_mood=sanitize_from(field_name='persona.visual_identity.palette_mood', primary=persona_visual_source.get('palette_mood')),
                 style_hints=persona_style_hints,
-                prefer_pack=_norm_text(persona_visual_source.get('prefer_pack', '')),
-                prefer_cluster=_norm_text(persona_visual_source.get('prefer_cluster', '')),
+                prefer_pack=_norm_text(persona_visual_source.get('preferred_pack', persona_visual_source.get('prefer_pack', ''))),
+                prefer_cluster=_norm_text(persona_visual_source.get('preferred_style_cluster', persona_visual_source.get('prefer_cluster', ''))),
             ),
             affect_profile=PersonaAffectProfile(
                 default_tone=sanitize_from(field_name='persona.affect_profile.default_tone', primary=persona_affect_source.get('default_tone')),
@@ -695,9 +751,9 @@ class StickerRetrievalPlan:
         if self.visual_focus.active_fields():
             fields.append('advanced.visual_focus')
         if self.prefer_pack:
-            fields.append('prefer_pack')
+            fields.append('preferred_pack')
         if self.prefer_cluster:
-            fields.append('prefer_cluster')
+            fields.append('preferred_style_cluster')
         if self.has_persona_request:
             fields.append('persona')
         if self.selection_lens.active_fields():
@@ -713,14 +769,14 @@ class StickerRetrievalPlan:
             'send': self.send,
             'intent_core': self.intent_core,
             'secondary_goals': list(self.secondary_goals),
-            'simple_hints': self.simple_hints.as_dict(),
+            'simple_hints': self.simple_hints.display_dict(),
             'persona_mode': self.persona_mode,
-            'persona': self.persona.as_dict(),
+            'persona': self.persona.display_dict(),
             'selection_lens': self.selection_lens.as_dict(),
             'advanced': {
                 'semantic_focus': self.semantic_focus.as_dict(),
                 'visual_focus': self.visual_focus.as_dict(),
-                'style_focus': self.style_focus.as_dict(),
+                'style_focus': self.style_focus.display_dict(),
                 'text_constraints': self.text_constraints.as_dict(),
                 'intensity_limits': self.intensity_limits.as_dict(),
                 'forbid': list(self.forbid),

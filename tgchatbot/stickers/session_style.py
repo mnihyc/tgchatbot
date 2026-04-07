@@ -7,11 +7,12 @@ from typing import Any, Deque, Iterable
 from tgchatbot.stickers.persona import build_persona_dict, compact_persona_dict, merge_persona_dicts, persona_has_values
 
 _STYLE_GOAL_ALIASES = {
-    'continue': 'keep_current',
+    'continue': 'preserve',
     'neutral': 'allow_switch',
     'prefer_switch': 'prefer_switch',
     'hard_switch': 'ignore_style',
-    'keep_current': 'keep_current',
+    'preserve': 'preserve',
+    'keep_current': 'preserve',
     'allow_switch': 'allow_switch',
     'ignore_style': 'ignore_style',
 }
@@ -19,7 +20,7 @@ _STYLE_GOAL_ALIASES = {
 
 def normalize_style_goal(value: str | None) -> str:
     normalized = str(value or '').strip().lower()
-    return _STYLE_GOAL_ALIASES.get(normalized, 'keep_current')
+    return _STYLE_GOAL_ALIASES.get(normalized, 'preserve')
 
 
 @dataclass(slots=True)
@@ -46,7 +47,7 @@ class SessionStyleState:
         *,
         candidate_style_cluster: str | None,
         candidate_source_pack_id: str | None,
-        style_goal: str = 'keep_current',
+        style_goal: str = 'preserve',
         style_policy: str | None = None,
     ) -> float:
         goal = normalize_style_goal(style_policy or style_goal)
@@ -67,11 +68,11 @@ class SessionStyleState:
                 bonus += 0.08
             return bonus
         if same_cluster:
-            bonus += 1.35 if goal == 'keep_current' else 0.70
+            bonus += 1.35 if goal == 'preserve' else 0.70
         if same_pack:
-            bonus += 0.40 if goal == 'keep_current' else 0.18
+            bonus += 0.40 if goal == 'preserve' else 0.18
         if seen_recent_cluster:
-            bonus += 0.15 if goal == 'keep_current' else 0.10
+            bonus += 0.15 if goal == 'preserve' else 0.10
         return bonus
 
     def repeat_penalty(
@@ -122,7 +123,7 @@ class SessionStyleState:
         *,
         current_score: float,
         candidate_score: float,
-        style_goal: str = 'keep_current',
+        style_goal: str = 'preserve',
         style_policy: str | None = None,
     ) -> bool:
         goal = normalize_style_goal(style_policy or style_goal)
@@ -130,7 +131,7 @@ class SessionStyleState:
             return True
         if self.style_cluster is None:
             return True
-        threshold = 0.8 if goal == 'keep_current' else 0.45
+        threshold = 0.8 if goal == 'preserve' else 0.45
         return (candidate_score - current_score) >= threshold
 
     def relation(
@@ -138,7 +139,7 @@ class SessionStyleState:
         *,
         candidate_style_cluster: str | None,
         candidate_source_pack_id: str | None,
-        style_goal: str = 'keep_current',
+        style_goal: str = 'preserve',
         style_policy: str | None = None,
     ) -> dict[str, Any]:
         goal = normalize_style_goal(style_policy or style_goal)

@@ -69,6 +69,13 @@ logger = logging.getLogger(__name__)
 EventCallback = Callable[[RuntimeEvent], Awaitable[None]]
 
 
+class CompactionModelRequestFailed(RuntimeError):
+    def __init__(self, *, provider_name: str, mode: str) -> None:
+        super().__init__(f'Compaction model request failed for provider={provider_name} mode={mode}')
+        self.provider_name = provider_name
+        self.mode = mode
+
+
 class AgentRuntime:
     def __init__(
         self,
@@ -796,13 +803,13 @@ class AgentRuntime:
         return text[:limit] + marker + text[-rlimit:]
 
     def _tool_observation_summary(self, *, name: str, phase: str, payload: dict[str, Any]) -> str:
-        payload_text = self._compact_json(payload)
         if phase == 'call':
-            return f'[Tool call {name}: {payload_text}]'
+            return self._describe_tool_call(name, payload)
         if phase == 'result':
-            return f'[Tool result {name}: {payload_text}]'
+            return self._describe_tool_result(name, payload)
         if phase == 'delivery':
-            return f'[Tool delivery {name}: {payload_text}]'
+            return self._describe_tool_delivery(name, payload)
+        payload_text = self._compact_json(payload)
         return f'[Tool event {name}: {payload_text}]'
 
     async def _generate_with_retries(self, *, provider, settings: SessionSettings, messages: list[ConversationMessage], instructions: str, tools, extra_input_items):
@@ -1242,35 +1249,44 @@ class AgentRuntime:
                 detail += f'; images {image_count}/{image_limit}'
             await emit(RuntimeEvent(kind='phase', title=phase_title, detail=detail))
 
-        if token_overflow:
-            while total_estimate > compact_target_tokens:
-                changed = await self._compact_old_context(session_id=session_id, settings=settings, provider=provider, state=state, pressure=False, emit=emit)
-                if not changed and total_estimate > compact_target_tokens:
-                    changed = await self._compact_old_context(session_id=session_id, settings=settings, provider=provider, state=state, pressure=True, emit=emit)
-                if not changed:
-                    logger.warning('Unable to compact session %s below target; remaining estimate=%s images=%s', session_id, total_estimate, image_count)
-                    break
-                total_estimate = self._estimate_request_tokens(
-                    state,
-                    settings=settings,
-                    provider=provider,
-                    instructions=instructions,
-                    tools=tools,
-                )
-                image_count = self._estimate_request_images(state)
+        try:
+            if token_overflow:
+                while total_estimate > compact_target_tokens:
+                    changed = await self._compact_old_context(session_id=session_id, settings=settings, provider=provider, state=state, pressure=False, emit=emit)
+                    if not changed and total_estimate > compact_target_tokens:
+                        changed = await self._compact_old_context(session_id=session_id, settings=settings, provider=provider, state=state, pressure=True, emit=emit)
+                    if not changed:
+                        logger.warning('Unable to compact session %s below target; remaining estimate=%s images=%s', session_id, total_estimate, image_count)
+                        break
+                    total_estimate = self._estimate_request_tokens(
+                        state,
+                        settings=settings,
+                        provider=provider,
+                        instructions=instructions,
+                        tools=tools,
+                    )
+                    image_count = self._estimate_request_images(state)
 
-        image_count = self._estimate_request_images(state)
-        if image_limit is not None and image_count > image_limit:
-            image_target_limit = image_target if image_target is not None else image_limit
-            removed_images = await self._compact_oldest_images(
-                session_id=session_id,
-                settings=settings,
-                state=state,
-                target_images=image_target_limit,
-                emit=emit,
+            image_count = self._estimate_request_images(state)
+            if image_limit is not None and image_count > image_limit:
+                image_target_limit = image_target if image_target is not None else image_limit
+                removed_images = await self._compact_oldest_images(
+                    session_id=session_id,
+                    settings=settings,
+                    state=state,
+                    target_images=image_target_limit,
+                    emit=emit,
+                )
+                if not removed_images and image_count > image_limit:
+                    logger.warning('Unable to compact images for session %s below limit; remaining images=%s limit=%s target=%s', session_id, image_count, image_limit, image_target_limit)
+        except CompactionModelRequestFailed as exc:
+            logger.warning(
+                'compact.halt sid=%s provider=%s mode=%s reason=model_request_failed',
+                self._session_log_id(session_id),
+                exc.provider_name,
+                exc.mode,
             )
-            if not removed_images and image_count > image_limit:
-                logger.warning('Unable to compact images for session %s below limit; remaining images=%s limit=%s target=%s', session_id, image_count, image_limit, image_target_limit)
+            return
 
     def _estimate_request_tokens(
         self,
@@ -2249,7 +2265,7 @@ class AgentRuntime:
             return self._parse_candidate_json(response.final_text or '', mode=mode)
         except Exception as exc:
             logger.exception('compact.model_failed provider=%s mode=%s err=%s', provider.name, mode, exc.__class__.__name__)
-            return None
+            raise CompactionModelRequestFailed(provider_name=provider.name, mode=mode) from exc
 
     @staticmethod
     def _raw_message_time_bounds(messages: list[StoredConversationMessage], timezone: str) -> tuple[str | None, str | None]:
@@ -2620,6 +2636,8 @@ class AgentRuntime:
             text = self._describe_tool_call(name, payload)
         elif phase == 'result':
             text = self._describe_tool_result(name, payload)
+        elif phase == 'delivery':
+            text = self._describe_tool_delivery(name, payload)
         else:
             text = self._normalize_regular_message_text(message)
         if visible_text and text and visible_text not in text:
@@ -2639,6 +2657,10 @@ class AgentRuntime:
             code = self._clip_inline(arguments.get('code'), 180)
             if code:
                 details.append(f'ran Python code {code!r}')
+        elif name == 'sticker_query':
+            details.extend(self._describe_sticker_query_call(arguments))
+        elif name == 'sticker_send_selected':
+            details.extend(self._describe_sticker_send_call(arguments))
         elif arguments:
             details.append(f'called with arguments {self._clip_inline(self._compact_json(arguments, limit=180), 180)!r}')
         cwd = arguments.get('cwd_subdir')
@@ -2654,20 +2676,161 @@ class AgentRuntime:
         output = payload.get('output') if isinstance(payload.get('output'), dict) else {}
         details: list[str] = []
         if output:
-            if 'ok' in output:
-                details.append(f"ok={bool(output.get('ok'))}")
-            if output.get('returncode') is not None:
-                details.append(f"returncode={output.get('returncode')}")
-            stdout = self._clip_inline(output.get('stdout'), 180)
-            stderr = self._clip_inline(output.get('stderr'), 180)
-            if stdout:
-                details.append(f'stdout={stdout!r}')
-            if stderr:
-                details.append(f'stderr={stderr!r}')
+            if name == 'sticker_query':
+                details.extend(self._describe_sticker_query_result(output))
+            elif name == 'sticker_send_selected':
+                details.extend(self._describe_sticker_send_result(output))
+            else:
+                if 'ok' in output:
+                    details.append(f"ok={bool(output.get('ok'))}")
+                if output.get('returncode') is not None:
+                    details.append(f"returncode={output.get('returncode')}")
+                stdout = self._clip_inline(output.get('stdout'), 180)
+                stderr = self._clip_inline(output.get('stderr'), 180)
+                if stdout:
+                    details.append(f'stdout={stdout!r}')
+                if stderr:
+                    details.append(f'stderr={stderr!r}')
         elif payload:
             details.append(self._clip_inline(self._compact_json(payload, limit=220), 220))
         prefix = f'Tool {name} result'
         return prefix + (': ' + '; '.join(details) if details else ' recorded')
+
+    def _describe_tool_delivery(self, name: str, payload: dict[str, Any]) -> str:
+        if name == 'sticker_send':
+            details = self._describe_sticker_delivery(payload)
+            prefix = f'Tool {name} delivery'
+            return prefix + (': ' + '; '.join(details) if details else ' recorded')
+        payload_text = self._clip_inline(self._compact_json(payload, limit=220), 220)
+        prefix = f'Tool {name} delivery'
+        return prefix + (': ' + payload_text if payload_text else ' recorded')
+
+    def _describe_sticker_query_call(self, arguments: dict[str, Any]) -> list[str]:
+        details: list[str] = []
+        intent = self._clip_inline(arguments.get('intent_core'), 96)
+        if intent:
+            details.append(f'query stickers for intent={intent!r}')
+        tone = self._clip_inline(arguments.get('reaction_tone', arguments.get('emotion_tone')), 60)
+        if tone:
+            details.append(f'tone={tone!r}')
+        social = self._clip_inline(arguments.get('social_intent', arguments.get('social_goal')), 60)
+        if social:
+            details.append(f'social={social!r}')
+        expression = self._clip_inline(arguments.get('expression_cue', arguments.get('visual_hint')), 60)
+        if expression:
+            details.append(f'expression={expression!r}')
+        caption = self._clip_inline(arguments.get('caption_meaning', arguments.get('text_hint')), 60)
+        if caption:
+            details.append(f'caption={caption!r}')
+        preferred_pack = self._clip_inline(arguments.get('preferred_pack', arguments.get('prefer_pack')), 48)
+        if preferred_pack:
+            details.append(f'pack={preferred_pack!r}')
+        preferred_cluster = self._clip_inline(arguments.get('preferred_style_cluster', arguments.get('prefer_cluster')), 48)
+        if preferred_cluster:
+            details.append(f'cluster={preferred_cluster!r}')
+        candidate_budget = arguments.get('candidate_budget')
+        if candidate_budget is not None:
+            details.append(f'candidate_budget={candidate_budget}')
+        return details
+
+    def _describe_sticker_send_call(self, arguments: dict[str, Any]) -> list[str]:
+        details: list[str] = []
+        sticker_id = self._clip_inline(arguments.get('selected_sticker_id', arguments.get('sticker_id')), 48)
+        if sticker_id:
+            details.append(f'send sticker_id={sticker_id!r}')
+        delivery_timing = self._clip_inline(arguments.get('delivery_timing', arguments.get('timing')), 32)
+        if delivery_timing:
+            details.append(f'delivery_timing={delivery_timing}')
+        return details
+
+    def _describe_sticker_query_result(self, output: dict[str, Any]) -> list[str]:
+        details: list[str] = []
+        details.append(f"ok={bool(output.get('ok'))}")
+        if not output.get('ok'):
+            error = self._clip_inline(output.get('error'), 120)
+            if error:
+                details.append(f'error={error!r}')
+            culprit_fields = output.get('likely_culprit_fields') if isinstance(output.get('likely_culprit_fields'), list) else []
+            if culprit_fields:
+                details.append('likely_culprit_fields=' + ', '.join(str(item) for item in culprit_fields[:4]))
+            return details
+        candidates = output.get('candidates') if isinstance(output.get('candidates'), list) else []
+        details.append(f'candidate_count={len(candidates)}')
+        if output.get('field_warnings'):
+            warnings = output.get('field_warnings') if isinstance(output.get('field_warnings'), list) else []
+            if warnings:
+                details.append(f'field_warning={self._clip_inline(warnings[0], 100)!r}')
+        top_candidates: list[str] = []
+        for candidate in candidates[:2]:
+            if not isinstance(candidate, dict):
+                continue
+            top_candidates.append(self._describe_sticker_candidate(candidate))
+        if top_candidates:
+            details.append('top_candidates=' + ' | '.join(top_candidates))
+        return details
+
+    def _describe_sticker_send_result(self, output: dict[str, Any]) -> list[str]:
+        details: list[str] = []
+        details.append(f"ok={bool(output.get('ok'))}")
+        if not output.get('ok'):
+            error = self._clip_inline(output.get('error'), 120)
+            if error:
+                details.append(f'error={error!r}')
+            return details
+        sticker_id = self._clip_inline(output.get('sticker_id'), 48)
+        if sticker_id:
+            details.append(f'sticker_id={sticker_id!r}')
+        status = self._clip_inline(output.get('status'), 32)
+        if status:
+            details.append(f'status={status}')
+        delivery_timing = self._clip_inline(output.get('delivery_timing', output.get('timing')), 32)
+        if delivery_timing:
+            details.append(f'delivery_timing={delivery_timing}')
+        pack_id = self._clip_inline(output.get('source_pack_id'), 48)
+        if pack_id:
+            details.append(f'pack={pack_id!r}')
+        cluster_id = self._clip_inline(output.get('style_cluster'), 48)
+        if cluster_id:
+            details.append(f'cluster={cluster_id!r}')
+        style_summary = self._clip_inline(output.get('style_summary'), 80)
+        if style_summary:
+            details.append(f'style={style_summary!r}')
+        semantic_summary = self._clip_inline(output.get('semantic_summary', output.get('social_read')), 80)
+        if semantic_summary:
+            details.append(f'semantic={semantic_summary!r}')
+        return details
+
+    def _describe_sticker_delivery(self, payload: dict[str, Any]) -> list[str]:
+        details: list[str] = []
+        sticker_id = self._clip_inline(payload.get('sticker_id'), 48)
+        if sticker_id:
+            details.append(f'sticker_id={sticker_id!r}')
+        label = self._clip_inline(payload.get('sticker_label'), 60)
+        if label:
+            details.append(f'label={label!r}')
+        delivery_timing = self._clip_inline(payload.get('delivery_timing'), 32)
+        if delivery_timing:
+            details.append(f'delivery_timing={delivery_timing}')
+        delivery_state = self._clip_inline(payload.get('delivery_state'), 32)
+        if delivery_state:
+            details.append(f'state={delivery_state}')
+        if payload.get('sent') is not None:
+            details.append(f"sent={bool(payload.get('sent'))}")
+        telegram_message_id = payload.get('telegram_message_id')
+        if telegram_message_id is not None:
+            details.append(f'telegram_message_id={telegram_message_id}')
+        error = self._clip_inline(payload.get('error'), 60)
+        if error:
+            details.append(f'error={error!r}')
+        return details
+
+    def _describe_sticker_candidate(self, candidate: dict[str, Any]) -> str:
+        sticker_id = self._clip_inline(candidate.get('sticker_id'), 40) or '?'
+        pack_id = self._clip_inline(candidate.get('source_pack_id'), 32) or '-'
+        cluster_id = self._clip_inline(candidate.get('style_cluster'), 32) or '-'
+        style_summary = self._clip_inline(candidate.get('style_summary'), 56) or '-'
+        semantic_summary = self._clip_inline(candidate.get('semantic_summary', candidate.get('social_read') or candidate.get('summary')), 72) or '-'
+        return f'{sticker_id} pack={pack_id} cluster={cluster_id} style={style_summary!r} semantic={semantic_summary!r}'
 
     @staticmethod
     def _describe_attachment_part(part: MessagePart) -> str:

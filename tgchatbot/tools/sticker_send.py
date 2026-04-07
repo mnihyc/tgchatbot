@@ -25,12 +25,39 @@ def _round_mapping(values: dict[str, Any]) -> dict[str, Any]:
     return {key: _round_number(value) for key, value in values.items()}
 
 
+def _compact_text(value: Any, *, limit: int = 160) -> str:
+    text = ' '.join(str(value or '').split()).strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + '...'
+
+
+def _semantic_summary(entry: Any) -> str:
+    return _compact_text(
+        entry.sticker_card.get('fused_pragmatic_meaning')
+        or entry.sticker_semantic_text
+        or entry.caption_semantic_text
+        or entry.summary
+    )
+
+
+def _style_summary(entry: Any) -> str:
+    return _compact_text(entry.style_text or '')
+
+
+def _caption_summary(entry: Any) -> str:
+    return _compact_text(entry.caption_meaning_en or entry.caption_meaning_zh or entry.source_overlay_text_normalized or '')
+
+
 def _compact_entry_payload(entry: Any) -> dict[str, Any]:
     return {
         'sticker_id': entry.sticker_id,
         'summary': entry.summary,
         'source_pack_id': entry.source_pack_id,
         'style_cluster': entry.style_cluster,
+        'style_summary': _style_summary(entry),
+        'semantic_summary': _semantic_summary(entry),
+        'caption_summary': _caption_summary(entry),
         'animated': entry.animated,
         'emoji': entry.emoji,
     }
@@ -173,10 +200,10 @@ def _advanced_schema() -> dict[str, Any]:
                 'type': 'object',
                 'description': 'Advanced style continuity controls.',
                 'properties': {
-                    'style_goal': _param('string', 'How strongly to keep or switch style families.', enum=['keep_current', 'allow_switch', 'prefer_switch', 'ignore_style'], default='keep_current'),
+                    'style_goal': _param('string', 'How strongly to preserve or switch style families.', enum=['preserve', 'allow_switch', 'prefer_switch', 'ignore_style'], default='preserve'),
                     'style_hints': _param('array', 'Optional visual-family hints like rough manga line, pastel, or deadpan meme.', items={'type': 'string'}),
-                    'prefer_pack': _param('string', 'Optional preferred source pack id or nearby pack family name.'),
-                    'prefer_cluster': _param('string', 'Optional preferred style cluster id.'),
+                    'preferred_pack': _param('string', 'Optional pack family or source pack id to preserve or stay near.'),
+                    'preferred_style_cluster': _param('string', 'Optional style cluster id to preserve or stay near.'),
                 },
                 'additionalProperties': False,
             },
@@ -220,8 +247,8 @@ def _persona_schema() -> dict[str, Any]:
                     'rendering_style': _param('string', 'Persistent rendering family, for example flat anime sticker, rough manga, or glossy chibi.'),
                     'palette_mood': _param('string', 'Persistent palette or visual mood, for example soft pastel, monochrome, or bright candy.'),
                     'style_hints': _param('array', 'Persistent style-family hints.', items={'type': 'string'}),
-                    'prefer_pack': _param('string', 'Persistent preferred source pack id or nearby pack family name.'),
-                    'prefer_cluster': _param('string', 'Persistent preferred style cluster id.'),
+                    'preferred_pack': _param('string', 'Persistent pack family or source pack id to preserve or stay near.'),
+                    'preferred_style_cluster': _param('string', 'Persistent style cluster id to preserve or stay near.'),
                 },
                 'additionalProperties': False,
             },
@@ -264,7 +291,7 @@ class StickerQueryTool:
             name='sticker_query',
             description=(
                 'Query the sticker system with a simple-first plan. Always provide intent_core. '
-                'Only add 1-3 or more helper hints when they clearly matter: emotion_tone, social_goal, visual_hint, text_hint, prefer_pack, prefer_cluster, or etc. '
+                'Only add one to three helper hints when they clearly matter: reaction_tone, social_intent, expression_cue, caption_meaning, preferred_pack, or preferred_style_cluster. '
                 'Use diversity_preference=prefer_fresh_variant only when you want a slightly fresher variant than recent similar queries. '
                 'Use persona when the sticker should keep a recurring visual or expressive identity across the session. '
                 'Use selection_lens when subtle subtext, face, pose, or social read matters. '
@@ -276,12 +303,12 @@ class StickerQueryTool:
                     'send': _param('boolean', 'Whether the bot actually wants to send a sticker after this query.', default=True),
                     'intent_core': _param('string', 'Required core reaction meaning in plain language, for example dry amused refusal or warm supportive acknowledgement.'),
                     'secondary_goals': _param('array', 'Optional extra nuances that materially refine the reaction.', items={'type': 'string'}),
-                    'emotion_tone': _param('string', 'Optional simple tone hint, for example dry amused, warm, irritated, bashful, or smug.'),
-                    'social_goal': _param('string', 'Optional simple social-use hint, for example reassure, lightly tease, acknowledge, celebrate, or dismiss.'),
-                    'visual_hint': _param('string', 'Optional simple visible-expression hint, for example side-eye, blank stare, pout, or tiny shrug.'),
-                    'text_hint': _param('string', 'Optional simple caption/overlay hint when written text meaning matters.'),
-                    'prefer_pack': _param('string', 'Optional preferred source pack id or nearby pack family name.'),
-                    'prefer_cluster': _param('string', 'Optional preferred style cluster id.'),
+                    'reaction_tone': _param('string', 'Optional simple reaction tone, for example dry amused, warm, irritated, bashful, or smug.'),
+                    'social_intent': _param('string', 'Optional simple social intent, for example reassure, lightly tease, acknowledge, celebrate, or dismiss.'),
+                    'expression_cue': _param('string', 'Optional simple face or pose cue, for example side-eye, blank stare, pout, or tiny shrug.'),
+                    'caption_meaning': _param('string', 'Optional caption or overlay meaning hint when visible text matters.'),
+                    'preferred_pack': _param('string', 'Optional pack family or source pack id to preserve or stay near.'),
+                    'preferred_style_cluster': _param('string', 'Optional style cluster id to preserve or stay near.'),
                     'diversity_preference': _param('string', 'Whether to keep normal ranking or slightly prefer fresher variants than very recent ones.', enum=['default', 'prefer_fresh_variant'], default='default'),
                     'allow_animation': _param('boolean', 'Allow animated stickers if they fit better.', default=False),
                     'candidate_budget': _param('integer', 'How many ranked candidates to return.', minimum=1, maximum=8, default=5),
@@ -349,7 +376,7 @@ class StickerQueryTool:
                     'dropped_noise_terms': list(plan.dropped_noise_terms),
                     'candidate_count': len(matches),
                     'candidates': [_candidate_payload(match) for match in matches],
-                    'selection_guidance': 'Pick one sticker_id using selection_summary, social_read, expression_fit, persona_fit, continuity_note, fit_signals, and warnings first; inspect candidate.debug.score_breakdown only when you need to compare close variants.',
+                    'selection_guidance': 'Pick one candidate sticker_id using selection_summary, social_read, expression_fit, persona_fit, continuity_note, fit_signals, and warnings first; then pass it as selected_sticker_id to sticker_send_selected. Inspect candidate.debug.score_breakdown only when you need to compare close variants.',
                 },
             )
         except Exception as exc:
@@ -366,10 +393,10 @@ class StickerSendSelectedTool:
             parameters_schema={
                 'type': 'object',
                 'properties': {
-                    'sticker_id': _param('string', 'Exact sticker_id returned by sticker_query.'),
-                    'timing': _param('string', 'Whether to send the sticker immediately now or after the final text.', enum=['send_now', 'after_final', 'before_final']),
+                    'selected_sticker_id': _param('string', 'Exact sticker_id returned by sticker_query.'),
+                    'delivery_timing': _param('string', 'Whether to send the sticker immediately now or after the final text.', enum=['send_now', 'after_final', 'before_final']),
                 },
-                'required': ['sticker_id'],
+                'required': ['selected_sticker_id'],
                 'additionalProperties': False,
             },
             runner=self,
@@ -379,10 +406,10 @@ class StickerSendSelectedTool:
         try:
             if not self.catalog.loaded:
                 self.catalog.load()
-            sticker_id = str(args.get('sticker_id', '') or '').strip()
+            sticker_id = str(args.get('selected_sticker_id', args.get('sticker_id', '')) or '').strip()
             if not sticker_id:
-                return ToolResult(call_id='', name=self.spec.name, output={'ok': False, 'error': 'Empty sticker_id'})
-            timing_raw = str(args.get('timing', 'after_final') or 'after_final').strip().lower()
+                return ToolResult(call_id='', name=self.spec.name, output={'ok': False, 'error': 'Empty selected_sticker_id'})
+            timing_raw = str(args.get('delivery_timing', args.get('timing', 'after_final')) or 'after_final').strip().lower()
             timing = StickerTiming.parse(timing_raw)
             entry = self.catalog.get_by_sticker_id(sticker_id)
             if entry is None:
@@ -403,6 +430,7 @@ class StickerSendSelectedTool:
                 output={
                     'ok': True,
                     'status': 'success',
+                    'delivery_timing': timing.value,
                     'timing': timing.value,
                     'selection_summary': _send_selection_summary(entry, style_context_after_send),
                     'style_context_after_send': style_context_after_send,

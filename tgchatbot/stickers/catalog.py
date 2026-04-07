@@ -952,7 +952,7 @@ def _select_with_style_goal(scored: list[StickerMatch], *, top_k: int, session_s
             diversity_penalty = 0.0
             style_guard_penalty = 0.0
             if not selected:
-                if goal in {'keep_current', 'allow_switch'} and session_style.style_cluster and candidate.entry.style_cluster != session_style.style_cluster:
+                if goal in {'preserve', 'allow_switch'} and session_style.style_cluster and candidate.entry.style_cluster != session_style.style_cluster:
                     anchored = [m for m in pool if m.entry.style_cluster == session_style.style_cluster]
                     if anchored:
                         anchored_best = anchored[0].score
@@ -963,7 +963,7 @@ def _select_with_style_goal(scored: list[StickerMatch], *, top_k: int, session_s
                 max_similarity = max(similarity(candidate, chosen) for chosen in selected)
                 diversity_penalty = (1.0 - lambda_diversity) * max_similarity
                 value = (lambda_diversity * relevance) - diversity_penalty
-                if goal in {'keep_current', 'allow_switch'} and session_style.style_cluster and candidate.entry.style_cluster != session_style.style_cluster:
+                if goal in {'preserve', 'allow_switch'} and session_style.style_cluster and candidate.entry.style_cluster != session_style.style_cluster:
                     if not session_style.should_allow_switch(current_score=selected[0].base_score or selected[0].score, candidate_score=candidate.base_score or candidate.score, style_goal=goal):
                         style_guard_penalty = 0.9
                         value -= style_guard_penalty
@@ -1263,7 +1263,7 @@ def _hard_mismatches(*, plan: StickerRetrievalPlan, style_relation: dict[str, An
         mismatches.append('missing required caption meaning: ' + ', '.join(text_profile['missing_must_include']))
     if text_profile['blocked_avoid_terms']:
         mismatches.append('caption meaning conflicts with avoid list: ' + ', '.join(text_profile['blocked_avoid_terms']))
-    if plan.style_goal == 'keep_current' and style_relation.get('relation_label') == 'style_switch' and style_relation.get('current_style_cluster'):
+    if plan.style_goal == 'preserve' and style_relation.get('relation_label') == 'style_switch' and style_relation.get('current_style_cluster'):
         mismatches.append('switches away from the current style cluster')
     if semantic_profile['missing'] and len(semantic_profile['requested']) <= 2:
         mismatches.extend(f'missing semantic axis: {field}' for field in semantic_profile['missing'])
@@ -1330,7 +1330,7 @@ def _build_selection_summary(*, entry: StickerIndexEntry, plan: StickerRetrieval
         parts.append('stays in the current style family')
     elif relation_label == 'style_switch' and plan.style_goal == 'prefer_switch':
         parts.append('intentionally switches style')
-    elif relation_label == 'style_switch' and plan.style_goal == 'keep_current':
+    elif relation_label == 'style_switch' and plan.style_goal == 'preserve':
         parts.append('switches style despite the continuity preference')
     if diversity_relation.get('mode') == 'prefer_fresh_variant':
         labels = diversity_relation.get('labels') or []
