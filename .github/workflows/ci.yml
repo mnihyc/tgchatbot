@@ -1,0 +1,40 @@
+name: CI
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_call:
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python: ['3.12', '3.13']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          version: '0.11.16'
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - name: Install locked runtime dependencies
+        run: uv sync --frozen --no-dev
+      - name: Mock business and deployment regression tests (no service credentials)
+        run: uv run --frozen python -m unittest discover -s tests -v
+      - name: Check deployment shell syntax
+        run: |
+          bash -n deploy/update.sh
+          sh -n deploy/entrypoint.sh
+          bash -n deploy/smoke-image.sh
+      - name: Validate Compose without reading secrets
+        run: TGCHATBOT_IMAGE=tgchatbot:ci docker compose --env-file /dev/null -f deploy/compose.yml config --quiet
+
+  retriever:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Test Rust retriever with committed dependency lock
+        run: cargo test --locked --manifest-path retriever/Cargo.toml

@@ -22,6 +22,7 @@ enum Command {
     },
     Serve {
         #[arg(long)] index_dir: PathBuf,
+        #[arg(long, default_value = "127.0.0.1")] bind: std::net::IpAddr,
         #[arg(long, default_value_t = 4107)] port: u16,
     },
 }
@@ -32,6 +33,6 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Build { docs_jsonl, index_dir } => indexer::build_index(&docs_jsonl, &index_dir),
-        Command::Serve { index_dir, port } => search::serve(index_dir, port).await,
+        Command::Serve { index_dir, bind, port } => search::serve(index_dir, bind, port).await,
     }
 }

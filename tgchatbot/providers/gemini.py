@@ -74,6 +74,7 @@ class GeminiProvider:
         if settings.model.startswith('gemini-3'):
             thinking_budget_note += ' On Gemini 3 it is a legacy fallback and is ignored when thinking_level is set.'
         return {
+            **{name: ControlDescriptor(True, str(getattr(settings, name) if getattr(settings, name) is not None else getattr(self.config, name)), 'session' if getattr(settings, name) is not None else 'default') for name in ('temperature', 'top_p', 'top_k')},
             'include_thoughts': ControlDescriptor(
                 gemini_supports_thinking(settings.model),
                 include_thoughts,

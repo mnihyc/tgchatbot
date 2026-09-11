@@ -306,7 +306,7 @@ class AgentRuntime:
         total_steps = max_tool_rounds + 1
         for iteration in range(total_steps):
             final_iteration = iteration == max_tool_rounds
-            current_tools = [] if final_iteration else tools
+            current_tools = [] if final_iteration or not provider.capabilities.function_tools else tools
             iteration_instructions = instructions
             if final_iteration and tools:
                 # The last round intentionally disables tools. This keeps multi-step turns bounded and,
@@ -442,10 +442,13 @@ class AgentRuntime:
                         metadata_update=metadata_update,
                     )
                     logger.info('tool.call sid=%s name=%s call=%s args=%s', self._session_log_id(session_id), tool_call.name, clip_for_log(tool_call.call_id, limit=32), self._tool_argument_summary(tool_call.arguments))
-                    spec = self.tool_registry.get(tool_call.name)
+                    # The current request is the authority for executable tools.
+                    # A model can emit calls even when tools are disabled or the
+                    # final response round explicitly advertises no tools.
+                    spec = next((item for item in current_tools if item.name == tool_call.name), None)
                     if spec is None:
-                        logger.warning('tool.unknown sid=%s name=%s', self._session_log_id(session_id), tool_call.name)
-                        tool_output = {'ok': False, 'error': f'Unknown tool: {tool_call.name}'}
+                        logger.warning('tool.unavailable sid=%s name=%s', self._session_log_id(session_id), tool_call.name)
+                        tool_output = {'ok': False, 'error': f'Tool unavailable in this round: {tool_call.name}'}
                     else:
                         if emit and settings.process_visibility != ProcessVisibility.OFF:
                             await emit(
@@ -596,21 +599,21 @@ class AgentRuntime:
             'max_output_tokens_source': controls.get('max_output_tokens').source if controls.get('max_output_tokens') else 'n/a',
             'max_output_tokens_supported': controls.get('max_output_tokens').supported if controls.get('max_output_tokens') else False,
             'max_output_tokens_note': controls.get('max_output_tokens').note if controls.get('max_output_tokens') else None,
-            'temperature': f"{temperature:g}",
+            'temperature': controls['temperature'].effective_value if controls.get('temperature') else 'n/a',
             'temperature_source': 'session' if settings.temperature is not None else 'default',
-            'temperature_supported': settings.provider == 'gemini',
-            'temperature_note': 'Gemini generationConfig.temperature; retained across provider switches.',
-            'top_p': f"{top_p:g}",
+            'temperature_supported': bool(controls.get('temperature') and controls['temperature'].supported),
+            'temperature_note': 'Sampling setting; retained across provider switches.',
+            'top_p': controls['top_p'].effective_value if controls.get('top_p') else 'n/a',
             'top_p_source': 'session' if settings.top_p is not None else 'default',
-            'top_p_supported': settings.provider == 'gemini',
-            'top_p_note': 'Gemini generationConfig.topP; retained across provider switches.',
-            'top_k': str(top_k),
+            'top_p_supported': bool(controls.get('top_p') and controls['top_p'].supported),
+            'top_p_note': 'Sampling setting; retained across provider switches.',
+            'top_k': controls['top_k'].effective_value if controls.get('top_k') else 'n/a',
             'top_k_source': 'session' if settings.top_k is not None else 'default',
-            'top_k_supported': settings.provider == 'gemini',
-            'top_k_note': 'Gemini generationConfig.topK; retained across provider switches.',
+            'top_k_supported': bool(controls.get('top_k') and controls['top_k'].supported),
+            'top_k_note': 'Sampling setting; retained across provider switches.',
             'native_web_search_max': format_optional_disabled_int(native_web_search_max, disabled_label='unlimited'),
             'native_web_search_max_source': 'session' if settings.native_web_search_max is not None else 'default',
-            'native_web_search_max_supported': settings.provider == 'openai',
+            'native_web_search_max_supported': bool(controls.get('native_web_search_max') and controls['native_web_search_max'].supported),
             'native_web_search_max_note': 'OpenAI-only cap for built-in web_search tool calls. 0 disables the explicit cap.',
             'prompt_injection_mode': settings.prompt_injection_mode.value,
             'tool_history_mode': settings.tool_history_mode.value,
@@ -714,24 +717,24 @@ class AgentRuntime:
     def _effective_native_web_search_max(self, settings: SessionSettings) -> int | None:
         return effective_optional_disabled_int(
             settings.native_web_search_max,
-            self.config.openai.native_web_search_max,
+            getattr(self.config.provider_config(settings.provider), 'native_web_search_max', 0),
             maximum=NATIVE_WEB_SEARCH_MAX_MAX,
         )
 
     def _effective_temperature(self, settings: SessionSettings) -> float:
         if settings.temperature is not None:
             return clamp_float(settings.temperature, minimum=TEMPERATURE_MIN, maximum=TEMPERATURE_MAX, default=TEMPERATURE_MIN)
-        return clamp_float(self.config.gemini.temperature, minimum=TEMPERATURE_MIN, maximum=TEMPERATURE_MAX, default=TEMPERATURE_MIN)
+        return clamp_float(getattr(self.config.provider_config(settings.provider), 'temperature', None) or TEMPERATURE_MIN, minimum=TEMPERATURE_MIN, maximum=TEMPERATURE_MAX, default=TEMPERATURE_MIN)
 
     def _effective_top_p(self, settings: SessionSettings) -> float:
         if settings.top_p is not None:
             return clamp_float(settings.top_p, minimum=TOP_P_MIN, maximum=TOP_P_MAX, default=TOP_P_MIN)
-        return clamp_float(self.config.gemini.top_p, minimum=TOP_P_MIN, maximum=TOP_P_MAX, default=TOP_P_MIN)
+        return clamp_float(getattr(self.config.provider_config(settings.provider), 'top_p', None) or TOP_P_MIN, minimum=TOP_P_MIN, maximum=TOP_P_MAX, default=TOP_P_MIN)
 
     def _effective_top_k(self, settings: SessionSettings) -> int:
         if settings.top_k is not None:
             return clamp_int(settings.top_k, minimum=TOP_K_MIN, maximum=TOP_K_MAX, default=TOP_K_MIN)
-        return clamp_int(self.config.gemini.top_k, minimum=TOP_K_MIN, maximum=TOP_K_MAX, default=TOP_K_MIN)
+        return clamp_int(getattr(self.config.provider_config(settings.provider), 'top_k', TOP_K_MIN), minimum=TOP_K_MIN, maximum=TOP_K_MAX, default=TOP_K_MIN)
 
     def _effective_compact_trigger_tokens(self, settings: SessionSettings) -> int:
         if settings.compact_trigger_tokens is not None:
@@ -1057,6 +1060,12 @@ class AgentRuntime:
             if not isinstance(item, dict):
                 continue
             item_type = str(item.get('type') or '').strip().lower()
+            if item.get('role') == 'assistant':
+                content = item.get('content')
+                if isinstance(content, str) and content.strip():
+                    texts.append(content.strip())
+                elif isinstance(content, list):
+                    texts.extend(str(part.get('text') or '').strip() for part in content if isinstance(part, dict) and part.get('type') == 'text' and part.get('text'))
             if item_type == 'message':
                 content_items = item.get('content') if isinstance(item.get('content'), list) else []
                 for content in content_items:
@@ -1328,12 +1337,12 @@ class AgentRuntime:
 
     def _effective_max_input_images(self, provider: ModelProvider, settings: SessionSettings) -> int | None:
         name = getattr(provider, 'name', '')
-        default = self.config.gemini.max_input_images if name == 'gemini' else self.config.openai.max_input_images if name == 'openai' else 0
+        default = getattr(provider, 'config', self.config.provider_config(settings.provider)).max_input_images
         return effective_optional_disabled_int(settings.max_input_images, default, maximum=IMAGE_LIMIT_MAX)
 
     def _configured_compact_target_images(self, provider: ModelProvider, settings: SessionSettings) -> int | None:
         name = getattr(provider, 'name', '')
-        default = self.config.gemini.compact_target_images if name == 'gemini' else self.config.openai.compact_target_images if name == 'openai' else 0
+        default = getattr(provider, 'config', self.config.provider_config(settings.provider)).compact_target_images
         return effective_optional_disabled_int(settings.compact_target_images, default, maximum=IMAGE_LIMIT_MAX)
 
     def _effective_compact_target_images(self, provider: ModelProvider, settings: SessionSettings) -> int | None:
@@ -2596,7 +2605,9 @@ class AgentRuntime:
             if not isinstance(item, dict):
                 continue
             item_type = str(item.get('type') or '').strip().lower()
-            if item_type in {'function_call', 'function_call_output'}:
+            if item_type in {'function_call', 'function_call_output'} or item.get('tool_calls') or item.get('role') == 'tool':
+                return True
+            if any(isinstance(part, dict) and ('functionCall' in part or 'functionResponse' in part) for part in item.get('parts') or []):
                 return True
         return False
 
@@ -2859,7 +2870,6 @@ class AgentRuntime:
         if len(text) > limit:
             return text[: limit - 3] + '...'
         return text
-
 
 
 

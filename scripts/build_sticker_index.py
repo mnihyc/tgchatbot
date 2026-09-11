@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import atexit
 import base64
 import gc
@@ -16,7 +17,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from datetime import datetime, timezone
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -24,8 +25,17 @@ import httpx
 import numpy as np
 from PIL import Image
 
-from paddleocr import PaddleOCR
+try:
+    from paddleocr import PaddleOCR
+except ImportError:
+    PaddleOCR = None
 import av
+from dotenv import load_dotenv
+
+from tgchatbot.config import AppConfig, load_config
+from tgchatbot.domain.models import ChatMode, ConversationMessage, MessagePart, MessageRole, PartKind
+from tgchatbot.providers.factory import build_provider
+from tgchatbot.stickers.semantic_index import EmbeddingProvider
 
 SUPPORTED_EXTS = {'.webp', '.webm', '.gif', '.png', '.jpg', '.jpeg', '.mp4'}
 ANIMATED_EXTS = {'webm', 'gif', 'mp4'}
@@ -71,19 +81,17 @@ class BuiltStickerRow:
 class BuildWorkerConfig:
     max_frames: int
     ocr_lang: str
-    openai_base_url: str
-    openai_api_key: str
-    openai_model: str
-    embedding_model: str
-    embedding_dimensions: int
-    openai_read_timeout: float
-    openai_connect_timeout: float
-    openai_retries: int
+    app_config: AppConfig
+    provider_name: str
+    model: str
+    read_timeout: float
+    connect_timeout: float
+    retries: int
 
 
 _WORKER_CONFIG: BuildWorkerConfig | None = None
 _WORKER_OCR: 'PaddleOCRExtractor | None' = None
-_WORKER_LLM: 'OpenAITextClient | None' = None
+_WORKER_LLM: 'StickerAnalysisClient | None' = None
 
 
 def _close_worker_clients() -> None:
@@ -102,20 +110,18 @@ def _init_worker(config: BuildWorkerConfig) -> None:
     _WORKER_OCR = PaddleOCRExtractor(lang=config.ocr_lang)
     if not _WORKER_OCR.available:
         raise RuntimeError('PaddleOCR is required for build_sticker_index.py. Install paddlepaddle and paddleocr first.')
-    _WORKER_LLM = OpenAITextClient(
-        api_key=config.openai_api_key,
-        base_url=config.openai_base_url,
-        model=config.openai_model,
-        embedding_model=config.embedding_model,
-        embedding_dimensions=config.embedding_dimensions,
-        read_timeout=config.openai_read_timeout,
-        connect_timeout=config.openai_connect_timeout,
-        retries=config.openai_retries,
+    _WORKER_LLM = StickerAnalysisClient(
+        config=config.app_config,
+        provider_name=config.provider_name,
+        model=config.model,
+        read_timeout=config.read_timeout,
+        connect_timeout=config.connect_timeout,
+        retries=config.retries,
     )
     atexit.register(_close_worker_clients)
 
 
-def _ensure_worker_state() -> tuple['PaddleOCRExtractor', 'OpenAITextClient', BuildWorkerConfig]:
+def _ensure_worker_state() -> tuple['PaddleOCRExtractor', 'StickerAnalysisClient', BuildWorkerConfig]:
     if _WORKER_CONFIG is None or _WORKER_OCR is None or _WORKER_LLM is None:
         raise RuntimeError('Sticker build worker was used before initialization.')
     return _WORKER_OCR, _WORKER_LLM, _WORKER_CONFIG
@@ -216,74 +222,60 @@ class PaddleOCRExtractor:
                 pass
 
 
-class OpenAITextClient:
+class StickerAnalysisClient:
     def __init__(
         self,
         *,
-        api_key: str,
-        base_url: str,
+        config: AppConfig,
+        provider_name: str,
         model: str,
-        embedding_model: str,
-        embedding_dimensions: int,
-        read_timeout: float,
-        connect_timeout: float,
-        retries: int,
+        read_timeout: float = 300.0,
+        connect_timeout: float = 30.0,
+        retries: int = 2,
     ) -> None:
-        self.api_key = api_key
-        self.base_url = base_url.rstrip('/')
-        self.model = model
-        self.embedding_model = embedding_model
-        self.embedding_dimensions = embedding_dimensions
+        provider_config = replace(config.provider_config(provider_name), request_timeout_s=read_timeout, connect_timeout_s=connect_timeout)
+        if provider_name in {'openai', 'gemini'}:
+            config = replace(config, **{provider_name: provider_config})
+        else:
+            config = replace(config, chat_completions=tuple(provider_config if profile.name == provider_name else profile for profile in config.chat_completions))
+        self.provider = build_provider(config, provider_name)
+        self.runner = asyncio.Runner()
+        self.settings = replace(config.default_session_settings(), provider=provider_name, model=model, mode=ChatMode.CHAT)
         self.retries = max(0, int(retries))
-        self.client = httpx.Client(
-            headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
-            timeout=httpx.Timeout(read_timeout, connect=connect_timeout),
-        )
+        if not self.provider.capabilities.multimodal_input:
+            self.close()
+            raise RuntimeError(f'Sticker visual analysis requires an image-capable provider profile; {provider_name!r} has image input disabled.')
 
     def close(self) -> None:
-        self.client.close()
-
-    def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        last_exc: Exception | None = None
-        for attempt in range(self.retries + 1):
-            try:
-                response = self.client.post(f'{self.base_url}{path}', json=payload)
-                response.raise_for_status()
-                return response.json()
-            except httpx.HTTPStatusError as exc:
-                status = exc.response.status_code
-                last_exc = exc
-                if status not in {408, 409, 425, 429, 500, 502, 503, 504} or attempt >= self.retries:
-                    raise
-            except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError, httpx.TransportError) as exc:
-                last_exc = exc
-                if attempt >= self.retries:
-                    raise
-            time.sleep(min(8.0, 1.5 * (2 ** attempt)))
-        assert last_exc is not None
-        raise last_exc
+        try:
+            self.runner.run(self.provider.aclose())
+        finally:
+            self.runner.close()
 
     def _responses_json(self, *, prompt: str, schema_name: str, schema: dict[str, Any], frame_payloads: list[dict[str, str]]) -> dict[str, Any]:
-        parts: list[dict[str, Any]] = [{'type': 'input_text', 'text': prompt}]
-        for frame in frame_payloads:
-            parts.append({'type': 'input_image', 'image_url': f"data:{frame['mime']};base64,{frame['data']}", 'detail': 'auto'})
-        payload = {
-            'model': self.model,
-            'store': False,
-            'input': [{'role': 'user', 'content': parts}],
-            'text': {'format': {'type': 'json_schema', 'name': schema_name, 'schema': schema, 'strict': True}},
-        }
-        body = self._post_json('/responses', payload)
-        text = body.get('output_text', '')
-        if not text:
-            pieces: list[str] = []
-            for item in body.get('output', []):
-                if item.get('type') == 'message':
-                    for content in item.get('content', []):
-                        if content.get('type') == 'output_text':
-                            pieces.append(content.get('text', ''))
-            text = ''.join(pieces)
-        return json.loads(text)
+        parts = [MessagePart(kind=PartKind.TEXT, text=prompt)]
+        parts.extend(MessagePart(kind=PartKind.IMAGE, mime_type=frame['mime'], data_b64=frame['data']) for frame in frame_payloads)
+        for attempt in range(self.retries + 1):
+            try:
+                response = self.runner.run(self.provider.generate(
+                    settings=self.settings,
+                    messages=[ConversationMessage(role=MessageRole.USER, parts=parts)],
+                    instructions='Analyze the supplied sticker frames and return only the requested JSON object.',
+                    tools=[], response_schema=schema, response_schema_name=schema_name,
+                ))
+                result = json.loads(response.final_text)
+                if not isinstance(result, dict):
+                    raise ValueError('Sticker semantic analysis must return a JSON object')
+                return result
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code not in {408, 409, 425, 429, 500, 502, 503, 504} or attempt >= self.retries:
+                    raise
+            except httpx.TransportError:
+                if attempt >= self.retries:
+                    raise
+            # Preserve the legacy bounded backoff for transient provider failures.
+            time.sleep(min(8.0, 1.5 * (2 ** attempt)))
+        raise RuntimeError('Sticker analysis exhausted provider retries')
 
     def analyze_primary(self, *, relative_path: str, source_format_name: str, ocr_summary: dict[str, Any], frame_payloads: list[dict[str, str]]) -> dict[str, Any]:
         prompt = (
@@ -323,24 +315,6 @@ class OpenAITextClient:
         primary = self.analyze_primary(relative_path=relative_path, source_format_name=source_format_name, ocr_summary=ocr_summary, frame_payloads=frame_payloads)
         revised = self.validate_semantics(relative_path=relative_path, source_format_name=source_format_name, ocr_summary=ocr_summary, candidate=primary, frame_payloads=frame_payloads)
         return revised
-
-    def embed_many(self, texts: list[str], batch_size: int = 128) -> np.ndarray:
-        if not texts:
-            return np.zeros((0, self.embedding_dimensions), dtype=np.float32)
-        batches: list[np.ndarray] = []
-        for start in range(0, len(texts), max(1, batch_size)):
-            payload = {
-                'model': self.embedding_model,
-                'input': texts[start:start + max(1, batch_size)],
-                'dimensions': self.embedding_dimensions,
-            }
-            body = self._post_json('/embeddings', payload)
-            rows = body['data']
-            batch = np.asarray([row['embedding'] for row in rows], dtype=np.float32)
-            norms = np.linalg.norm(batch, axis=1, keepdims=True)
-            norms[norms == 0] = 1.0
-            batches.append(batch / norms)
-        return np.vstack(batches)
 
 def _parse_paddle_predict_result(result: Any) -> dict[str, Any]:
     lines: list[dict[str, Any]] = []
@@ -1185,6 +1159,7 @@ def _write_validation_report(*, built_rows: list[BuiltStickerRow], output_path: 
 
 
 def main() -> None:
+    load_dotenv()
     parser = argparse.ArgumentParser(description='Build sticker metadata, OCR output, semantic cards, Tantivy docs, and local embeddings.')
     parser.add_argument('--stickers-dir', default='./data/stickers')
     parser.add_argument('--index-db', default='./data/sticker_index.sqlite3')
@@ -1195,14 +1170,16 @@ def main() -> None:
     parser.add_argument('--progress-every', type=int, default=int(os.getenv('STICKER_BUILD_PROGRESS_EVERY', '10')))
     parser.add_argument('--max-in-flight', type=int, default=int(os.getenv('STICKER_BUILD_MAX_IN_FLIGHT', '0')))
     parser.add_argument('--worker-max-tasks', type=int, default=int(os.getenv('STICKER_BUILD_WORKER_MAX_TASKS', '100')))
-    parser.add_argument('--openai-base-url', default=os.getenv('OPENAI_BASE_URL', 'https://api.openai.com/v1'))
-    parser.add_argument('--openai-api-key', default=os.getenv('OPENAI_API_KEY', ''))
-    parser.add_argument('--openai-model', default=os.getenv('STICKER_TAGGING_MODEL', 'gpt-5'))
-    parser.add_argument('--embedding-model', default=os.getenv('STICKER_EMBEDDING_MODEL', 'text-embedding-3-large'))
-    parser.add_argument('--embedding-dimensions', type=int, default=int(os.getenv('STICKER_EMBEDDING_DIMENSIONS', '1024')))
-    parser.add_argument('--openai-read-timeout', type=float, default=float(os.getenv('OPENAI_READ_TIMEOUT', '300')))
-    parser.add_argument('--openai-connect-timeout', type=float, default=float(os.getenv('OPENAI_CONNECT_TIMEOUT', '30')))
-    parser.add_argument('--openai-retries', type=int, default=int(os.getenv('OPENAI_REQUEST_RETRIES', '2')))
+    parser.add_argument('--openai-base-url', default=None, help='Legacy override for the OpenAI endpoint only.')
+    parser.add_argument('--openai-api-key', default=None, help='Legacy override for OPENAI_API_KEY.')
+    parser.add_argument('--provider', default=os.getenv('STICKER_TAGGING_PROVIDER', ''), help='Configured provider name; defaults to OpenAI when its key is set, otherwise DEFAULT_PROVIDER.')
+    parser.add_argument('--model', '--openai-model', dest='model', default=os.getenv('STICKER_TAGGING_MODEL', ''), help='Analysis model; --openai-model is a legacy alias.')
+    parser.add_argument('--embedding-model', default=None, help='Override STICKER_EMBEDDING_MODEL.')
+    parser.add_argument('--embedding-dimensions', type=int, default=None, help='Override STICKER_EMBEDDING_DIMENSIONS.')
+    parser.add_argument('--no-embeddings', action='store_true', help='Build lexical search artifacts without embedding API calls.')
+    parser.add_argument('--read-timeout', '--openai-read-timeout', dest='read_timeout', type=float, default=float(os.getenv('OPENAI_READ_TIMEOUT', '300')))
+    parser.add_argument('--connect-timeout', '--openai-connect-timeout', dest='connect_timeout', type=float, default=float(os.getenv('OPENAI_CONNECT_TIMEOUT', '30')))
+    parser.add_argument('--retries', '--openai-retries', dest='retries', type=int, default=int(os.getenv('OPENAI_REQUEST_RETRIES', '2')))
     args = parser.parse_args()
 
     sticker_root = Path(args.stickers_dir).expanduser().resolve()
@@ -1218,21 +1195,31 @@ def main() -> None:
 
     if PaddleOCR is None:
         raise RuntimeError('PaddleOCR is required for build_sticker_index.py. Install paddlepaddle and paddleocr first.')
-    if not args.openai_api_key:
-        raise RuntimeError('OPENAI_API_KEY / --openai-api-key is required. LLM semantic analysis and embeddings are mandatory.')
-
+    for arg, env_name in ((args.openai_api_key, 'OPENAI_API_KEY'), (args.openai_base_url, 'OPENAI_BASE_URL'), (args.embedding_model, 'STICKER_EMBEDDING_MODEL'), (args.embedding_dimensions, 'STICKER_EMBEDDING_DIMENSIONS')):
+        if arg is not None:
+            os.environ[env_name] = str(arg)
+    config = load_config(require_telegram=False)
+    provider_name = args.provider.strip().lower() or ('openai' if config.openai.api_key else config.default_provider)
+    model = args.model.strip() or ('gpt-5' if provider_name == 'openai' else config.default_model_for_provider(provider_name))
+    # Validate capabilities once before spawning OCR workers or mutating the index.
+    analyzer = StickerAnalysisClient(config=config, provider_name=provider_name, model=model)
+    analyzer.close()
+    embedding = None if args.no_embeddings else EmbeddingProvider.from_env()
+    if embedding is not None and not embedding.enabled:
+        raise RuntimeError('Configure STICKER_EMBEDDING_API_KEY (or the selected embedding provider key), or use --no-embeddings.')
+    embedding_model = embedding.model if embedding else ''
+    embedding_dimensions = embedding.dimensions if embedding else 0
+    build_stack = f'paddleocr+{provider_name}+tantivy' + ('+embeddings' if embedding else '')
     sources = _iter_stickers(sticker_root)
     worker_config = BuildWorkerConfig(
         max_frames=max(1, args.max_frames),
         ocr_lang=args.ocr_lang,
-        openai_base_url=args.openai_base_url,
-        openai_api_key=args.openai_api_key,
-        openai_model=args.openai_model,
-        embedding_model=args.embedding_model,
-        embedding_dimensions=args.embedding_dimensions,
-        openai_read_timeout=args.openai_read_timeout,
-        openai_connect_timeout=args.openai_connect_timeout,
-        openai_retries=args.openai_retries,
+        app_config=config,
+        provider_name=provider_name,
+        model=model,
+        read_timeout=args.read_timeout,
+        connect_timeout=args.connect_timeout,
+        retries=args.retries,
     )
 
     con = sqlite3.connect(index_db, timeout=30.0)
@@ -1278,10 +1265,10 @@ def main() -> None:
     build_id = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     con.execute('INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', ('schema_version', STICKER_SCHEMA_VERSION))
     con.execute('INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', ('needs_rebuild', '0'))
-    con.execute('INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', ('build_stack', 'paddleocr+openai+tantivy+embeddings'))
+    con.execute('INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', ('build_stack', build_stack))
     con.execute('INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', ('build_id', build_id))
-    con.execute('INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', ('embedding_dimensions', str(args.embedding_dimensions)))
-    con.execute('INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', ('embedding_model', args.embedding_model))
+    con.execute('INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', ('embedding_dimensions', str(embedding_dimensions)))
+    con.execute('INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', ('embedding_model', embedding_model))
     con.commit()
     con.close()
 
@@ -1290,30 +1277,27 @@ def main() -> None:
             handle.write(json.dumps(doc, ensure_ascii=False) + '\n')
     style_clusters_path.write_text(json.dumps({'clusters': cluster_summary, 'vocab_size': len(vocab)}, ensure_ascii=False, indent=2), encoding='utf-8')
 
-    llm = OpenAITextClient(
-        api_key=args.openai_api_key,
-        base_url=args.openai_base_url,
-        model=args.openai_model,
-        embedding_model=args.embedding_model,
-        embedding_dimensions=args.embedding_dimensions,
-        read_timeout=args.openai_read_timeout,
-        connect_timeout=args.openai_connect_timeout,
-        retries=args.openai_retries,
-    )
-    try:
-        caption_matrix = llm.embed_many(caption_embed_inputs)
-        sticker_matrix = llm.embed_many(sticker_embed_inputs)
-    finally:
-        llm.close()
-    np.save(caption_npy, caption_matrix.astype(np.float32))
-    np.save(sticker_npy, sticker_matrix.astype(np.float32))
-    _write_validation_report(built_rows=built_rows, output_path=validation_report_path, embedding_dimensions=args.embedding_dimensions, embedding_model=args.embedding_model)
-    manifest_path.write_text(json.dumps({'sticker_ids': sticker_ids, 'dimensions': args.embedding_dimensions, 'embedding_model': args.embedding_model, 'build_stack': 'paddleocr+openai+tantivy+embeddings', 'schema_version': STICKER_SCHEMA_VERSION}, ensure_ascii=False, indent=2), encoding='utf-8')
+    if embedding is not None:
+        caption_matrix = embedding.embed_many(caption_embed_inputs)
+        sticker_matrix = embedding.embed_many(sticker_embed_inputs)
+        np.save(caption_npy, caption_matrix.astype(np.float32))
+        np.save(sticker_npy, sticker_matrix.astype(np.float32))
+    _write_validation_report(built_rows=built_rows, output_path=validation_report_path, embedding_dimensions=embedding_dimensions, embedding_model=embedding_model)
+    manifest_path.write_text(json.dumps({
+        'enabled': embedding is not None, 'sticker_ids': sticker_ids,
+        'dimensions': embedding_dimensions, 'embedding_model': embedding_model,
+        'embedding_backend': embedding.backend if embedding else None,
+        'embedding_base_url': embedding.base_url if embedding else None,
+        'build_stack': build_stack, 'schema_version': STICKER_SCHEMA_VERSION,
+    }, ensure_ascii=False, indent=2), encoding='utf-8')
 
     print(f"Indexed {len(sticker_ids)} stickers into {index_db} (new_ok={build_stats['ok']} skipped={build_stats['skipped']} failed={build_stats['failed']})")
     print(f'Wrote Tantivy docs JSONL to {docs_jsonl}')
     print(f'Wrote style clusters to {style_clusters_path}')
-    print(f'Wrote embeddings to {caption_npy} and {sticker_npy}')
+    if embedding is not None:
+        print(f'Wrote embeddings to {caption_npy} and {sticker_npy}')
+    else:
+        print('Embeddings disabled; this index uses lexical search.')
     print(f'Wrote validation report to {validation_report_path}')
     if build_stats['failed']:
         print(f'Logged per-sticker failures to {failures_log_path}')

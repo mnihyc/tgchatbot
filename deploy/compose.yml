@@ -1,0 +1,51 @@
+name: tgchatbot
+
+x-service: &service
+  image: ${TGCHATBOT_IMAGE:?Run ./update.sh to select a release image}
+  pull_policy: never
+  init: true
+  restart: unless-stopped
+  stop_grace_period: 45s
+  working_dir: /app
+  volumes:
+    - ./data:/app/data
+  environment: &environment
+    TGCHATBOT_UID: ${TGCHATBOT_UID:-1000}
+    TGCHATBOT_GID: ${TGCHATBOT_GID:-1000}
+    APP_DATA_DIR: /app/data
+    APP_HEALTH_FILE: /tmp/tgchatbot-health.json
+    STICKER_RETRIEVER_URL: http://retriever:4107
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  retriever:
+    <<: *service
+    command: [retriever]
+    healthcheck:
+      test: [CMD, python, -c, "import json,urllib.request; r=json.load(urllib.request.urlopen('http://127.0.0.1:4107/health',timeout=3)); assert r['status']=='ok' and r['service']=='tantivy_retriever' and r['schema_version']=='human_sticker_v1'"]
+      interval: 5s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  bot:
+    <<: *service
+    command: [python, -m, tgchatbot.app]
+    # Mount the file for python-dotenv: no Compose interpolation of passwords,
+    # dollar signs, quotes or multi-line prompts, and no secrets in image layers.
+    volumes:
+      - ./data:/app/data
+      - ./.env:/app/.env:ro
+    depends_on:
+      retriever:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -m, tgchatbot.healthcheck]
+      interval: 5s
+      timeout: 5s
+      retries: 6
+      start_period: 45s

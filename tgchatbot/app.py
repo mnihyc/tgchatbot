@@ -8,8 +8,7 @@ from dotenv import load_dotenv
 from tgchatbot.config import load_config
 from tgchatbot.core.runtime import AgentRuntime
 from tgchatbot.logging_config import configure_logging
-from tgchatbot.providers.gemini import GeminiProvider
-from tgchatbot.providers.openai_responses import OpenAIResponsesProvider
+from tgchatbot.providers.factory import build_providers
 from tgchatbot.stickers.catalog import StickerCatalog
 from tgchatbot.storage.artifacts import ArtifactStore
 from tgchatbot.storage.presets import PresetStore
@@ -38,14 +37,7 @@ async def _cleanup(remote: RemoteWorkspaceClient, providers: dict[str, object]) 
 
 
 def _build_providers(config) -> dict[str, object]:
-    providers: dict[str, object] = {}
-    if config.openai.api_key:
-        providers['openai'] = OpenAIResponsesProvider(config.openai)
-    if config.gemini.api_key:
-        providers['gemini'] = GeminiProvider(config.gemini)
-    if not providers:
-        raise RuntimeError('At least one provider API key must be configured: OPENAI_API_KEY and/or GEMINI_API_KEY')
-    return providers
+    return build_providers(config)
 
 
 def main() -> None:
@@ -79,12 +71,13 @@ def main() -> None:
         persisted_sessions,
     )
     logger.info('stickers.ready loaded=%s count=%s packs=%s index=%s', sticker_stats.get('loaded'), sticker_stats.get('stickers'), sticker_stats.get('packs'), config.sticker_index_path)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     if remote.enabled:
         logger.info('remote.warmup.start host=%s port=%s', config.ssh_exec.host, config.ssh_exec.port)
-        asyncio.run(remote.warmup())
+        loop.run_until_complete(remote.warmup())
         logger.info('remote.warmup.done ready=%s', getattr(remote, '_master_started', False))
 
-    asyncio.set_event_loop(asyncio.new_event_loop())
     runtime = AgentRuntime(
         config=config,
         store=store,
@@ -104,7 +97,10 @@ def main() -> None:
     except KeyboardInterrupt:
         logger.info('app.stop signal=keyboard_interrupt')
     finally:
-        asyncio.run(_cleanup(remote, providers))
+        loop.run_until_complete(_cleanup(remote, providers))
+        sticker_catalog.retriever.close()
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
         logger.info('app.stop complete=1')
 
 

@@ -1,0 +1,17 @@
+**
+!Dockerfile
+!pyproject.toml
+!uv.lock
+!tgchatbot/
+!tgchatbot/**
+!retriever/
+!retriever/Cargo.toml
+!retriever/Cargo.lock
+!retriever/src/
+!retriever/src/**
+!scripts/
+!scripts/**
+!deploy/
+!deploy/entrypoint.sh
+**/__pycache__
+**/*.pyc

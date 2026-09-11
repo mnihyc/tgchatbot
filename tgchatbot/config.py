@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import os
+import json
+import re
+from typing import Any
 
 from tgchatbot.domain.models import (
     ChatMode,
@@ -107,6 +110,28 @@ class GeminiConfig:
 
 
 @dataclass(frozen=True)
+class ChatCompletionsConfig:
+    """One named endpoint; capabilities are explicit because models differ."""
+
+    name: str
+    api_key: str = field(repr=False)
+    base_url: str
+    model: str
+    max_output_tokens: int = 4096
+    max_input_images: int = 0
+    compact_target_images: int = 0
+    request_timeout_s: float = 60.0
+    connect_timeout_s: float = 15.0
+    temperature: float | None = None
+    top_p: float | None = None
+    multimodal_input: bool = False
+    function_tools: bool = True
+    structured_output: str = 'json_object'
+    token_limit_parameter: str = 'max_tokens'
+    extra_body: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class SSHExecConfig:
     enabled: bool
     host: str
@@ -187,6 +212,7 @@ class AppConfig:
     gemini: GeminiConfig
     ssh_exec: SSHExecConfig
     context: ContextConfig
+    chat_completions: tuple[ChatCompletionsConfig, ...] = ()
 
     @property
     def db_path(self) -> Path:
@@ -208,13 +234,27 @@ class AppConfig:
     def sticker_index_path(self) -> Path:
         return self.data_dir / "sticker_index.sqlite3"
 
-    def default_model_for_provider(self, provider: str) -> str:
+    def provider_config(self, provider: str) -> OpenAIConfig | GeminiConfig | ChatCompletionsConfig:
+        if provider == 'openai':
+            return self.openai
         if provider == 'gemini':
-            return self.gemini.model
-        return self.openai.model
+            return self.gemini
+        for profile in self.chat_completions:
+            if profile.name == provider:
+                return profile
+        raise ValueError(f'Unknown provider: {provider!r}')
+
+    def default_model_for_provider(self, provider: str) -> str:
+        return self.provider_config(provider).model
+
+    def configured_provider_names(self) -> tuple[str, ...]:
+        # Retain Gemini as the legacy preference only when both old keys are present.
+        names = [name for name in ('gemini', 'openai') if self.provider_config(name).api_key]
+        names.extend(profile.name for profile in self.chat_completions if profile.api_key)
+        return tuple(names)
 
     def default_session_settings(self) -> SessionSettings:
-        provider = (self.default_provider or 'gemini').strip().lower() or 'gemini'
+        provider = self.default_provider
         return SessionSettings(
             provider=provider,
             model=self.default_model_for_provider(provider),
@@ -261,20 +301,28 @@ class AppConfig:
         )
 
 
-def load_config() -> AppConfig:
+def load_config(*, require_telegram: bool = True) -> AppConfig:
     data_dir = Path(os.getenv("APP_DATA_DIR", "./data")).expanduser().resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
 
     token = os.getenv("TGBOT_TOKEN", "").strip()
-    if not token:
+    if require_telegram and not token:
         raise RuntimeError("TGBOT_TOKEN not set")
 
     default_system_prompt_value = os.getenv('DEFAULT_SYSTEM_PROMPT', '').strip() or default_system_prompt()
 
+    chat_completions = _load_chat_completions_profiles()
+    configured = [name for name in ('gemini', 'openai') if os.getenv(f'{name.upper()}_API_KEY', '').strip()]
+    configured.extend(profile.name for profile in chat_completions)
+    default_provider = os.getenv('DEFAULT_PROVIDER', '').strip().lower()
+    if not default_provider:
+        default_provider = configured[0] if configured else ''
+
     return AppConfig(
         data_dir=data_dir,
         log_level=os.getenv("LOG_LEVEL", "INFO"),
-        default_provider=_choice(os.getenv("DEFAULT_PROVIDER", "gemini"), "gemini", {"openai", "gemini"}),
+        default_provider=default_provider,
+        chat_completions=chat_completions,
         default_chat_mode=_choice(os.getenv('DEFAULT_CHAT_MODE', 'chat'), 'chat', {mode.value for mode in ChatMode}),
         default_process_visibility=_choice(os.getenv('DEFAULT_PROCESS_VISIBILITY', 'status'), 'status', {value.value for value in ProcessVisibility}),
         default_response_delivery=_choice(os.getenv("DEFAULT_RESPONSE_DELIVERY", "edit"), "edit", {value.value for value in ResponseDelivery}),
@@ -373,3 +421,110 @@ def load_config() -> AppConfig:
             min_raw_messages_reserve=parse_bounded_int_env(os.getenv("CONTEXT_MIN_RAW_MESSAGES_RESERVE"), default=8, minimum=MIN_RAW_MESSAGES_RESERVE_MIN, maximum=MIN_RAW_MESSAGES_RESERVE_MAX),
         ),
     )
+
+
+def _load_chat_completions_profiles() -> tuple[ChatCompletionsConfig, ...]:
+    profiles: list[ChatCompletionsConfig] = []
+    for name, base_url, model in (
+        ('deepseek', 'https://api.deepseek.com', 'deepseek-flash'),
+        ('openrouter', 'https://openrouter.ai/api/v1', ''),
+    ):
+        prefix = name.upper()
+        api_key = os.getenv(f'{prefix}_API_KEY', '').strip()
+        if not api_key:
+            continue
+        values = {
+            'name': name,
+            'api_key': api_key,
+            'base_url': os.getenv(f'{prefix}_BASE_URL', base_url),
+            'model': os.getenv(f'{prefix}_MODEL', model),
+            'multimodal_input': _bool(os.getenv(f'{prefix}_MULTIMODAL_INPUT'), name == 'deepseek'),
+            'function_tools': _bool(os.getenv(f'{prefix}_FUNCTION_TOOLS'), True),
+            'structured_output': os.getenv(f'{prefix}_STRUCTURED_OUTPUT', 'json_object'),
+        }
+        for key in ('max_output_tokens', 'max_input_images', 'compact_target_images', 'request_timeout_s', 'connect_timeout_s', 'temperature', 'top_p', 'token_limit_parameter'):
+            value = os.getenv(f'{prefix}_{key.upper()}')
+            if value is not None:
+                values[key] = value
+        extra_body = os.getenv(f'{prefix}_EXTRA_BODY', '').strip()
+        if extra_body:
+            try:
+                values['extra_body'] = json.loads(extra_body)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f'{prefix}_EXTRA_BODY must contain a JSON object') from exc
+        profiles.append(_chat_completions_profile(values))
+    raw = os.getenv('LLM_PROVIDERS_JSON', '').strip()
+    if raw:
+        try:
+            values = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError('LLM_PROVIDERS_JSON must contain a JSON array of provider profiles') from exc
+        if not isinstance(values, list):
+            raise ValueError('LLM_PROVIDERS_JSON must contain a JSON array of provider profiles')
+        for value in values:
+            profiles.append(_chat_completions_profile(value))
+    names = ['openai', 'gemini']
+    for profile in profiles:
+        if profile.name in names:
+            raise ValueError(f'Duplicate or reserved provider name: {profile.name!r}')
+        names.append(profile.name)
+    return tuple(profiles)
+
+
+def _chat_completions_profile(value: Any) -> ChatCompletionsConfig:
+    if not isinstance(value, dict):
+        raise ValueError('Each LLM provider profile must be a JSON object')
+    allowed = set(ChatCompletionsConfig.__dataclass_fields__) | {'api_key_env'}
+    unknown = set(value) - allowed
+    if unknown:
+        raise ValueError(f'Unknown provider profile fields: {", ".join(sorted(unknown))}')
+    values = dict(value)
+    name = str(values.get('name', '')).strip().lower()
+    if not re.fullmatch(r'[a-z][a-z0-9_-]*', name):
+        raise ValueError('Provider name must start with a letter and contain letters, digits, underscores or hyphens')
+    values['name'] = name
+    key_env = values.pop('api_key_env', None)
+    if key_env is not None:
+        if 'api_key' in values:
+            raise ValueError(f'Provider {name}: choose api_key_env or api_key')
+        values['api_key'] = os.getenv(str(key_env), '').strip()
+    for key in ('api_key', 'base_url', 'model'):
+        values[key] = str(values.get(key, '')).strip()
+        if not values[key]:
+            raise ValueError(f'Provider {name}: {key} is required')
+    values['base_url'] = values['base_url'].rstrip('/')
+    if not values['base_url'].startswith(('https://', 'http://')):
+        raise ValueError(f'Provider {name}: base_url must be an HTTP(S) URL')
+    for key in ('multimodal_input', 'function_tools'):
+        if key in values and not isinstance(values[key], bool):
+            raise ValueError(f'Provider {name}: {key} must be a JSON boolean')
+    bounds = {
+        'max_output_tokens': (int, MAX_OUTPUT_TOKENS_MIN, MAX_OUTPUT_TOKENS_MAX),
+        'max_input_images': (int, 0, IMAGE_LIMIT_MAX),
+        'compact_target_images': (int, 0, IMAGE_LIMIT_MAX),
+        'request_timeout_s': (float, 0.1, 3600),
+        'connect_timeout_s': (float, 0.1, 3600),
+        'temperature': (float, TEMPERATURE_MIN, TEMPERATURE_MAX),
+        'top_p': (float, TOP_P_MIN, TOP_P_MAX),
+    }
+    for key, (cast, minimum, maximum) in bounds.items():
+        if key in values:
+            if values[key] is None and key in {'temperature', 'top_p'}:
+                continue
+            try:
+                values[key] = cast(values[key])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f'Provider {name}: invalid {key}') from exc
+            if not minimum <= values[key] <= maximum:
+                raise ValueError(f'Provider {name}: {key} must be between {minimum} and {maximum}')
+    if values.get('structured_output', 'json_object') not in {'json_schema', 'json_object', 'prompt'}:
+        raise ValueError(f'Provider {name}: structured_output must be json_schema, json_object or prompt')
+    if values.get('token_limit_parameter', 'max_tokens') not in {'max_tokens', 'max_completion_tokens'}:
+        raise ValueError(f'Provider {name}: token_limit_parameter must be max_tokens or max_completion_tokens')
+    extra = values.get('extra_body', {})
+    if not isinstance(extra, dict):
+        raise ValueError(f'Provider {name}: extra_body must be an object')
+    reserved = {'model', 'messages', 'tools', 'tool_choice', 'response_format', 'stream', 'n', 'max_tokens', 'max_completion_tokens'}
+    if reserved & extra.keys():
+        raise ValueError(f'Provider {name}: extra_body cannot override request or tool controls')
+    return ChatCompletionsConfig(**values)

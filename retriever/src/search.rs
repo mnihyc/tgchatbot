@@ -57,7 +57,7 @@ struct MutableHit {
     sticker_lexical: f32,
 }
 
-pub async fn serve(index_dir: PathBuf, port: u16) -> Result<()> {
+pub async fn serve(index_dir: PathBuf, bind: std::net::IpAddr, port: u16) -> Result<()> {
     let schema = build_schema();
     let index = Index::open_in_dir(index_dir)?;
     index.tokenizers().register("caption", caption_analyzer());
@@ -67,7 +67,7 @@ pub async fn serve(index_dir: PathBuf, port: u16) -> Result<()> {
         .route("/health", get(health))
         .route("/search", post(search))
         .with_state(state);
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = SocketAddr::new(bind, port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())

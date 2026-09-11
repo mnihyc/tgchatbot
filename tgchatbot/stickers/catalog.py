@@ -158,16 +158,23 @@ class StickerCatalog:
         self.style_memory = SessionStyleMemory()
         retriever_url = os.getenv('STICKER_RETRIEVER_URL', 'http://127.0.0.1:4107')
         self.retriever = TantivyRetrieverClient(retriever_url)
+        semantic_mode = os.getenv('STICKER_SEMANTIC_MODE', 'auto').strip().lower()
+        if semantic_mode not in {'auto', 'on', 'off'}:
+            raise ValueError('STICKER_SEMANTIC_MODE must be auto, on, or off')
+        embedding_provider = EmbeddingProvider.from_env(
+            cache_db_path=self.index_db_path.parent / 'query_embedding_cache.sqlite3',
+        )
+        artifacts_present = all((self.index_db_path.parent / name).exists() for name in (
+            'embeddings_manifest.json', 'caption_embeddings.npy', 'sticker_embeddings.npy'))
+        if artifacts_present and semantic_mode == 'auto' and embedding_provider.enabled:
+            manifest = json.loads((self.index_db_path.parent / 'embeddings_manifest.json').read_text())
+            artifacts_present = manifest.get('enabled', True)
+        self.semantic_enabled = semantic_mode == 'on' or (
+            semantic_mode == 'auto' and embedding_provider.enabled and artifacts_present)
         self.semantic_index = SemanticIndex(
             self.index_db_path.parent,
             require_ready=True,
-            embedding_provider=EmbeddingProvider(
-                api_key=os.getenv('OPENAI_API_KEY'),
-                model=os.getenv('STICKER_EMBEDDING_MODEL', 'text-embedding-3-large'),
-                dimensions=int(os.getenv('STICKER_EMBEDDING_DIMENSIONS', '1024')),
-                base_url=os.getenv('OPENAI_BASE_URL', 'https://api.openai.com/v1'),
-                cache_db_path=self.index_db_path.parent / 'query_embedding_cache.sqlite3',
-            ),
+            embedding_provider=embedding_provider,
         )
 
     @property
@@ -184,7 +191,11 @@ class StickerCatalog:
         self.entries_by_id = {}
         self.cluster_style_profiles = {}
         if not self.index_db_path.exists():
-            raise RuntimeError(f'Sticker index database not found: {self.index_db_path}')
+            # A new deployment can chat before the optional sticker library is
+            # built. An existing invalid index still fails visibly below.
+            self._stats_cache = {'loaded': True, 'stickers': 0, 'packs': 0, 'animated': 0, 'static': 0}
+            self._loaded = True
+            return
         with self._connect() as con:
             rows = con.execute('SELECT * FROM stickers').fetchall()
             meta_rows = {str(row['key']): str(row['value']) for row in con.execute('SELECT key, value FROM meta').fetchall()}
@@ -201,7 +212,8 @@ class StickerCatalog:
         animated = sum(1 for entry in self.entries_by_id.values() if entry.animated)
         packs = len({entry.source_pack_id or '' for entry in self.entries_by_id.values()})
         self._stats_cache = {'loaded': True, 'stickers': len(self.entries_by_id), 'packs': packs, 'animated': animated, 'static': max(0, len(self.entries_by_id) - animated)}
-        self.semantic_index.ensure_ready()
+        if self.semantic_enabled:
+            self.semantic_index.ensure_ready()
         self.retriever.ensure_healthy(expected_schema_version=STICKER_SCHEMA_VERSION, expected_service='tantivy_retriever')
         self._loaded = True
 
@@ -317,6 +329,8 @@ class StickerCatalog:
             self.load()
         if not plan.send or not plan.intent_core:
             return []
+        if not self.entries_by_id:
+            return []
         caption_query_text = plan.caption_query_text()
         sticker_query_text = plan.sticker_query_text()
         lexical_hits = self._search_lexical(
@@ -330,7 +344,7 @@ class StickerCatalog:
             caption_query_text=caption_query_text,
             sticker_query_text=sticker_query_text,
             top_k=max(50, plan.candidate_budget * 12),
-        )
+        ) if self.semantic_enabled else []
         lexical_map = {hit.sticker_id: hit for hit in lexical_hits}
         semantic_by_id: dict[str, dict[str, float]] = defaultdict(dict)
         for hit in semantic_hits:

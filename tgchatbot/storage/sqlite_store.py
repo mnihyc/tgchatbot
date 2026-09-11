@@ -679,14 +679,17 @@ class SQLiteStore:
         rows = list(reversed(rows))
         return [self._row_to_message(row) for row in rows]
 
-    async def list_recent_visible_messages(self, session_id: str, limit: int = 20) -> list[StoredConversationMessage]:
-        return await asyncio.to_thread(self._list_recent_visible_messages_sync, session_id, limit)
+    async def list_recent_visible_messages(self, session_id: str, limit: int = 20, *, before_message_id: int | None = None) -> list[StoredConversationMessage]:
+        return await asyncio.to_thread(self._list_recent_visible_messages_sync, session_id, limit, before_message_id)
 
-    def _list_recent_visible_messages_sync(self, session_id: str, limit: int) -> list[StoredConversationMessage]:
+    def _list_recent_visible_messages_sync(self, session_id: str, limit: int, before_message_id: int | None = None) -> list[StoredConversationMessage]:
+        before_clause = " AND id < ?" if before_message_id is not None else ""
+        parameters = (session_id, before_message_id, limit) if before_message_id is not None else (session_id, limit)
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT id, role, name, payload_json, estimated_tokens, created_at FROM messages WHERE session_id = ? AND hidden = 0 ORDER BY id DESC LIMIT ?",
-                (session_id, limit),
+                "SELECT id, role, name, payload_json, estimated_tokens, created_at FROM messages WHERE session_id = ? AND hidden = 0"
+                + before_clause + " ORDER BY id DESC LIMIT ?",
+                parameters,
             ).fetchall()
         out: list[StoredConversationMessage] = []
         for row in rows:

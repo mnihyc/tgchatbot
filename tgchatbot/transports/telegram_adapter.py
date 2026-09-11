@@ -14,6 +14,7 @@ from telegram.constants import ChatAction, ChatType
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from tgchatbot.config import AppConfig
+from tgchatbot.healthcheck import start_heartbeat, stop_heartbeat
 from tgchatbot.core.runtime import AgentRuntime
 from tgchatbot.domain.models import (
     ChatMode,
@@ -157,7 +158,8 @@ class TelegramBotApp:
         self.artifact_store = artifact_store
         self.preset_store = preset_store or PresetStore(config.preset_dir)
         self.remote_workspace = remote_workspace
-        self.application = Application.builder().token(config.telegram.token).build()
+        self.application = (Application.builder().token(config.telegram.token)
+                            .post_init(start_heartbeat).post_shutdown(stop_heartbeat).build())
         self._chat_states: dict[int, ChatFlowState] = {}
         self._register_handlers()
 
@@ -180,9 +182,14 @@ class TelegramBotApp:
         return self.config.gemini.thinking_level
 
     def _provider_native_web_search_default(self, provider_name: str) -> str:
-        if provider_name == 'openai':
-            return 'on' if self.config.openai.enable_native_web_search else 'off'
-        return 'on' if self.config.gemini.enable_native_web_search else 'off'
+        return 'on' if getattr(self.config.provider_config(provider_name), 'enable_native_web_search', False) else 'off'
+
+    def _provider_supports_control(self, settings: SessionSettings, name: str) -> bool:
+        provider = self.runtime.providers.get(settings.provider)
+        if provider is None:
+            return False
+        control = provider.describe_controls(settings).get(name)
+        return bool(control and control.supported)
 
     @staticmethod
     def _display_optional_disabled_int(value: int | None, *, disabled_label: str, maximum: int) -> str:
@@ -194,11 +201,11 @@ class TelegramBotApp:
     def _stored_native_web_search_max_default(self) -> int:
         return int(self.config.openai.native_web_search_max)
 
-    def _stored_temperature_default(self) -> float:
-        return float(self.config.gemini.temperature)
+    def _stored_temperature_default(self, provider_name: str) -> float | None:
+        return getattr(self.config.provider_config(provider_name), 'temperature', None)
 
-    def _stored_top_p_default(self) -> float:
-        return float(self.config.gemini.top_p)
+    def _stored_top_p_default(self, provider_name: str) -> float | None:
+        return getattr(self.config.provider_config(provider_name), 'top_p', None)
 
     def _stored_top_k_default(self) -> int:
         return int(self.config.gemini.top_k)
@@ -244,31 +251,20 @@ class TelegramBotApp:
 
     def _param_usage_lines(self, settings: SessionSettings) -> list[str]:
         lines = ['Usage: /param <name> <value|default>']
-        if settings.provider == 'openai':
-            lines.extend([
-                'reasoning_effort <none|minimal|low|medium|high|xhigh|default>',
-                'reasoning_summary <off|on|auto|detailed|concise|default>',
-                'text_verbosity <low|medium|high|default>',
-                'native_web_search <on|off|default>',
-                f'native_web_search_max <{NATIVE_WEB_SEARCH_MAX_MIN}..{NATIVE_WEB_SEARCH_MAX_MAX}|default>  (0 disables the explicit cap)',
-            ])
-        else:
-            lines.extend([
-                'include_thoughts <on|off|default>',
-                'native_web_search <on|off|default>',
-                f'temperature <{TEMPERATURE_MIN:g}..{TEMPERATURE_MAX:g}|default>',
-                f'top_p <{TOP_P_MIN:g}..{TOP_P_MAX:g}|default>',
-                f'top_k <{TOP_K_MIN}..{TOP_K_MAX}|default>',
-            ])
-            allowed_thinking_levels = gemini_allowed_thinking_levels(settings.model)
-            if allowed_thinking_levels:
-                lines.append(f"thinking_level <{'|'.join(allowed_thinking_levels)}|default>")
-                lines.append(
-                    f'thinking_budget <{GEMINI_THINKING_BUDGET_MIN}..{GEMINI_THINKING_BUDGET_MAX}|default>  '
-                    '(legacy Gemini 3 fallback; ignored when thinking_level is set)'
-                )
-            elif gemini_supports_thinking(settings.model):
-                lines.append(f'thinking_budget <{gemini_thinking_budget_usage(settings.model)}|default>')
+        usage = {
+            'reasoning_effort': 'reasoning_effort <none|minimal|low|medium|high|xhigh|default>',
+            'reasoning_summary': 'reasoning_summary <off|on|auto|detailed|concise|default>',
+            'text_verbosity': 'text_verbosity <low|medium|high|default>',
+            'include_thoughts': 'include_thoughts <on|off|default>',
+            'native_web_search': 'native_web_search <on|off|default>',
+            'native_web_search_max': f'native_web_search_max <{NATIVE_WEB_SEARCH_MAX_MIN}..{NATIVE_WEB_SEARCH_MAX_MAX}|default>',
+            'temperature': f'temperature <{TEMPERATURE_MIN:g}..{TEMPERATURE_MAX:g}|default>',
+            'top_p': f'top_p <{TOP_P_MIN:g}..{TOP_P_MAX:g}|default>',
+            'top_k': f'top_k <{TOP_K_MIN}..{TOP_K_MAX}|default>',
+            'thinking_budget': f'thinking_budget <{gemini_thinking_budget_usage(settings.model)}|default>',
+            'thinking_level': f"thinking_level <{'|'.join(gemini_allowed_thinking_levels(settings.model))}|default>",
+        }
+        lines.extend(line for name, line in usage.items() if self._provider_supports_control(settings, name))
         lines.extend([
             'link_prefetch <off|title|snippet|default>',
             f'max_output_tokens <{MAX_OUTPUT_TOKENS_MIN}..{MAX_OUTPUT_TOKENS_MAX}|default>',
@@ -296,21 +292,9 @@ class TelegramBotApp:
 
     def _param_lines(self, session_status: dict[str, object], *, include_help: bool) -> list[str]:
         lines = ['Session parameters']
-        if session_status['provider'] == 'openai':
-            lines.extend([
-                f"reasoning_effort={session_status['reasoning_effort']} ({session_status['reasoning_effort_source']}) supported={session_status['reasoning_effort_supported']}",
-                f"reasoning_summary={session_status['reasoning_summary']} ({session_status['reasoning_summary_source']}) supported={session_status['reasoning_summary_supported']}",
-                f"text_verbosity={session_status['text_verbosity']} ({session_status['text_verbosity_source']}) supported={session_status['text_verbosity_supported']}",
-                f"native_web_search={session_status['native_web_search']} ({session_status['native_web_search_source']}) supported={session_status['native_web_search_supported']}",
-                f"native_web_search_max={session_status['native_web_search_max']} ({session_status['native_web_search_max_source']}) supported={session_status['native_web_search_max_supported']}",
-            ])
-        else:
-            lines.extend([
-                f"include_thoughts={session_status['include_thoughts']} ({session_status['include_thoughts_source']}) supported={session_status['include_thoughts_supported']}",
-                f"thinking_budget={session_status['thinking_budget']} ({session_status['thinking_budget_source']}) supported={session_status['thinking_budget_supported']}",
-                f"thinking_level={session_status['thinking_level']} ({session_status['thinking_level_source']}) supported={session_status['thinking_level_supported']}",
-                f"native_web_search={session_status['native_web_search']} ({session_status['native_web_search_source']}) supported={session_status['native_web_search_supported']}",
-            ])
+        for name in ('reasoning_effort', 'reasoning_summary', 'text_verbosity', 'include_thoughts', 'thinking_budget', 'thinking_level', 'native_web_search', 'native_web_search_max'):
+            if session_status.get(f'{name}_supported'):
+                lines.append(f"{name}={session_status[name]} ({session_status[f'{name}_source']})")
         lines.extend([
             f"temperature={session_status['temperature']} ({session_status['temperature_source']}) supported={session_status['temperature_supported']}",
             f"top_p={session_status['top_p']} ({session_status['top_p_source']}) supported={session_status['top_p_supported']}",
@@ -406,7 +390,7 @@ class TelegramBotApp:
 
     def run_polling(self) -> None:
         logger.info('telegram.polling.start whitelist=%s keywords=%s', len(self.config.telegram.whitelist), len(self.config.telegram.keywords))
-        self.application.run_polling()
+        self.application.run_polling(close_loop=False)
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
@@ -466,6 +450,7 @@ class TelegramBotApp:
             state = self._flow_state(chat.id)
             task: asyncio.Task[None] | None = None
             async with state.mutex:
+                state.latest_reply_token += 1
                 state.latest_reply_candidate = None
                 state.last_replied_message_id = 0
                 task = state.reply_task
@@ -485,14 +470,20 @@ class TelegramBotApp:
         if not chat or not message or not self._allowed(chat):
             return
         session_id = self._session_id(chat)
-        recent = await self.store.list_recent_visible_messages(session_id, limit=40)
-        trigger = next((item for item in recent if item.message.role == MessageRole.USER), None)
+        # Keep each read small, but do not impose a turn-length limit: a valid
+        # tool-heavy answer can contain more than one page of observations.
+        before_message_id = None
+        trigger = None
+        while True:
+            recent = await self.store.list_recent_visible_messages(session_id, limit=40, before_message_id=before_message_id)
+            trigger = next((item for item in recent if item.message.role == MessageRole.USER), None)
+            if trigger is not None or len(recent) < 40:
+                break
+            before_message_id = recent[-1].db_id
         if trigger is None:
             await message.reply_text('Nothing to retry: no visible user message found in this session.')
             return
-        hidden = 0
-        if recent and recent[0].db_id > trigger.db_id:
-            hidden = await self.store.hide_messages_since(session_id, trigger.db_id + 1)
+        hidden = await self.store.hide_messages_since(session_id, trigger.db_id + 1)
         self.runtime.invalidate_session(session_id)
         await self._cancel_pending_reply(chat.id)
         candidate = ReplyCandidate(
@@ -663,8 +654,8 @@ class TelegramBotApp:
         name = context.args[0].strip().lower()
         value = context.args[1].strip().lower()
         if name == 'reasoning_effort':
-            if settings.provider != 'openai':
-                await update.effective_message.reply_text('reasoning_effort is only supported by the OpenAI provider in this app.')
+            if not self._provider_supports_control(settings, 'reasoning_effort'):
+                await update.effective_message.reply_text('reasoning_effort is not supported by the current provider/model.')
                 return
             allowed = {'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'default'}
             if value not in allowed:
@@ -672,8 +663,8 @@ class TelegramBotApp:
                 return
             settings.reasoning_effort = None if value == 'default' else value
         elif name == 'reasoning_summary':
-            if settings.provider != 'openai':
-                await update.effective_message.reply_text('reasoning_summary is only supported by the OpenAI provider in this app.')
+            if not self._provider_supports_control(settings, 'reasoning_summary'):
+                await update.effective_message.reply_text('reasoning_summary is not supported by the current provider/model.')
                 return
             allowed = set(REASONING_SUMMARY_VALUES) | {'default'}
             if value not in allowed:
@@ -686,8 +677,8 @@ class TelegramBotApp:
                 return
             settings.reasoning_summary = None if value == 'default' else value
         elif name == 'text_verbosity':
-            if settings.provider != 'openai':
-                await update.effective_message.reply_text('text_verbosity is only supported by the OpenAI provider in this app.')
+            if not self._provider_supports_control(settings, 'text_verbosity'):
+                await update.effective_message.reply_text('text_verbosity is not supported by the current provider/model.')
                 return
             allowed = {'low', 'medium', 'high', 'default'}
             if value not in allowed:
@@ -695,8 +686,8 @@ class TelegramBotApp:
                 return
             settings.text_verbosity = None if value == 'default' else value
         elif name == 'include_thoughts':
-            if settings.provider != 'gemini':
-                await update.effective_message.reply_text('include_thoughts is only supported by the Gemini provider in this app.')
+            if not self._provider_supports_control(settings, 'include_thoughts'):
+                await update.effective_message.reply_text('include_thoughts is not supported by the current provider/model.')
                 return
             allowed = {'on', 'off', 'default'}
             if value not in allowed:
@@ -705,8 +696,8 @@ class TelegramBotApp:
                 return
             settings.include_thoughts = None if value == 'default' else (value == 'on')
         elif name == 'thinking_budget':
-            if settings.provider != 'gemini':
-                await update.effective_message.reply_text('thinking_budget is only supported by the Gemini provider in this app.')
+            if not self._provider_supports_control(settings, 'thinking_budget'):
+                await update.effective_message.reply_text('thinking_budget is not supported by the current provider/model.')
                 return
             if not gemini_supports_thinking(settings.model):
                 await update.effective_message.reply_text(f'{settings.model} does not support Gemini thinking controls.')
@@ -731,8 +722,8 @@ class TelegramBotApp:
                 if settings.model.startswith('gemini-3'):
                     settings.thinking_level = None
         elif name == 'thinking_level':
-            if settings.provider != 'gemini':
-                await update.effective_message.reply_text('thinking_level is only supported by the Gemini provider in this app.')
+            if not self._provider_supports_control(settings, 'thinking_level'):
+                await update.effective_message.reply_text('thinking_level is not supported by the current provider/model.')
                 return
             allowed = gemini_allowed_thinking_levels(settings.model)
             if not allowed:
@@ -751,6 +742,9 @@ class TelegramBotApp:
                 settings.thinking_level = value
                 settings.thinking_budget = None
         elif name == 'native_web_search':
+            if value != 'default' and not self._provider_supports_control(settings, 'native_web_search'):
+                await update.effective_message.reply_text('native_web_search is not supported by the current provider/model.')
+                return
             allowed = {'on', 'off', 'default'}
             if value not in allowed:
                 current = settings.native_web_search_mode if settings.native_web_search_mode != 'default' else self._provider_native_web_search_default(settings.provider)
@@ -758,8 +752,8 @@ class TelegramBotApp:
                 return
             settings.native_web_search_mode = value
         elif name == 'native_web_search_max':
-            if settings.provider != 'openai':
-                await update.effective_message.reply_text('native_web_search_max is only supported by the OpenAI provider in this app.')
+            if not self._provider_supports_control(settings, 'native_web_search_max'):
+                await update.effective_message.reply_text('native_web_search_max is not supported by the current provider/model.')
                 return
             if value == 'default':
                 settings.native_web_search_max = None
@@ -775,8 +769,8 @@ class TelegramBotApp:
                     return
                 settings.native_web_search_max = cap
         elif name == 'temperature':
-            if settings.provider != 'gemini':
-                await update.effective_message.reply_text('temperature is only supported by the Gemini provider in this app.')
+            if not self._provider_supports_control(settings, 'temperature'):
+                await update.effective_message.reply_text('temperature is not supported by the current provider/model.')
                 return
             if value == 'default':
                 settings.temperature = None
@@ -786,13 +780,13 @@ class TelegramBotApp:
                 except ValueError:
                     temp = -1.0
                 if temp < TEMPERATURE_MIN or temp > TEMPERATURE_MAX:
-                    current = settings.temperature if settings.temperature is not None else self._stored_temperature_default()
+                    current = settings.temperature if settings.temperature is not None else self._stored_temperature_default(settings.provider)
                     await update.effective_message.reply_text(f'Invalid temperature. Current stored value: {current}')
                     return
                 settings.temperature = temp
         elif name == 'top_p':
-            if settings.provider != 'gemini':
-                await update.effective_message.reply_text('top_p is only supported by the Gemini provider in this app.')
+            if not self._provider_supports_control(settings, 'top_p'):
+                await update.effective_message.reply_text('top_p is not supported by the current provider/model.')
                 return
             if value == 'default':
                 settings.top_p = None
@@ -802,13 +796,13 @@ class TelegramBotApp:
                 except ValueError:
                     top_p = -1.0
                 if top_p < TOP_P_MIN or top_p > TOP_P_MAX:
-                    current = settings.top_p if settings.top_p is not None else self._stored_top_p_default()
+                    current = settings.top_p if settings.top_p is not None else self._stored_top_p_default(settings.provider)
                     await update.effective_message.reply_text(f'Invalid top_p. Current stored value: {current}')
                     return
                 settings.top_p = top_p
         elif name == 'top_k':
-            if settings.provider != 'gemini':
-                await update.effective_message.reply_text('top_k is only supported by the Gemini provider in this app.')
+            if not self._provider_supports_control(settings, 'top_k'):
+                await update.effective_message.reply_text('top_k is not supported by the current provider/model.')
                 return
             if value == 'default':
                 settings.top_k = None
@@ -838,7 +832,7 @@ class TelegramBotApp:
                 except ValueError:
                     max_tokens = 0
                 if max_tokens < MAX_OUTPUT_TOKENS_MIN or max_tokens > MAX_OUTPUT_TOKENS_MAX:
-                    current = settings.max_output_tokens if settings.max_output_tokens is not None else (self.config.openai.max_output_tokens if settings.provider == 'openai' else self.config.gemini.max_output_tokens)
+                    current = settings.max_output_tokens if settings.max_output_tokens is not None else self.config.provider_config(settings.provider).max_output_tokens
                     await update.effective_message.reply_text(f'Invalid max_output_tokens. Current effective value: {current}')
                     return
                 settings.max_output_tokens = max_tokens
@@ -851,7 +845,7 @@ class TelegramBotApp:
                 except ValueError:
                     image_limit = -1
                 if image_limit < 0 or image_limit > IMAGE_LIMIT_MAX:
-                    default_limit = self.config.openai.max_input_images if settings.provider == 'openai' else self.config.gemini.max_input_images
+                    default_limit = self.config.provider_config(settings.provider).max_input_images
                     current = settings.max_input_images if settings.max_input_images is not None else default_limit
                     current_text = self._display_optional_disabled_int(current, disabled_label='unlimited', maximum=IMAGE_LIMIT_MAX)
                     await update.effective_message.reply_text(f'Invalid max_input_images. Current effective value: {current_text}')
@@ -866,7 +860,7 @@ class TelegramBotApp:
                 except ValueError:
                     target = -1
                 if target < 0 or target > IMAGE_LIMIT_MAX:
-                    default_target = self.config.openai.compact_target_images if settings.provider == 'openai' else self.config.gemini.compact_target_images
+                    default_target = self.config.provider_config(settings.provider).compact_target_images
                     current = settings.compact_target_images if settings.compact_target_images is not None else default_target
                     current_text = self._display_optional_disabled_int(current, disabled_label='disabled', maximum=IMAGE_LIMIT_MAX)
                     await update.effective_message.reply_text(f'Invalid compact_target_images. Current effective value: {current_text}')
@@ -1803,6 +1797,9 @@ class TelegramBotApp:
         state = self._flow_state(chat_id)
         task: asyncio.Task[None] | None = None
         async with state.mutex:
+            # Delayed promotion tasks also need cancellation: they validate this
+            # token after their sleep before handing work to the reply worker.
+            state.latest_reply_token += 1
             state.latest_reply_candidate = None
             task = state.reply_task
             state.reply_task = None
@@ -1818,36 +1815,25 @@ class TelegramBotApp:
         return 'user' if role == MessageRole.USER else 'bot'
 
     async def _collect_rollback_message_ids(self, session_id: str, block_count: int) -> list[int]:
-        limit = max(40, min(400, block_count * 40))
-        recent = []
+        # A page boundary is not a conversation-block boundary. Carry the side
+        # across pages and stop only when the next block begins or history ends.
+        before_message_id = None
+        target_ids: list[int] = []
+        groups = 0
+        prev_side: str | None = None
         while True:
-            recent = await self.store.list_recent_visible_messages(session_id, limit=limit)
-            if not recent:
-                return []
-            groups = 0
-            prev_side: str | None = None
+            recent = await self.store.list_recent_visible_messages(session_id, limit=40, before_message_id=before_message_id)
             for item in recent:
                 side = self._rollback_side(item.message.role)
                 if side != prev_side:
                     groups += 1
+                    if groups > block_count:
+                        return target_ids
                     prev_side = side
-                if groups >= block_count:
-                    break
-            if groups >= block_count or len(recent) < limit or limit >= 5000:
-                break
-            limit = min(limit * 2, 5000)
-        target_ids: list[int] = []
-        groups = 0
-        prev_side: str | None = None
-        for item in recent:
-            side = self._rollback_side(item.message.role)
-            if side != prev_side:
-                groups += 1
-                if groups > block_count:
-                    break
-                prev_side = side
-            target_ids.append(item.db_id)
-        return target_ids
+                target_ids.append(item.db_id)
+            if len(recent) < 40:
+                return target_ids
+            before_message_id = recent[-1].db_id
 
     @staticmethod
     def _rollback_item_type(item: StoredConversationMessage) -> str:

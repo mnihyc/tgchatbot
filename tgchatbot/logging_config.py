@@ -66,7 +66,8 @@ def dump_llm_exchange(*, provider: str, model: str, url: str, payload: dict[str,
 
     logs_dir = Path(os.getenv('APP_DATA_DIR', './data')).resolve() / 'logs'
     logs_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S_%fZ')
+    now = datetime.now(timezone.utc)
+    timestamp = now.strftime('%Y%m%dT%H%M%S_%fZ')
     path = logs_dir / f'provider_{timestamp}.json'
     body: dict[str, Any] = {
         'timestamp': now.isoformat(),

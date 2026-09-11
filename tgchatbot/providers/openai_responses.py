@@ -37,6 +37,7 @@ class OpenAIResponsesProvider:
         native_web = settings.native_web_search_mode if settings.native_web_search_mode != 'default' else ('on' if self.config.enable_native_web_search else 'off')
         reasoning_summary = effective_reasoning_summary(settings.reasoning_summary or self.config.reasoning_summary, provider='openai', default='off')
         return {
+            'native_web_search_max': ControlDescriptor(True, str(settings.native_web_search_max if settings.native_web_search_max is not None else self.config.native_web_search_max), 'session' if settings.native_web_search_max is not None else 'default'),
             'reasoning_effort': ControlDescriptor(True, settings.reasoning_effort or self.config.reasoning_effort, 'session' if settings.reasoning_effort else 'default'),
             'reasoning_summary': ControlDescriptor(True, reasoning_summary, 'session' if settings.reasoning_summary else 'default', 'OpenAI Responses reasoning.summary; "on" is normalized to "auto".'),
             'text_verbosity': ControlDescriptor(True, settings.text_verbosity or self.config.text_verbosity, 'session' if settings.text_verbosity else 'default'),

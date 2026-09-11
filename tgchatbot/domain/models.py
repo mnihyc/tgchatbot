@@ -110,8 +110,8 @@ class ConversationMessage:
 
 @dataclass(slots=True)
 class SessionSettings:
-    provider: str = "gemini"
-    model: str = "gemini-2.5-flash"
+    provider: str = ""
+    model: str = ""
     mode: ChatMode = ChatMode.CHAT
     process_visibility: ProcessVisibility = ProcessVisibility.STATUS
     response_delivery: ResponseDelivery = ResponseDelivery.EDIT
