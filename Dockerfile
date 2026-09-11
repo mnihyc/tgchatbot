@@ -17,7 +17,8 @@ LABEL org.opencontainers.image.title="tgchatbot" \
 RUN apt-get update && apt-get install -y --no-install-recommends openssh-client ca-certificates util-linux \
     && apt-get clean \
     && groupadd --gid 1000 tgchatbot \
-    && useradd --uid 1000 --gid 1000 --home-dir /app/data/home --no-create-home tgchatbot
+    && useradd --uid 1000 --gid 1000 --home-dir /app/data/home --no-create-home tgchatbot \
+    && install -d -o 1000 -g 1000 /app/data
 COPY --from=uv /uv /usr/local/bin/uv
 WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy \
