@@ -32,6 +32,6 @@ COPY tgchatbot ./tgchatbot
 RUN uv sync --frozen --no-dev --no-editable --group indexing --no-cache
 COPY --from=retriever-build /build/target/release/sticker-retriever /usr/local/bin/sticker-retriever
 COPY scripts ./scripts
-COPY deploy/entrypoint.sh /usr/local/bin/tgchatbot-entrypoint
+COPY scripts/docker-entrypoint.sh /usr/local/bin/tgchatbot-entrypoint
 ENTRYPOINT ["/usr/local/bin/tgchatbot-entrypoint"]
 CMD ["python", "-m", "tgchatbot.app"]

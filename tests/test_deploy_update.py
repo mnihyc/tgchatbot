@@ -78,7 +78,7 @@ class ReleaseUpdaterTests(unittest.TestCase):
         (self.install / "data" / "tantivy_index" / "meta.json").write_text('{"preserve": true}')
         self.env_content = "TGBOT_TOKEN=secret\nDEFAULT_SYSTEM_PROMPT='keep $cash and quotes'\nUNUSED=$(touch SHOULD_NOT_EXIST)\n"
         (self.install / ".env").write_text(self.env_content)
-        shutil.copy2(REPO / "deploy" / "update.sh", self.install / "update.sh")
+        shutil.copy2(REPO / ".github" / "release" / "update.sh", self.install / "update.sh")
         self.bin = self.path / "bin"
         self.bin.mkdir()
         for name in ("docker", "curl"):
@@ -104,7 +104,7 @@ class ReleaseUpdaterTests(unittest.TestCase):
             files = {"RELEASE_TAG": tag.encode(), "RELEASE_COMMIT": COMMIT.encode(),
                      ".env.example": b"TGBOT_TOKEN=\nOPENAI_API_KEY=\n"}
             for name in ("compose.yml", "update.sh"):
-                files[name] = (REPO / "deploy" / name).read_bytes()
+                files[name] = (REPO / ".github" / "release" / name).read_bytes()
             for name, contents in files.items():
                 info = tarfile.TarInfo(name)
                 info.size = len(contents)

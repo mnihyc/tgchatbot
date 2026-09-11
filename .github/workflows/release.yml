@@ -45,7 +45,7 @@ jobs:
       - name: Smoke test image imports, runtime user, and real retriever API
         env:
           IMAGE: tgchatbot:${{ github.ref_name }}-${{ matrix.arch }}
-        run: ./deploy/smoke-image.sh "$IMAGE"
+        run: ./scripts/smoke-image.sh "$IMAGE"
       - name: Export release image (docker load compatible)
         env:
           IMAGE: tgchatbot:${{ github.ref_name }}-${{ matrix.arch }}
@@ -78,8 +78,9 @@ jobs:
           RELEASE_COMMIT: ${{ github.sha }}
         run: |
           mkdir -p bundle
-          cp deploy/compose.yml deploy/update.sh deploy/README.md .env.example .env.full.example LICENSE bundle/
-          cp deploy/update.sh dist/update.sh
+          cp .github/release/compose.yml .github/release/update.sh .env.example .env.full.example LICENSE bundle/
+          cp docs/deployment.md bundle/README.md
+          cp .github/release/update.sh dist/update.sh
           printf '%s\n' "$RELEASE_TAG" > bundle/RELEASE_TAG
           printf '%s\n' "$RELEASE_COMMIT" > bundle/RELEASE_COMMIT
           tar -czf "dist/tgchatbot-deploy-$RELEASE_TAG.tar.gz" -C bundle compose.yml update.sh README.md .env.example .env.full.example LICENSE RELEASE_TAG RELEASE_COMMIT

@@ -36,7 +36,7 @@ class ComposeConfigurationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(prefix='fixture-compose-', dir=REPO / 'tests') as temporary:
             root = Path(temporary)
-            shutil.copyfile(REPO / 'deploy' / 'compose.yml', root / 'compose.yml')
+            shutil.copyfile(REPO / '.github' / 'release' / 'compose.yml', root / 'compose.yml')
             token = '123456:synthetic-telegram-token'
             key = 'synthetic-provider-key'
             prompt = 'First line costs $5; keep $PROMPT_TOKEN literally.\nSecond line keeps ${PROMPT_TOKEN} and "quotes".'
