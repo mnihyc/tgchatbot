@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends openssh-client 
     && apt-get clean \
     && groupadd --gid 1000 tgchatbot \
     && useradd --uid 1000 --gid 1000 --home-dir /app/data/home --no-create-home tgchatbot \
-    && usermod --home /app/data/home root \
+    && sed -i '/^root:/s#:/root:#:/app/data/home:#' /etc/passwd \
     && install -d -o 1000 -g 1000 /app/data
 COPY --from=uv /uv /usr/local/bin/uv
 WORKDIR /app
