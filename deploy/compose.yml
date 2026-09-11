@@ -24,7 +24,7 @@ x-service: &service
 
 services:
   postgres:
-    image: pgvector/pgvector:0.8.6-pg17-bookworm@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
+    image: pgvector/pgvector:0.8.6-pg17-bookworm
     # update.sh explicitly starts this service only for the bundled database.
     profiles: [local-database]
     restart: unless-stopped

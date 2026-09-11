@@ -35,7 +35,7 @@ assert psycopg.__version__
 assert callable(runpy.run_path("/usr/local/lib/tgchatbot-deploy-configure.py")["configure"])
 PY
 for tool in build_sticker_index reset_sticker query_sticker_index; do
-    python "/app/scripts/$tool.py" --help >/dev/null
+    python -m "scripts.$tool" --help >/dev/null
 done
 python -m tgchatbot.tools.import_desktop --help >/dev/null
 python -m tgchatbot.tools.memory --help >/dev/null
@@ -46,7 +46,7 @@ docker network create --internal "$name-network" >/dev/null
 docker run --detach --name "$name-postgres" --network "$name-network" --network-alias postgres \
   --memory 2g --cpus 2 --tmpfs /var/lib/postgresql/data:rw,size=256m \
   -e POSTGRES_USER=tgchatbot -e POSTGRES_DB=tgchatbot -e POSTGRES_PASSWORD=smoke-test-only \
-  pgvector/pgvector:0.8.6-pg17-bookworm@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f >/dev/null
+  pgvector/pgvector:0.8.6-pg17-bookworm >/dev/null
 for attempt in $(seq 1 30); do
   if docker exec "$name-postgres" pg_isready -U tgchatbot -d tgchatbot >/dev/null 2>&1; then break; fi
   sleep 1

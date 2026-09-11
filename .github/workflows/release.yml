@@ -12,90 +12,28 @@ jobs:
   tests:
     uses: ./.github/workflows/ci.yml
 
-  image:
+  package:
     needs: tests
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-24.04
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Validate release tag
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: '[[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]'
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - name: Build locked Python image on a native standard runner
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          platforms: linux/${{ matrix.arch }}
-          tags: tgchatbot:${{ github.ref_name }}-${{ matrix.arch }}
-          build-args: |
-            RELEASE_TAG=${{ github.ref_name }}
-            RELEASE_COMMIT=${{ github.sha }}
-          load: true
-          cache-from: type=gha,scope=image-${{ matrix.arch }}
-          cache-to: type=gha,scope=image-${{ matrix.arch }},mode=max
-      - name: Smoke test image imports, runtime user, and PostgreSQL catalog startup
-        env:
-          IMAGE: tgchatbot:${{ github.ref_name }}-${{ matrix.arch }}
-        run: ./deploy/smoke-image.sh "$IMAGE"
-      - name: Export release image (docker load compatible)
-        env:
-          IMAGE: tgchatbot:${{ github.ref_name }}-${{ matrix.arch }}
-          ARCH: ${{ matrix.arch }}
-        run: |
-          mkdir -p dist
-          docker save "$IMAGE" | gzip -1 > "dist/tgchatbot-linux-$ARCH.tar.gz"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: image-${{ matrix.arch }}
-          path: dist/*.tar.gz
-          compression-level: 0
-          retention-days: 1
-
-  publish:
-    needs: image
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
         with:
-          pattern: image-*
-          path: dist
-          merge-multiple: true
-      - name: Bundle deployment and checksum every release asset
+          version: '0.11.16'
+          python-version: '3.13'
+      - name: Package application release
         env:
           RELEASE_TAG: ${{ github.ref_name }}
-          RELEASE_COMMIT: ${{ github.sha }}
-        run: |
-          mkdir -p bundle
-          cp deploy/compose.yml deploy/update.sh deploy/README.md .env.example .env.full.example LICENSE bundle/
-          cp deploy/update.sh dist/update.sh
-          printf '%s\n' "$RELEASE_TAG" > bundle/RELEASE_TAG
-          printf '%s\n' "$RELEASE_COMMIT" > bundle/RELEASE_COMMIT
-          tar -czf "dist/tgchatbot-deploy-$RELEASE_TAG.tar.gz" -C bundle compose.yml update.sh README.md .env.example .env.full.example LICENSE RELEASE_TAG RELEASE_COMMIT
-          (cd dist && sha256sum *.tar.gz update.sh > SHA256SUMS)
-      - name: Publish immutable exact-tag assets
+        run: uv run --frozen python .github/package_release.py --tag "$RELEASE_TAG"
+      - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            echo 'Release already exists; publish a new tag instead of replacing assets' >&2
-            exit 1
-          fi
-          notes=(--generate-notes)
-          if [[ -f "docs/releases/$RELEASE_TAG.md" ]]; then
-            notes=(--notes-file "docs/releases/$RELEASE_TAG.md")
-          fi
-          gh release create "$RELEASE_TAG" dist/* --verify-tag --title "$RELEASE_TAG" "${notes[@]}"
+          gh release create "$RELEASE_TAG" \
+            "dist/tgchatbot-deploy-$RELEASE_TAG.tar.gz" dist/update.sh dist/SHA256SUMS \
+            --verify-tag --title "$RELEASE_TAG" \
+            --notes 'Download and extract the deployment bundle, then run ./update.sh.'

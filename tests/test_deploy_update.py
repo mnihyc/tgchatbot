@@ -76,11 +76,17 @@ elif args[:2] == ["image", "inspect"]:
             print(state["images"][identity]["tag"])
         else:
             print(os.environ.get("MOCK_COMMIT", state["images"][identity]["commit"]))
-elif args and args[0] == "load":
-    payload = json.loads(pathlib.Path(args[args.index("--input") + 1]).read_text())
-    identity = "sha256:" + hashlib.sha256(payload["tag"].encode()).hexdigest()
-    state["images"][identity] = payload
-    state["tags"]["tgchatbot:" + payload["tag"] + "-" + payload["arch"]] = identity
+elif args and args[0] == "build":
+    context = pathlib.Path(args[-1])
+    build_args = dict(args[index + 1].split('=', 1) for index, value in enumerate(args) if value == '--build-arg')
+    tag = build_args['RELEASE_TAG']
+    if tag == os.environ.get('FAIL_BUILD_TAG'):
+        sys.exit(1)
+    files = {str(path.relative_to(context)): path.read_text() for path in context.rglob('*') if path.is_file()}
+    payload = {'tag': tag, 'commit': build_args['RELEASE_COMMIT'], 'build_files': files}
+    identity = "sha256:" + hashlib.sha256(tag.encode()).hexdigest()
+    state['images'][identity] = payload
+    state['tags'][args[args.index('--tag') + 1]] = identity
 elif args and args[0] == "tag":
     identity = image_id(args[1])
     if identity is None:
@@ -131,14 +137,15 @@ class ReleaseUpdaterTests(unittest.TestCase):
     def make_release(self, tag):
         directory = self.assets / tag
         directory.mkdir(parents=True)
-        for arch in ("amd64", "arm64"):
-            payload = {"tag": tag, "arch": arch, "commit": COMMIT}
-            (directory / f"tgchatbot-linux-{arch}.tar.gz").write_text(json.dumps(payload))
         with tarfile.open(directory / f"tgchatbot-deploy-{tag}.tar.gz", "w:gz") as archive:
             files = {"RELEASE_TAG": tag.encode(), "RELEASE_COMMIT": COMMIT.encode(),
                      ".env.example": b"TGBOT_TOKEN=\nOPENAI_API_KEY=\n"}
             for name in ("compose.yml", "update.sh"):
                 files[name] = (REPO / "deploy" / name).read_bytes()
+            for name in ("Dockerfile", ".dockerignore", "deploy/entrypoint.sh", "deploy/configure_database.py"):
+                files[name] = (REPO / name).read_bytes()
+            files["build/runtime-requirements.txt"] = b"locked third-party dependencies fixture"
+            files[f"build/tgchatbot-{tag[1:]}-py3-none-any.whl"] = b"portable application wheel fixture"
             for name, contents in files.items():
                 info = tarfile.TarInfo(name)
                 info.size = len(contents)
@@ -197,14 +204,14 @@ class ReleaseUpdaterTests(unittest.TestCase):
         self.assert_data_preserved()
         self.assert_simple_layout()
 
-    def test_bootstrap_creates_configuration_without_downloading_image(self):
+    def test_bootstrap_creates_configuration_without_building_or_starting_application(self):
         (self.install / ".env").unlink()
         (self.install / "update.sh").chmod(0o644)
         result = self.run_update()
         self.assertEqual((self.install / ".env").read_text(), "TGBOT_TOKEN=\nOPENAI_API_KEY=\n")
         self.assertTrue((self.install / "compose.yml").is_file())
         self.assertTrue(os.access(self.install / "update.sh", os.X_OK))
-        self.assertFalse(any("load" in call or "up" in call for call in self.calls()))
+        self.assertFalse(any("build" in call or "up" in call for call in self.calls()))
         self.assertFalse(any("tgchatbot-linux-" in call[-1] for call in self.calls() if call[0] == "curl"))
         self.assert_simple_layout()
 
@@ -216,7 +223,7 @@ class ReleaseUpdaterTests(unittest.TestCase):
         self.assertIn('Continuing with the verified release updater', result.stdout)
         self.assertEqual(installed.read_bytes(), (REPO / 'deploy' / 'update.sh').read_bytes())
         self.assertEqual(self.image_tag('tgchatbot:current'), 'v0.2.0')
-        self.assertEqual(len([call for call in self.calls() if call[:2] == ['docker', 'load']]), 1)
+        self.assertEqual(len([call for call in self.calls() if call[:2] == ['docker', 'build']]), 1)
         self.assert_data_preserved()
         self.assert_simple_layout()
 
@@ -253,11 +260,43 @@ class ReleaseUpdaterTests(unittest.TestCase):
         self.assertIn('retired-search', [call for call in calls if 'up' in call and 'bot' in call][-1])
         self.assert_data_preserved()
 
-    def test_bad_checksum_never_loads_or_stops_services(self):
-        for archive in (self.assets / "v0.2.0").glob("tgchatbot-linux-*.tar.gz"):
-            archive.write_bytes(b"corrupted image")
+    def test_bad_checksum_never_builds_or_stops_services(self):
+        archive = self.assets / "v0.2.0" / "tgchatbot-deploy-v0.2.0.tar.gz"
+        archive.write_bytes(b"corrupted code bundle")
         self.run_update("v0.2.0", success=False)
-        self.assertFalse(any("load" in call or "stop" in call or "up" in call for call in self.calls()))
+        self.assertFalse(any("build" in call or "stop" in call or "up" in call for call in self.calls()))
+        self.assert_data_preserved()
+        self.assert_simple_layout()
+
+    def test_docker_build_receives_only_released_code_and_locked_dependency_inputs(self):
+        stale = self.install / 'tmp' / 'update' / 'build-context' / 'build'
+        stale.mkdir(parents=True)
+        (stale / 'tgchatbot-0.0.0-py3-none-any.whl').write_bytes(b'interrupted prior update')
+        self.run_update('v0.2.0')
+        state = json.loads(self.docker_state.read_text())
+        image = state['images'][state['tags']['tgchatbot:current']]
+        files = image['build_files']
+        self.assertEqual(set(files), {
+            'Dockerfile', '.dockerignore', 'build/runtime-requirements.txt',
+            'build/tgchatbot-0.2.0-py3-none-any.whl',
+            'deploy/entrypoint.sh', 'deploy/configure_database.py',
+        })
+        self.assertEqual(files['build/tgchatbot-0.2.0-py3-none-any.whl'], 'portable application wheel fixture')
+        self.assertEqual(files['build/runtime-requirements.txt'], 'locked third-party dependencies fixture')
+        self.assertFalse(any(call[:2] == ['docker', 'load'] for call in self.calls()))
+        downloads = [call[-1].split('/')[-1] for call in self.calls() if call[0] == 'curl']
+        self.assertEqual(set(downloads), {'SHA256SUMS', 'tgchatbot-deploy-v0.2.0.tar.gz'})
+        self.assert_data_preserved()
+        self.assert_simple_layout()
+
+    def test_failed_dependency_install_keeps_working_image_and_services_untouched(self):
+        self.run_update('v0.1.0')
+        old_compose = (self.install / 'compose.yml').read_bytes()
+        before = len(self.calls())
+        self.run_update('v0.2.0', success=False, FAIL_BUILD_TAG='v0.2.0')
+        self.assertEqual(self.image_tag('tgchatbot:current'), 'v0.1.0')
+        self.assertEqual((self.install / 'compose.yml').read_bytes(), old_compose)
+        self.assertFalse(any('stop' in call or 'up' in call for call in self.calls()[before:]))
         self.assert_data_preserved()
         self.assert_simple_layout()
 
@@ -440,7 +479,7 @@ class ReleaseUpdaterTests(unittest.TestCase):
     def test_concurrent_update_does_not_remove_first_updaters_download(self):
         scratch = self.install / "tmp" / "update"
         scratch.mkdir(parents=True)
-        downloading = scratch / "image.tar.gz"
+        downloading = scratch / "deploy.tar.gz"
         downloading.write_bytes(b"first updater still downloading")
         with (self.install / "tmp" / "update.lock").open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

@@ -7,7 +7,7 @@ fail() { log "$*" >&2; exit 1; }
 valid_tag() { [[ $1 =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; }
 if [[ ${1:-} == -h || ${1:-} == --help ]]; then
   echo 'Usage: ./update.sh [latest|vX.Y.Z|rollback]'
-  echo 'Default: install the latest prebuilt release using your existing .env.'
+  echo 'Default: build and install the latest code release using Docker and your existing .env.'
   exit 0
 fi
 [[ $# -le 1 ]] || fail 'Expected at most one argument'
@@ -27,10 +27,12 @@ flock -n 9 || fail 'Another update is running'
 work=$root/tmp/update
 # Only this updater's fixed scratch files are removed, including after failure.
 cleanup() {
-  rm -f -- "$work/SHA256SUMS" "$work/deploy.tar.gz" "$work/image.tar.gz" \
+  rm -f -- "$work/SHA256SUMS" "$work/deploy.tar.gz" \
     "$work/compose.next.yml" "$work/compose.before.yml" "$work/update.next.sh" "$work/update.install.sh"
+  rm -rf -- "$work/build-context"
 }
 trap cleanup EXIT
+cleanup
 download() { curl --fail --location --retry 3 --connect-timeout 15 --output "$2" "$1"; }
 verify() {
   local expected
@@ -81,8 +83,6 @@ else
     target=${url##*/}
     valid_tag "$target" || fail 'Cannot resolve latest to an exact release tag'
   fi
-  [[ $(uname -s) == Linux ]] || fail 'Release images support Linux Docker hosts'
-  case "$(uname -m)" in x86_64|amd64) arch=amd64;; aarch64|arm64) arch=arm64;; *) fail 'Releases support amd64 and arm64';; esac
   base=https://github.com/$repository/releases/download/$target
   bundle=tgchatbot-deploy-$target.tar.gz
   log "Downloading release $target deployment files"
@@ -115,12 +115,16 @@ else
     exit 0
   fi
   docker compose --project-directory "$root" -f "$work/compose.next.yml" config --quiet
-  image_asset=tgchatbot-linux-$arch.tar.gz
-  log "Downloading prebuilt $arch image"
-  download "$base/$image_asset" "$work/image.tar.gz"
-  verify "$image_asset" "$work/image.tar.gz" || fail 'Image checksum mismatch'
-  docker load --input "$work/image.tar.gz"
-  image=tgchatbot:$target-$arch
+  mapfile -t wheels < <(tar -tzf "$work/deploy.tar.gz" | awk '/^build\/tgchatbot-[0-9A-Za-z_.+-]+-py3-none-any\.whl$/')
+  [[ ${#wheels[@]} == 1 ]] || fail 'Release must contain one CPU-neutral tgchatbot wheel'
+  mkdir -p "$work/build-context/build" "$work/build-context/deploy"
+  for member in Dockerfile .dockerignore build/runtime-requirements.txt "${wheels[0]}" deploy/entrypoint.sh deploy/configure_database.py; do
+    tar -xOzf "$work/deploy.tar.gz" "$member" > "$work/build-context/$member"
+  done
+  image=tgchatbot:$target
+  log 'Preparing the application with Docker'
+  docker build --build-arg "RELEASE_TAG=$target" --build-arg "RELEASE_COMMIT=$commit" \
+    --tag "$image" "$work/build-context"
   [[ $(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$image") == "$target" ]] || fail 'Image release label mismatch'
   [[ $(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image") == "$commit" ]] || fail 'Image commit label mismatch'
   candidate=$(docker image inspect --format '{{.Id}}' "$image")

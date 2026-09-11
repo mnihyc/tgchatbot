@@ -1,8 +1,10 @@
 name: CI
 on:
   push:
-    branches: [main, master]
+    branches: [main]
+    paths-ignore: ['**/*.md']
   pull_request:
+    paths-ignore: ['**/*.md']
   workflow_call:
 permissions:
   contents: read
@@ -12,7 +14,7 @@ jobs:
     runs-on: ubuntu-24.04
     services:
       postgres:
-        image: pgvector/pgvector:0.8.6-pg17-bookworm@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
+        image: pgvector/pgvector:0.8.6-pg17-bookworm
         env:
           POSTGRES_USER: tgchatbot
           POSTGRES_PASSWORD: test-only
@@ -28,15 +30,12 @@ jobs:
           --cpus 2
     env:
       TEST_DATABASE_URL: postgresql://tgchatbot:test-only@127.0.0.1:5432/tgchatbot
-    strategy:
-      matrix:
-        python: ['3.12', '3.13']
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
         with:
           version: '0.11.16'
-          python-version: ${{ matrix.python }}
+          python-version: '3.13'
           enable-cache: true
       - name: Install locked runtime dependencies
         run: uv sync --frozen --no-dev

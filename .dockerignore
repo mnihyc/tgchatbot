@@ -1,13 +1,8 @@
 **
 !Dockerfile
-!pyproject.toml
-!uv.lock
-!tgchatbot/
-!tgchatbot/**
-!scripts/
-!scripts/**
+!build/
+!build/runtime-requirements.txt
+!build/tgchatbot-*.whl
 !deploy/
 !deploy/entrypoint.sh
 !deploy/configure_database.py
-**/__pycache__
-**/*.pyc

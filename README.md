@@ -1,0 +1,117 @@
+# tgchatbot
+
+A self-hosted Telegram chatbot with persistent conversations, participant-aware
+memory, configurable personalities, optional remote tools, and contextual stickers.
+Each chat owns its history and settings; group participants share that agent.
+
+Use OpenAI, Gemini, DeepSeek, OpenRouter, or a compatible endpoint. Different
+chats can use different providers without replacing their conversation state.
+
+## Install
+
+You need Linux, Docker with Compose, a Telegram bot token, and a configured model
+provider. Keep deployment files and retained data separate from the source checkout.
+
+```sh
+mkdir tgchatbot
+cd tgchatbot
+curl -fsSLO https://github.com/mnihyc/tgchatbot/releases/latest/download/update.sh
+bash update.sh
+```
+
+The first run creates `.env`. Set `TGBOT_TOKEN` and a provider key, then run
+`./update.sh` again. Existing `.env` settings are retained. The updater configures
+the bundled PostgreSQL database; an explicit `DATABASE_URL` selects your own
+PostgreSQL database with pgvector.
+
+See [deployment and backups](deploy/README.md). Available configuration is listed
+in [.env.example](.env.example) and [.env.full.example](.env.full.example).
+
+## Providers
+
+| Provider | Configuration |
+| --- | --- |
+| OpenAI | `OPENAI_API_KEY`; optional `OPENAI_MODEL` |
+| Gemini | `GEMINI_API_KEY`; optional `GEMINI_MODEL` |
+| DeepSeek | `DEEPSEEK_API_KEY`; optional `DEEPSEEK_MODEL` |
+| OpenRouter | `OPENROUTER_API_KEY` and `OPENROUTER_MODEL` |
+
+Configure any combination and set `DEFAULT_PROVIDER` explicitly when a particular
+route should be the default. `/provider <name>` switches the current chat and
+selects that provider's configured model. `/model <id>` overrides it. The prompt
+and history survive switching; unavailable routes produce an error rather than
+silently sending the conversation to a different provider.
+
+Custom Chat Completions profiles use `LLM_PROVIDERS_JSON`:
+
+```dotenv
+CUSTOM_LLM_KEY=replace-me
+LLM_PROVIDERS_JSON=[{"name":"custom","api_key_env":"CUSTOM_LLM_KEY","base_url":"https://api.example.com/v1","model":"your-model-id","structured_output":"json_object"}]
+DEFAULT_PROVIDER=custom
+```
+
+Model capabilities differ. Enable image input only on a compatible model; choose
+`json_schema`, `json_object`, or `prompt` for its structured-output support.
+Sampling, reasoning, context and timeout controls remain configurable in `.env`.
+
+Embeddings are independent of generation. `EMBEDDING_*` configures conversation
+search; the default uses the existing Gemini credentials and 1536 dimensions.
+An OpenAI embedding route uses `EMBEDDING_PROVIDER=openai`; a compatible endpoint
+also sets `EMBEDDING_BASE_URL` and `EMBEDDING_MODEL`. Without embeddings, lexical
+history search remains available. Sticker embeddings have independent
+`STICKER_EMBEDDING_*` overrides. See [maintenance](scripts/README.md).
+
+## Conversation controls
+
+Private text starts a reply. In groups, use a configured keyword or reply to the
+bot. Media and captions add context; send a text question to request a response.
+Optional spontaneous group replies can be configured separately. Set
+`TGBOT_WHITELIST` to restrict access; an empty whitelist allows all chats.
+
+| Command | Purpose |
+| --- | --- |
+| `/help`, `/status`, `/status full` | Commands and current state |
+| `/mode chat`, `/mode assist`, `/mode agent` | Conversation with read-only memory, occasional tools, or multistep tools |
+| `/provider`, `/model` | Inspect or change the chat's generation route |
+| `/presets`, `/preset <name>`, `/prompt` | Manage personality prompts |
+| `/params`, `/param <name> <value>` | Inspect or change supported session settings |
+| `/process off`, `/delivery final_new` | Control progress visibility and final-answer delivery |
+| `/stickers auto`, `/stickers off` | Enable or disable sticker tools in a tool-enabled mode |
+| `/retry` | Retry the latest eligible user message without duplicating it |
+| `/rollback <count>` | Abandon recent consecutive user/bot blocks in the current context |
+| `/reset` or `/reset history` | Clear working context; retain searchable history, profiles and settings |
+| `/reset_full` or `/reset all` | Start a fresh agent with defaults; previous generations become operator-audit-only |
+| `/reset session` | Restore session settings while retaining conversation and learned profiles |
+
+Retry and rollback affect the current context. They do not retract Telegram
+messages or undo remote actions. Full reset leaves the shared sticker library and
+optional SSH workspace intact. Participants are identified by stable source IDs,
+not display names; forwarded content retains its separate attribution.
+
+Stickers require an explicitly built catalog. The agent retrieves candidates,
+inspects available evidence, and chooses a sticker or text. Query previews are
+not automatically sent to Telegram. Photos and documents depend on the selected
+model's capabilities. SSH tools remain disabled until a remote host is configured.
+
+## Development
+
+The Python application separates runtime, provider adapters, Telegram transport,
+tools and storage under `tgchatbot/`. Maintain those boundaries when adding a
+provider or changing a workflow. Intake idempotency, participant attribution,
+reset isolation, compaction continuity and delivery acknowledgments must remain
+covered by business tests.
+
+With Python 3.12 or 3.13 and uv:
+
+```sh
+uv sync --frozen
+TEST_DATABASE_URL=postgresql://user:password@localhost:5432/test_database \
+  uv run --frozen python -m unittest discover -s tests -v
+```
+
+Use a disposable PostgreSQL database with pgvector. Tests mock Telegram, model,
+SSH and release-download boundaries; they require no production credentials.
+[Maintenance commands](scripts/README.md) cover sticker catalogs, Desktop imports
+and memory jobs. Keep deployment data and credentials outside the Git checkout.
+
+[Apache License 2.0](LICENSE).

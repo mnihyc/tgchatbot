@@ -15,10 +15,14 @@ __pycache__/
 htmlcov/
 build/
 dist/
-retriever/target/
 *.log
 nohup.out
-sticker-retriever
+
+# Private local inputs and handoff archives never belong in source control.
+internal-data/
+/ChatExport*/
+/stickers_full/
+/*.zip
 
 # Isolated unittest temporary state, created within the checkout.
 /tests/fixture-*/
