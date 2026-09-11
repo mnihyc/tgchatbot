@@ -94,4 +94,8 @@ jobs:
             echo 'Release already exists; publish a new tag instead of replacing assets' >&2
             exit 1
           fi
-          gh release create "$RELEASE_TAG" dist/* --verify-tag --title "$RELEASE_TAG" --generate-notes
+          notes=(--generate-notes)
+          if [[ -f "docs/releases/$RELEASE_TAG.md" ]]; then
+            notes=(--notes-file "docs/releases/$RELEASE_TAG.md")
+          fi
+          gh release create "$RELEASE_TAG" dist/* --verify-tag --title "$RELEASE_TAG" "${notes[@]}"

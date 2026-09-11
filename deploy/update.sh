@@ -38,7 +38,10 @@ verify() {
   [[ $expected =~ ^[0-9a-fA-F]{64}$ ]] || return 1
   printf '%s  %s\n' "$expected" "$2" | sha256sum --check --strict -
 }
-start() { docker compose up -d --no-build --pull never --force-recreate --wait --wait-timeout "$timeout"; }
+start() { docker compose up -d --no-build --pull never --force-recreate --wait --wait-timeout "$timeout" retriever bot; }
+schema_compatible() {
+  TGCHATBOT_IMAGE="$1" docker compose run --rm --no-deps bot python -m tgchatbot.storage.postgres_store --check-schema
+}
 install_updater() {
   cp "$work/update.next.sh" "$work/update.install.sh"
   chmod 755 "$work/update.install.sh"
@@ -91,20 +94,53 @@ else
 fi
 
 cp compose.yml "$work/compose.before.yml"
+activation_started=0
 on_failure() {
   trap - ERR INT TERM
+  if [[ $activation_started == 0 ]]; then
+    cp "$work/compose.before.yml" compose.yml
+    log 'Preparation failed; existing application services were not restarted.' >&2
+    exit 1
+  fi
   log 'Activation failed; stopping attempted services' >&2
   docker compose stop bot retriever || true
-  cp "$work/compose.before.yml" compose.yml
-  if [[ -n $active ]]; then
+  # Database state is never rolled back by swapping an image. The previous
+  # application must prove it can read the current schema before it may restart.
+  if [[ -n $active ]] && schema_compatible "$active"; then
+    cp "$work/compose.before.yml" compose.yml
     docker tag "$active" tgchatbot:current
     if start; then log 'Restored the prior image'; else log 'Restart failed; inspect docker compose logs' >&2; fi
+  else
+    log 'Services remain stopped: no compatible prior image. Retained data is unchanged by the updater; install a compatible release or restore a matching backup.' >&2
   fi
   exit 1
 }
 trap on_failure ERR INT TERM
 [[ $target == rollback ]] || cp "$work/compose.next.yml" compose.yml
+# Compose owns dotenv parsing. The published helper sees the resolved bot
+# environment and creates only a missing local database password, without
+# printing credentials or requiring Python on the Docker host.
+database_mode=$(docker compose config --format json | docker run --rm -i --network none \
+  --user "$(id -u):$(id -g)" --entrypoint python \
+  -v "$root:/deployment" -v "$root/data:/deployment/data:ro" \
+  "$candidate" /usr/local/lib/tgchatbot-deploy-configure.py)
+case "$database_mode" in
+  local)
+    docker compose pull --policy missing postgres
+    docker compose up -d --no-build --pull never --wait --wait-timeout "$timeout" postgres
+    ;;
+  external)
+    # Validate the external database before stopping any existing local service.
+    ;;
+  *) fail 'Could not determine database configuration' ;;
+esac
+schema_compatible "$candidate"
+activation_started=1
 if [[ -n $active ]]; then docker compose stop bot retriever; fi
+if [[ $database_mode == external ]]; then
+  # The previous bot may still have used this database until it stopped above.
+  docker compose stop postgres
+fi
 # Keep a named recovery image before current changes, even if power is lost
 # before the health check can finish. Reinstalling one image keeps the prior tag.
 if [[ -n $active && $active != "$candidate" ]]; then docker tag "$active" tgchatbot:previous; fi
@@ -115,4 +151,4 @@ if [[ $target != rollback ]]; then
 fi
 trap - ERR INT TERM
 version=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' tgchatbot:current)
-log "Healthy release $version. Use docker compose up -d, logs, or stop directly."
+log "Healthy release $version. Use ./update.sh to start/update, or docker compose logs/stop directly."

@@ -5,7 +5,10 @@ from pathlib import Path
 import os
 import json
 import re
+from urllib.parse import quote
 from typing import Any
+
+from tgchatbot.operational import MemoryConfig, from_env
 
 from tgchatbot.domain.models import (
     ChatMode,
@@ -214,10 +217,17 @@ class AppConfig:
     ssh_exec: SSHExecConfig
     context: ContextConfig
     chat_completions: tuple[ChatCompletionsConfig, ...] = ()
+    memory: MemoryConfig = field(default_factory=lambda: from_env(MemoryConfig, 'MEMORY'))
 
     @property
-    def db_path(self) -> Path:
-        return self.data_dir / "tgchatbot.sqlite3"
+    def database_url(self) -> str:
+        external = os.getenv('DATABASE_URL', '').strip()
+        if external:
+            return external
+        password = os.getenv('POSTGRES_PASSWORD', '')
+        if not password:
+            raise ValueError('Set DATABASE_URL for development, or run the release update.sh to configure PostgreSQL.')
+        return f'postgresql://tgchatbot:{quote(password, safe="")}@postgres:5432/tgchatbot'
 
     @property
     def artifact_dir(self) -> Path:

@@ -4,6 +4,8 @@ import asyncio
 import logging
 import random
 import contextlib
+import hashlib
+import json
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -36,8 +38,9 @@ from tgchatbot.logging_config import clip_for_log
 from tgchatbot.media.ingest import extract_message_parts
 from tgchatbot.media.link_prefetch import fetch_link_previews, previews_to_parts
 from tgchatbot.storage.artifacts import ArtifactStore
-from tgchatbot.storage.sqlite_store import SQLiteStore
+from tgchatbot.storage.postgres_store import PostgresStore, StaleScopeError
 from tgchatbot.storage.presets import PresetStore
+from tgchatbot.domain.provenance import telegram_metadata, telegram_actor
 from tgchatbot.tools.remote_workspace import RemoteWorkspaceClient
 from tgchatbot.settings_schema import (
     COMPACT_TOOL_RATIO_THRESHOLD_MAX,
@@ -151,7 +154,7 @@ class TelegramBotApp:
             text = exc.__class__.__name__
         return f'⚠️ {stage} failed.\n{text}'
 
-    def __init__(self, *, config: AppConfig, runtime: AgentRuntime, store: SQLiteStore, artifact_store: ArtifactStore, preset_store: PresetStore | None = None, remote_workspace: RemoteWorkspaceClient | None = None) -> None:
+    def __init__(self, *, config: AppConfig, runtime: AgentRuntime, store: PostgresStore, artifact_store: ArtifactStore, preset_store: PresetStore | None = None, remote_workspace: RemoteWorkspaceClient | None = None) -> None:
         self.config = config
         self.runtime = runtime
         self.store = store
@@ -336,7 +339,12 @@ class TelegramBotApp:
             f"compact_trigger_tokens={session_status['compact_trigger_tokens']} compact_target_tokens={session_status['compact_target_tokens']}",
             f"reply_running={flow['reply_running']} ingest_inflight={flow['ingest_inflight']}",
             f"prompt_chars={session_status['system_prompt_chars']}",
+            f"agent_generation={session_status.get('scope', {}).get('generation', '-')} context={session_status.get('scope', {}).get('context_id', '-')}",
+            f"semantic_search_configured={session_status.get('semantic_enabled', False)} memory_jobs=" +
+                (', '.join(f"{job['kind']}:{job['status']}={job['count']}" for job in session_status.get('memory_jobs', [])) or 'none'),
         ]
+        if session_status.get('memory_last_error'):
+            lines.append('Memory worker error: ' + str(session_status['memory_last_error']))
         if not full:
             lines.append('')
             lines.append('Use [/status full] for the original detailed status and current /params values.')
@@ -366,6 +374,7 @@ class TelegramBotApp:
         self.application.add_handler(CommandHandler('start', self.start_command))
         self.application.add_handler(CommandHandler('help', self.help_command))
         self.application.add_handler(CommandHandler('reset', self.reset_command))
+        self.application.add_handler(CommandHandler('reset_full', self.reset_full_command))
         self.application.add_handler(CommandHandler('mode', self.mode_command))
         self.application.add_handler(CommandHandler('process', self.process_command))
         self.application.add_handler(CommandHandler('delivery', self.delivery_command))
@@ -426,7 +435,9 @@ class TelegramBotApp:
             '/param <name> <value|default> - trusted users only; use /params for the full parameter list and value semantics',
             '/prompt - show prompt controls, including augment vs exact preset mode',
             '/preset <name> [augment|exact]|clear and /presets - manage prompt presets',
-            '/reset [history|session|all] - hide history, reset session settings, or both',
+            '/reset - start a fresh context; keep searchable history and profiles',
+            '/reset_full - start a new agent with defaults; keep prior data for audit only',
+            '/reset session - restore settings only (history/all aliases remain supported)',
             '/retry - regenerate from the latest visible user message after hiding newer assistant/tool output',
             '/rollback [count] - hide the last visible consecutive user/bot block(s) from session history',
             '',
@@ -437,13 +448,17 @@ class TelegramBotApp:
         chat = update.effective_chat
         if not chat or not self._allowed(chat):
             return
-        mode = (context.args[0].strip().lower() if context.args else '')
+        mode = (context.args[0].strip().lower() if context.args else 'history')
         if mode not in {'history', 'session', 'all'}:
-            await update.effective_message.reply_text('Usage: /reset [history|session|all]\n[history] hides chat history only\n[session] resets session settings only\n[all] hides history and resets session settings to defaults')
+            await update.effective_message.reply_text('Usage: /reset [history|session|all]\n[history] starts a fresh context, keeping searchable history and profiles\n[session] restores settings only\n[all] is an alias for /reset_full')
             return
-        if mode in {'history', 'all'}:
+        if mode == 'all':
+            await self.reset_full_command(update, context)
+            return
+        if mode == 'history':
+            await self._cancel_pending_reply(chat.id)
             await self.store.clear_messages(self._session_id(chat))
-        if mode in {'session', 'all'}:
+        if mode == 'session':
             await self.store.save_session(self._session_id(chat), self._default_settings())
         if mode in {'history', 'all'}:
             self.runtime.invalidate_session(self._session_id(chat))
@@ -461,8 +476,24 @@ class TelegramBotApp:
                     await task
                 except asyncio.CancelledError:
                     pass
-        note = 'Conversation history hidden.' if mode == 'history' else 'Session settings reset.' if mode == 'session' else 'Conversation history hidden and session settings reset to defaults.'
+        note = 'New context started. Prior messages remain searchable; profiles and settings are retained.' if mode == 'history' else 'Session settings reset.'
         await update.effective_message.reply_text(note)
+
+    async def reset_full_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        if not chat or not self._allowed(chat):
+            return
+        await self._cancel_pending_reply(chat.id)
+        session_id = self._session_id(chat)
+        await self.store.reset_full(session_id, self._default_settings())
+        self.runtime.invalidate_session(session_id)
+        catalog = getattr(self.runtime.tool_registry, 'sticker_catalog', None)
+        if catalog is not None:
+            catalog.reset_session(session_id)
+        self._flow_state(chat.id).last_replied_message_id = 0
+        await update.effective_message.reply_text(
+            'New agent started with deployment defaults. Prior messages, profiles and learned personality '
+            'are audit-only. The shared sticker catalog and SSH workspace are unchanged.')
 
     async def retry_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
@@ -472,6 +503,7 @@ class TelegramBotApp:
         session_id = self._session_id(chat)
         # Keep each read small, but do not impose a turn-length limit: a valid
         # tool-heavy answer can contain more than one page of observations.
+        await self._cancel_pending_reply(chat.id)
         before_message_id = None
         trigger = None
         while True:
@@ -488,7 +520,7 @@ class TelegramBotApp:
         await self._cancel_pending_reply(chat.id)
         candidate = ReplyCandidate(
             stored_message_id=trigger.db_id,
-            user_display_name=update.effective_user.username or update.effective_user.full_name or 'user',
+            user_display_name=str(trigger.message.metadata.get('actor_name') or trigger.message.name or 'Unknown sender'),
             source_message=message,
         )
         await self._reply_to_candidate(candidate)
@@ -515,6 +547,7 @@ class TelegramBotApp:
             return
 
         session_id = self._session_id(chat)
+        await self._cancel_pending_reply(chat.id)
         target_ids = await self._collect_rollback_message_ids(session_id, count)
         if not target_ids:
             await message.reply_text('Nothing to roll back: session history is already empty.')
@@ -522,7 +555,8 @@ class TelegramBotApp:
 
         target_ids = sorted(set(target_ids))
 
-        visible = await self.store.list_uncompacted_messages(session_id)
+        visible = (await self.store.read_messages(session_id, target_ids[-10:], current_context=True)
+                   if hasattr(self.store, 'read_messages') else await self.store.list_uncompacted_messages(session_id))
         by_id = {item.db_id: item for item in visible}
         targets = [by_id[mid] for mid in target_ids if mid in by_id]
 
@@ -1282,15 +1316,95 @@ class TelegramBotApp:
             return
         state = self._flow_state(chat.id)
         await self._mark_ingest_started(state)
+        intake_completion = None
+        intake_key = None
         try:
             session_id = self._session_id(chat)
             logger.info('tg.ingest.start chat=%s msg=%s group=%s edit=%s reply=%s', self._chat_log_id(chat.id), message.message_id, int(is_group), int(is_edit), int(should_reply))
             settings = await self.store.get_or_create_session(session_id, self._default_settings())
-            user_name = update.effective_user.username or update.effective_user.full_name or 'user'
-            parts = await self._safe_extract_parts(message, session_id)
-            logger.info('tg.ingest.parts chat=%s msg=%s sender=%s parts=%s preview=%s', self._chat_log_id(chat.id), message.message_id, user_name, self._parts_summary(parts), self._log_parts_preview(parts))#self._message_preview(message.text or message.caption or '')
-            link_mode = settings.link_prefetch_mode if settings.link_prefetch_mode != 'default' else self.config.default_link_prefetch_mode
+            intake_scope = await self.store.get_scope(session_id) if hasattr(self.store, 'get_scope') else None
+            canonical_metadata = telegram_metadata(message, is_edit=is_edit)
+            user_name = canonical_metadata['actor_name']
             message_text = message.text or message.caption or ''
+            auto_note_parts: list[MessagePart] = []
+            if settings.metadata_injection_mode != 'off':
+                event_time = getattr(message, 'edit_date', None) or getattr(message, 'date', None) or datetime.now(timezone.utc)
+                try:
+                    zone = ZoneInfo(settings.metadata_timezone or 'UTC')
+                except ZoneInfoNotFoundError:
+                    zone = ZoneInfo('UTC')
+                local_time = event_time.astimezone(zone).isoformat(timespec='seconds')
+                sender = getattr(message, 'from_user', None)
+                username = f'@{sender.username}' if sender and getattr(sender, 'username', None) else '-'
+                nickname = str(canonical_metadata['actor_name']).replace('"', "'")
+                auto_note_parts.append(MessagePart(kind=PartKind.TEXT,
+                    text=f'[Message metadata: username={username} nickname="{nickname}" time={local_time}]',
+                    remote_sync=False, origin='auto_note'))
+
+            # Persist transport facts before downloads, link fetches or SSH. A
+            # fixed field allowlist avoids copying Telegram's nested media graph;
+            # only the largest photo variant is used by the existing downloader.
+            attachment_parts: list[MessagePart] = []
+            attachment_metadata = []
+            for media_type in ('photo', 'document', 'sticker', 'animation', 'video', 'audio', 'voice', 'video_note'):
+                media = getattr(message, media_type, None)
+                if not media:
+                    continue
+                if media_type == 'photo':
+                    media = media[-1]
+                details = {'type': media_type}
+                for key in ('file_id', 'file_unique_id', 'file_name', 'mime_type', 'file_size',
+                            'width', 'height', 'duration', 'emoji', 'set_name', 'is_animated', 'is_video'):
+                    value = getattr(media, key, None)
+                    if isinstance(value, str):
+                        details[key] = value
+                    elif isinstance(value, (int, float, bool)):
+                        details[key] = value
+                attachment_metadata.append(details)
+                kind = PartKind.IMAGE if media_type == 'photo' else PartKind.STICKER if media_type == 'sticker' else PartKind.FILE
+                attachment_parts.append(MessagePart(kind=kind, filename=details.get('file_name') or media_type,
+                    mime_type=details.get('mime_type'), size_bytes=details.get('file_size'),
+                    detail=f'Telegram {media_type}; enrichment pending', remote_sync=False, origin='attachment_reference'))
+            if attachment_metadata:
+                canonical_metadata['telegram_attachments'] = attachment_metadata
+                fingerprint = hashlib.sha256(json.dumps([message_text, canonical_metadata],
+                    ensure_ascii=False, sort_keys=True, default=str).encode('utf-8')).hexdigest()
+                canonical_metadata['telegram_intake_fingerprint'] = fingerprint
+                # Only identical in-flight payloads wait for one another. A newer
+                # edit and unrelated senders can still save their originals now.
+                inflight = self.__dict__.setdefault('_intake_inflight', {})
+                intake_key = (session_id, str(message.message_id), fingerprint)
+                while intake_key in inflight:
+                    await asyncio.shield(inflight[intake_key])
+                intake_completion = asyncio.get_running_loop().create_future()
+                inflight[intake_key] = intake_completion
+                async with self.store.pool.connection() as conn:
+                    existing = await (await conn.execute('''SELECT m.context_id,r.metadata,r.edited_at FROM messages m
+                        JOIN message_revisions r ON (r.message_id,r.revision)=(m.id,m.source_revision)
+                        WHERE m.session_id=%s AND m.generation=%s AND m.source='telegram'
+                        AND m.source_chat_id=%s AND m.source_message_id=%s''',
+                        (session_id, intake_scope['generation'], str(chat.id), str(message.message_id)))).fetchone()
+                incoming_edit = getattr(message, 'edit_date', None)
+                if existing and existing['edited_at'] and (incoming_edit is None or incoming_edit < existing['edited_at']):
+                    logger.info('tg.ingest.duplicate chat=%s msg=%s reason=older_edit', self._chat_log_id(chat.id), message.message_id)
+                    return
+                if (existing and existing['metadata'].get('telegram_intake_fingerprint') == fingerprint
+                        and (existing['metadata'].get('telegram_intake_stage') == 'complete'
+                             or existing['context_id'] != intake_scope['context_id'])):
+                    logger.info('tg.ingest.duplicate chat=%s msg=%s', self._chat_log_id(chat.id), message.message_id)
+                    return
+            minimal_parts = [MessagePart(kind=PartKind.TEXT, text=message_text)] if message_text or not attachment_parts else []
+            original = ConversationMessage(role=MessageRole.USER,
+                parts=[*auto_note_parts, *minimal_parts, *attachment_parts],
+                metadata={**canonical_metadata, 'telegram_intake_stage': 'pending'} if attachment_metadata else canonical_metadata)
+            await self.runtime.ingest_user_message(session_id=session_id, incoming_message=original,
+                expected_scope=intake_scope, intake=True)
+
+            parts = await self._safe_extract_parts(message, session_id)
+            if intake_scope is not None:
+                await self.store.assert_scope(session_id, {key: intake_scope[key] for key in ('generation', 'context_id')})
+            logger.info('tg.ingest.parts chat=%s msg=%s sender=%s parts=%s preview=%s', self._chat_log_id(chat.id), message.message_id, user_name, self._parts_summary(parts), self._log_parts_preview(parts))
+            link_mode = settings.link_prefetch_mode if settings.link_prefetch_mode != 'default' else self.config.default_link_prefetch_mode
             if message_text and link_mode != 'off':
                 try:
                     previews = await fetch_link_previews(message_text, mode=link_mode, telegram=self.config.telegram)
@@ -1300,46 +1414,41 @@ class TelegramBotApp:
                     preview_parts = previews_to_parts(previews, mode=link_mode)
                     parts.extend(preview_parts)
                     logger.info('tg.ingest.links chat=%s msg=%s urls=%s mode=%s chars=%s', self._chat_log_id(chat.id), message.message_id, len(previews), link_mode, sum(len(part.text or '') for part in preview_parts))
+            if intake_scope is not None:
+                await self.store.assert_scope(session_id, {key: intake_scope[key] for key in ('generation', 'context_id')})
             if parts:
                 parts = await self._sync_parts_to_remote(session_id, parts)
+            if attachment_parts and not any(part.kind != PartKind.TEXT for part in parts):
+                # Download failure or disabled processing must still leave a
+                # searchable attachment reference in the current revision.
+                parts.extend(replace(part, detail=part.detail.replace('enrichment pending', 'media content unavailable'))
+                             for part in attachment_parts)
             if not parts:
                 parts = [MessagePart(kind=PartKind.TEXT, text='')]
-
-            auto_note_parts: list[MessagePart] = []
-            if settings.metadata_injection_mode != 'off':
-                event_time = message.edit_date or message.date or datetime.now(timezone.utc)
-                try:
-                    zone = ZoneInfo(settings.metadata_timezone or 'UTC')
-                except ZoneInfoNotFoundError:
-                    zone = ZoneInfo('UTC')
-                local_time = event_time.astimezone(zone).isoformat(timespec='seconds')
-                username = f'@{message.from_user.username}' if message.from_user and message.from_user.username else '-'
-                nickname = f'{message.from_user.full_name}'.replace('"', "'") if message.from_user.full_name else ''
-                auto_note_parts.append(
-                    MessagePart(
-                        kind=PartKind.TEXT,
-                        text=f'[Message metadata: username={username} nickname="{nickname}" time={local_time}]',
-                        remote_sync=False,
-                        origin='auto_note',
-                    )
-                )
             user_parts = [part for part in parts if part.origin != 'auto_note']
             auto_note_parts.extend(part for part in parts if part.origin == 'auto_note')
             if not user_parts:
                 user_parts = [MessagePart(kind=PartKind.TEXT, text='')]
-            envelope = ConversationMessage(
-                role=MessageRole.USER,
+            envelope = ConversationMessage(role=MessageRole.USER,
                 parts=[*auto_note_parts, *user_parts],
-                metadata={'telegram_message_id': message.message_id, 'is_edit': is_edit, 'media_group_id': message.media_group_id},
-            )
-            stored = await self.runtime.ingest_user_message(session_id=session_id, incoming_message=envelope)
+                metadata={**canonical_metadata, 'telegram_intake_stage': 'complete'} if attachment_metadata else canonical_metadata)
+            stored = await self.runtime.ingest_user_message(session_id=session_id, incoming_message=envelope,
+                expected_scope=intake_scope, intake=True)
             candidate = ReplyCandidate(
                 stored_message_id=stored.db_id,
                 user_display_name=user_name,
                 source_message=message,
                 spontaneous=bool(is_group and not group_explicit_reply),
             )
+        except StaleScopeError:
+            # Reset is ordinary cancellation. The initial original remains in
+            # its original context/generation; no late reply candidate is made.
+            logger.info('tg.ingest.cancelled chat=%s msg=%s reason=scope_changed', self._chat_log_id(chat.id), message.message_id)
+            return
         finally:
+            if intake_completion is not None:
+                self._intake_inflight.pop(intake_key, None)
+                intake_completion.set_result(None)
             await self._mark_ingest_finished(state)
             logger.info('tg.ingest.done chat=%s msg=%s inflight=%s', self._chat_log_id(chat.id), message.message_id, state.ingest_inflight)
 
@@ -1372,7 +1481,7 @@ class TelegramBotApp:
             return None
         return message.message_id
 
-    async def _send_text_message(self, source_message: Message, text: str) -> Message:
+    async def _send_text_message(self, source_message: Message, text: str, *, delivered_messages: list[Message] | None = None) -> Message:
         bot = source_message.get_bot()
         reply_to_message_id = self._reply_to_message_id(source_message)
         last_message: Message | None = None
@@ -1385,16 +1494,48 @@ class TelegramBotApp:
                 disable_web_page_preview=True,
                 reply_to_message_id=reply_to_message_id,
             )
+            if delivered_messages is not None:
+                delivered_messages.append(last_message)
         if last_message is None:
             raise RuntimeError('Telegram text delivery produced no message')
         return last_message
 
-    async def _record_delivered_assistant_text(self, *, session_id: str, result: TurnResult) -> None:
+    async def _record_delivered_assistant_text(self, *, session_id: str, result: TurnResult,
+                                               source_message: Message, delivered_messages: list[Message]) -> None:
         text = (result.text or '').strip()
         if not text:
             return
-        assistant_metadata = {'provider_native': {'provider': result.provider_name, 'items': result.provider_history_items}} if result.provider_name and result.provider_history_items else None
-        await self.runtime.record_assistant_text(session_id=session_id, text=text, metadata=assistant_metadata)
+        if not delivered_messages:
+            raise RuntimeError('Final answer delivery returned no Telegram message identifiers')
+        message_ids = []
+        for message in delivered_messages:
+            message_id = getattr(message, 'message_id', None)
+            if (isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0
+                    or message.chat.id != source_message.chat.id):
+                raise RuntimeError('Invalid Telegram final-answer delivery receipt')
+            if str(message_id) not in message_ids:
+                message_ids.append(str(message_id))
+        first = delivered_messages[0]
+        sender = getattr(first, 'from_user', None) or source_message.get_bot()
+        actor_id = getattr(sender, 'id', None)
+        if isinstance(actor_id, bool) or not isinstance(actor_id, int) or actor_id <= 0:
+            raise RuntimeError('Delivered answer has no authenticated Telegram bot identity')
+        actor_name = getattr(sender, 'full_name', None) or getattr(sender, 'username', None) or 'Assistant'
+        assistant_metadata = {'provider_native': {'provider': result.provider_name, 'items': result.provider_history_items}} if result.provider_name and result.provider_history_items else {}
+        sent_at = getattr(first, 'date', None) or datetime.now(timezone.utc)
+        assistant_metadata.update({'source': 'telegram', 'source_chat_id': str(source_message.chat.id),
+            'source_message_id': message_ids[0], 'telegram_message_aliases': message_ids[1:],
+            'actor_id': f'telegram:user:{actor_id}', 'actor_kind': 'bot', 'actor_name': actor_name,
+            'sent_at': sent_at.isoformat(), 'reply_target': result.reply_target})
+        if self.config.telegram.reply_to_user_message:
+            assistant_metadata.update(reply_to_source_id=str(source_message.message_id),
+                                      reply_to_source_chat_id=str(source_message.chat.id))
+        stored = await self.runtime.record_assistant_text(session_id=session_id, text=text,
+            metadata=assistant_metadata, expected_scope=result.scope)
+        await self.store.bind_message_source(session_id, stored.db_id, source='telegram',
+            source_chat_id=str(source_message.chat.id), source_message_ids=message_ids,
+            actor_id=assistant_metadata['actor_id'], actor_kind='bot', actor_name=actor_name,
+            expected_scope=result.scope)
 
     async def _notify_user_error(self, source_message: Message, text: str, *, renderer: TelegramMessageRenderer | None = None) -> None:
         if renderer is not None and renderer.message is not None:
@@ -1434,7 +1575,9 @@ class TelegramBotApp:
                     path.unlink(missing_ok=True)
                 except Exception:
                     logger.warning('tg.remote_sync.cleanup_failed sid=%s file=%s', clip_for_log(session_id, limit=48), path.name)
-            return [replace(part, artifact_path=None, remote_sync=False) if part.artifact_path and part.remote_sync else part for part in parts]
+            return [replace(part, artifact_path=None, remote_sync=False,
+                            detail=((part.detail + '; ') if part.detail else '') + 'remote copy unavailable: SSH is disabled')
+                    if part.artifact_path and part.remote_sync else part for part in parts]
         local_path_objs = tuple(Path(value) for value in local_paths)
         predicted_remote = {str(path.resolve()): f"{self.remote_workspace.session_paths(session_id).inputs.rstrip('/')}/{path.name}" for path in local_path_objs}
         surviving_remote: set[str] = set()
@@ -1465,6 +1608,8 @@ class TelegramBotApp:
                 updated_parts.append(replace(part, artifact_path=remote_path, remote_sync=True))
                 continue
             filename = part.filename or 'file'
+            updated_parts.append(replace(part, artifact_path=None, remote_sync=False,
+                detail=((part.detail + '; ') if part.detail else '') + 'remote copy unavailable: upload failed or file was rotated'))
             updated_parts.append(
                 MessagePart(
                     kind=PartKind.TEXT,
@@ -1628,6 +1773,9 @@ class TelegramBotApp:
                 trigger_message_id=candidate.stored_message_id,
                 emit=emit_event,
             )
+        except StaleScopeError:
+            logger.info('tg.reply.cancelled chat=%s msg=%s reason=scope_changed', self._chat_log_id(chat.id), candidate.stored_message_id)
+            return
         except Exception as exc:
             logger.exception('tg.reply.failed chat=%s msg=%s', self._chat_log_id(chat.id), candidate.stored_message_id)
             try:
@@ -1652,8 +1800,14 @@ class TelegramBotApp:
 
         logger.info('tg.reply.result chat=%s msg=%s text_chars=%s artifacts=%s stickers=%s usage=in=%s out=%s total=%s', self._chat_log_id(chat.id), candidate.stored_message_id, len(result.text), len(result.artifacts), len(result.stickers), result.usage.input_tokens, result.usage.output_tokens, result.usage.total_tokens)
         try:
-            await self._deliver_result(message, renderer, settings, result, sent_before_receipts=sent_before_receipts)
-            await self._record_delivered_assistant_text(session_id=session_id, result=result)
+            if result.scope is not None:
+                await self.store.assert_scope(session_id, result.scope)
+            delivered_messages = await self._deliver_result(message, renderer, settings, result, sent_before_receipts=sent_before_receipts)
+            await self._record_delivered_assistant_text(session_id=session_id, result=result,
+                source_message=message, delivered_messages=delivered_messages)
+        except StaleScopeError:
+            logger.info('tg.deliver.cancelled chat=%s msg=%s reason=scope_changed', self._chat_log_id(chat.id), candidate.stored_message_id)
+            return
         except Exception as exc:
             logger.exception('tg.deliver.failed chat=%s msg=%s', self._chat_log_id(chat.id), candidate.stored_message_id)
             try:
@@ -1678,19 +1832,24 @@ class TelegramBotApp:
         result: TurnResult,
         *,
         sent_before_receipts: list[dict[str, object]],
-    ) -> None:
+    ) -> list[Message]:
+        delivered_messages: list[Message] = []
         after_stickers = [sticker for sticker in result.stickers if sticker.timing == StickerTiming.AFTER_FINAL]
         logger.info('tg.deliver.start chat=%s process=%s text_chars=%s artifacts=%s after_stickers=%s usage=in=%s out=%s total=%s', self._chat_log_id(source_message.chat.id), settings.process_visibility.value, len(result.text), len(result.artifacts), len(after_stickers), result.usage.input_tokens, result.usage.output_tokens, result.usage.total_tokens)
         if (result.text or '').strip():
             if settings.process_visibility in {ProcessVisibility.OFF, ProcessVisibility.MINIMAL}:
-                await self._send_text_message(source_message, result.text)
+                await self._send_text_message(source_message, result.text, delivered_messages=delivered_messages)
             else:
-                await renderer.finalize(result.text)
+                delivered_messages = await renderer.finalize(result.text)
         elif settings.process_visibility not in {ProcessVisibility.OFF}:
             await renderer.complete_without_answer()
+        if result.scope is not None:
+            await self.store.assert_scope(self._session_id(source_message.chat), result.scope)
         if result.artifacts:
             if settings.process_visibility in {ProcessVisibility.OFF, ProcessVisibility.MINIMAL}:
                 for artifact in result.artifacts:
+                    if result.scope is not None:
+                        await self.store.assert_scope(self._session_id(source_message.chat), result.scope)
                     try:
                         suffix = artifact.path.suffix.lower()
                         if suffix in {'.png', '.jpg', '.jpeg', '.webp'}:
@@ -1704,6 +1863,8 @@ class TelegramBotApp:
                         logger.exception('Failed to send artifact %s after final delivery', artifact.path)
             else:
                 await renderer.send_artifacts(result.artifacts)
+        if result.scope is not None:
+            await self.store.assert_scope(self._session_id(source_message.chat), result.scope)
         if settings.process_visibility in {ProcessVisibility.OFF, ProcessVisibility.MINIMAL}:
             try:
                 sent_after_receipts = await self._send_stickers_direct(source_message, after_stickers)
@@ -1719,7 +1880,9 @@ class TelegramBotApp:
                 name='sticker_send',
                 phase='delivery',
                 payload=receipt,
+                expected_scope=result.scope,
             )
+        return delivered_messages
 
     async def _send_stickers_direct(self, source_message: Message, stickers: list[OutboundSticker]) -> list[dict[str, object]]:
         receipts: list[dict[str, object]] = []

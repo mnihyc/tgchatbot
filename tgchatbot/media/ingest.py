@@ -285,7 +285,7 @@ async def extract_message_parts(
             parts.append(_file_part(filename=filename, mime=mime, artifact_path=str(path), size_bytes=len(raw)))
             text_excerpt = _try_text_excerpt(raw, mime, telegram_config.max_inline_text_chars)
             if text_excerpt:
-                parts.append(MessagePart(kind=PartKind.TEXT, text=f"[Attached file excerpt: {filename} ({mime})]\n{text_excerpt}", remote_sync=False, origin='auto_note'))
+                parts.append(MessagePart(kind=PartKind.TEXT, text=f"[Attached file excerpt: {filename} ({mime})]\n{text_excerpt}", remote_sync=False, origin='attachment_excerpt'))
     return parts
 
 

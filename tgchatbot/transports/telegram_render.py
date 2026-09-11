@@ -251,6 +251,7 @@ class TelegramMessageRenderer:
         self.reply_to_source_message = reply_to_source_message
         self.process_visibility = _visibility_value(process_visibility)
         self.state = TelegramRenderState()
+        self._final_messages: list[Message] | None = None
 
     def _is_full(self) -> bool:
         return self.process_visibility == ProcessVisibility.FULL.value
@@ -302,7 +303,20 @@ class TelegramMessageRenderer:
             else:
                 await self._edit_text('Status: failed', force=True)
 
-    async def finalize(self, text: str) -> None:
+    def _remember_final_message(self, message: Message) -> None:
+        if self._final_messages is not None and not any(
+                item.message_id == message.message_id for item in self._final_messages):
+            self._final_messages.append(message)
+
+    async def finalize(self, text: str) -> list[Message]:
+        self._final_messages = []
+        try:
+            await self._finalize_text(text)
+            return list(self._final_messages)
+        finally:
+            self._final_messages = None
+
+    async def _finalize_text(self, text: str) -> None:
         self.state.answer = text or ''
         if self.message is None or self._is_none():
             await self._send_text_chunks(_chunk_text_for_telegram(self.state.answer))
@@ -318,7 +332,11 @@ class TelegramMessageRenderer:
             header = '\n'.join(line for line in self.state.lines if line.strip()).strip()
 
         if self.response_delivery == ResponseDelivery.FINAL_NEW:
-            await self._edit_text(header or 'Done', force=True)
+            receipts, self._final_messages = self._final_messages, None
+            try:
+                await self._edit_text(header or 'Done', force=True)
+            finally:
+                self._final_messages = receipts
             await self._send_text_chunks(_chunk_text_for_telegram(self.state.answer))
             return
         if not self.state.answer:
@@ -408,6 +426,7 @@ class TelegramMessageRenderer:
             await bot_message_safe(self.message, 'edit_text', text=text, parse_mode='MarkdownV2', disable_web_page_preview=True)
         except BadRequest as exc:
             if self._is_message_not_modified(exc):
+                self._remember_final_message(self.message)
                 self.state.last_render_text = text
                 self.state.last_render_at = now
                 return
@@ -425,6 +444,7 @@ class TelegramMessageRenderer:
             self.state.last_render_text = text
             self.state.last_render_at = now
             return
+        self._remember_final_message(self.message)
         self.state.last_render_text = text
         self.state.last_render_at = now
 
@@ -448,6 +468,8 @@ class TelegramMessageRenderer:
             return
         with contextlib.suppress(Exception):
             await message.delete()
+            if self._final_messages is not None:
+                self._final_messages[:] = [item for item in self._final_messages if item.message_id != message.message_id]
 
     def _reply_to_message_id(self) -> int | None:
         if not self.reply_to_source_message or self.source_message is None:
@@ -455,7 +477,9 @@ class TelegramMessageRenderer:
         return self.source_message.message_id
 
     async def _send_text_via_bot(self, bot: Bot, chat_id: int, text: str) -> Message:
-        return await bot_message_safe(bot, 'send_message', chat_id=chat_id, text=text, parse_mode='MarkdownV2', disable_web_page_preview=True, reply_to_message_id=self._reply_to_message_id())
+        message = await bot_message_safe(bot, 'send_message', chat_id=chat_id, text=text, parse_mode='MarkdownV2', disable_web_page_preview=True, reply_to_message_id=self._reply_to_message_id())
+        self._remember_final_message(message)
+        return message
 
     async def _send_text_chunks(self, chunks: list[str]) -> Message | None:
         target = self._delivery_target()
@@ -475,6 +499,7 @@ class TelegramMessageRenderer:
         try:
             await bot_message_safe(original_message, 'edit_text', text=(chunks[0] or '...'), parse_mode='MarkdownV2', disable_web_page_preview=True)
             self.message = original_message
+            self._remember_final_message(original_message)
             if len(chunks) > 1:
                 await self._send_text_chunks(chunks[1:])
         except BadRequest as exc:

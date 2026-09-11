@@ -10,6 +10,24 @@ permissions:
 jobs:
   python:
     runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.6-pg17-bookworm@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
+        env:
+          POSTGRES_USER: tgchatbot
+          POSTGRES_PASSWORD: test-only
+          POSTGRES_DB: tgchatbot
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tgchatbot -d tgchatbot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+          --memory 2g
+          --cpus 2
+    env:
+      TEST_DATABASE_URL: postgresql://tgchatbot:test-only@127.0.0.1:5432/tgchatbot
     strategy:
       matrix:
         python: ['3.12', '3.13']
@@ -22,7 +40,7 @@ jobs:
           enable-cache: true
       - name: Install locked runtime dependencies
         run: uv sync --frozen --no-dev
-      - name: Mock business and deployment regression tests (no service credentials)
+      - name: Business workflows with real PostgreSQL and mocked Telegram/model APIs
         run: uv run --frozen python -m unittest discover -s tests -v
       - name: Check deployment shell syntax
         run: |

@@ -325,13 +325,12 @@ class StickerQueryTool:
 
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         try:
-            if not self.catalog.loaded:
-                self.catalog.load()
+            await self.catalog.aensure_loaded()
             plan = StickerRetrievalPlan.from_payload(args)
             query_understanding = plan.query_interpretation()
-            style_context = self.catalog.describe_style_context(ctx.session_id)
+            style_context = await self.catalog.adescribe_style_context(ctx.session_id)
             if not plan.send:
-                _, persona_context = self.catalog.prepare_query_context(plan=plan, session_id=ctx.session_id, persist_persona=False)
+                _, persona_context = await self.catalog.aprepare_query_context(plan=plan, session_id=ctx.session_id, persist_persona=False)
                 return ToolResult(
                     call_id='',
                     name=self.spec.name,
@@ -346,8 +345,9 @@ class StickerQueryTool:
                         'dropped_noise_terms': list(plan.dropped_noise_terms),
                     },
                 )
-            session_state, persona_context = self.catalog.prepare_query_context(plan=plan, session_id=ctx.session_id, persist_persona=True)
-            matches = self.catalog.choose(plan=plan, session_id=ctx.session_id, session_state=session_state, persona_context=persona_context)
+            session_state, persona_context = await self.catalog.aprepare_query_context(plan=plan, session_id=ctx.session_id,
+                persist_persona=True, expected_scope=ctx.scope)
+            matches = await self.catalog.achoose(plan=plan, session_id=ctx.session_id, session_state=session_state, persona_context=persona_context)
             if not matches:
                 return ToolResult(
                     call_id='',
@@ -404,8 +404,7 @@ class StickerSendSelectedTool:
 
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         try:
-            if not self.catalog.loaded:
-                self.catalog.load()
+            await self.catalog.aensure_loaded()
             sticker_id = str(args.get('selected_sticker_id', args.get('sticker_id', '')) or '').strip()
             if not sticker_id:
                 return ToolResult(call_id='', name=self.spec.name, output={'ok': False, 'error': 'Empty selected_sticker_id'})
@@ -414,9 +413,10 @@ class StickerSendSelectedTool:
             entry = self.catalog.get_by_sticker_id(sticker_id)
             if entry is None:
                 return ToolResult(call_id='', name=self.spec.name, output={'ok': False, 'error': 'Unknown sticker_id', 'sticker_id': sticker_id})
+            await self.catalog.adescribe_style_context(ctx.session_id)
             self.catalog.record_selection(session_id=ctx.session_id, sticker_id=entry.sticker_id)
-            style_context_after_send = self.catalog.describe_style_context(ctx.session_id)
-            persona_context_after_send = self.catalog.describe_persona_context(ctx.session_id)
+            style_context_after_send = await self.catalog.adescribe_style_context(ctx.session_id)
+            persona_context_after_send = await self.catalog.adescribe_persona_context(ctx.session_id)
             sticker = OutboundSticker(
                 path=entry.absolute_path,
                 emoji=entry.emoji,

@@ -7,17 +7,19 @@ import io
 import json
 import os
 from pathlib import Path
+import runpy
 import shutil
 import subprocess
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 REPO = Path(__file__).resolve().parents[1]
 COMMIT = "a" * 40
 MOCK = r'''#!/usr/bin/env python3
-import hashlib, json, os, pathlib, sys
+import hashlib, json, os, pathlib, runpy, sys
 args = sys.argv[1:]
 name = pathlib.Path(sys.argv[0]).name
 with open(os.environ["MOCK_LOG"], "a") as out:
@@ -34,7 +36,30 @@ state_path = pathlib.Path(os.environ["MOCK_STATE"])
 state = json.loads(state_path.read_text()) if state_path.exists() else {"tags": {}, "images": {}}
 def image_id(reference):
     return state["tags"].get(reference, reference if reference in state["images"] else None)
-if args[:2] == ["image", "inspect"]:
+if args[:1] == ["compose"] and "config" in args and "json" in args:
+    # The real parser is Compose. Supply its shape here so the actual released
+    # credential helper, rather than a mocked initializer, handles the .env file.
+    values = {}
+    for line in pathlib.Path('.env').read_text().splitlines():
+        if '=' in line and not line.lstrip().startswith('#'):
+            key, value = line.split('=', 1)
+            values[key.strip()] = value.strip().strip("\"'")
+    print(json.dumps({'services': {'bot': {'environment': values}}}))
+    sys.exit(0)
+elif args[:1] == ["run"] and args[-1] == '/usr/local/lib/tgchatbot-deploy-configure.py':
+    mounts = [args[index + 1] for index, value in enumerate(args) if value == '-v']
+    deployment_path = pathlib.Path(next(value.split(':', 1)[0] for value in mounts if value.endswith(':/deployment')))
+    env_path = deployment_path / '.env'
+    data_path = pathlib.Path(next(value.split(':', 1)[0] for value in mounts if ':/deployment/data' in value))
+    helper = runpy.run_path(os.environ['DEPLOY_HELPER_SOURCE'])
+    print(helper['configure'](json.load(sys.stdin), env_path, data_path))
+    sys.exit(0)
+elif args[:1] == ["compose"] and '--check-schema' in args:
+    identity = image_id(os.environ['TGCHATBOT_IMAGE'])
+    tag = state['images'][identity]['tag']
+    if tag in (os.environ.get('FAIL_SCHEMA_TAG'), state.get('incompatible_schema_tag')):
+        sys.exit(1)
+elif args[:2] == ["image", "inspect"]:
     identity = image_id(args[-1])
     if identity is None:
         sys.exit(1)
@@ -57,9 +82,12 @@ elif args and args[0] == "tag":
         sys.exit(1)
     state["tags"][args[2]] = identity
 elif args and args[0] == "compose" and "up" in args:
-    identity = image_id("tgchatbot:current")
-    if identity is None or state["images"][identity]["tag"] == os.environ.get("FAIL_TAG"):
-        sys.exit(1)
+    if args[-1] != 'postgres':
+        identity = image_id("tgchatbot:current")
+        if identity is None or state["images"][identity]["tag"] == os.environ.get("FAIL_TAG"):
+            state['incompatible_schema_tag'] = os.environ.get('INCOMPATIBLE_AFTER_FAILURE')
+            state_path.write_text(json.dumps(state))
+            sys.exit(1)
 state_path.write_text(json.dumps(state))
 sys.exit(0)
 '''
@@ -90,7 +118,8 @@ class ReleaseUpdaterTests(unittest.TestCase):
         self.docker_state = self.path / "docker.json"
         self.environment = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
                                 MOCK_LOG=str(self.log), MOCK_ASSETS=str(self.assets),
-                                MOCK_STATE=str(self.docker_state), TGCHATBOT_RELEASE_REPO="example/chatbot")
+                                MOCK_STATE=str(self.docker_state), TGCHATBOT_RELEASE_REPO="example/chatbot",
+                                DEPLOY_HELPER_SOURCE=str(REPO / 'deploy' / 'configure_database.py'))
         for tag in ("v0.1.0", "v0.2.0"):
             self.make_release(tag)
 
@@ -141,7 +170,10 @@ class ReleaseUpdaterTests(unittest.TestCase):
 
     def assert_data_preserved(self):
         self.assertEqual(self.state.read_bytes(), b"existing business state")
-        self.assertEqual((self.install / ".env").read_text(), self.env_content)
+        current = (self.install / ".env").read_text()
+        self.assertTrue(current.startswith(self.env_content))
+        if current != self.env_content:
+            self.assertRegex(current[len(self.env_content):], r'^POSTGRES_PASSWORD=[0-9a-f]{64}\n$')
         self.assertEqual((self.install / "data" / "tantivy_index" / "meta.json").read_text(), '{"preserve": true}')
         self.assertFalse((self.install / "SHOULD_NOT_EXIST").exists())
 
@@ -153,7 +185,7 @@ class ReleaseUpdaterTests(unittest.TestCase):
         urls = [call[-1] for call in self.calls() if call[0] == "curl"]
         self.assertTrue(urls[0].endswith("/releases/latest"))
         self.assertTrue(all("/releases/download/v0.2.0/" in url for url in urls[1:]))
-        up = next(call for call in self.calls() if "up" in call)
+        up = next(call for call in self.calls() if "up" in call and "bot" in call)
         self.assertIn("--no-build", up)
         self.assertIn("--wait", up)
         self.assertIn("never", up)
@@ -192,7 +224,7 @@ class ReleaseUpdaterTests(unittest.TestCase):
         result = self.run_update("v0.2.0", success=False, FAIL_TAG="v0.2.0")
         self.assertEqual(self.image_tag("tgchatbot:current"), "v0.1.0")
         self.assertEqual((self.install / "compose.yml").read_text(), old_compose)
-        self.assertEqual(len([call for call in self.calls() if "up" in call]), 3)
+        self.assertEqual(len([call for call in self.calls() if "up" in call and "bot" in call]), 3)
         self.assert_data_preserved()
         self.assert_simple_layout()
 
@@ -219,6 +251,128 @@ class ReleaseUpdaterTests(unittest.TestCase):
         self.run_update("v0.2.0")
         self.assertEqual(self.image_tag("tgchatbot:previous"), "v0.1.0")
         self.assert_simple_layout()
+
+    def test_local_database_password_is_created_once_and_database_precedes_bot(self):
+        self.run_update('v0.1.0')
+        first_env = (self.install / '.env').read_text()
+        self.run_update('v0.2.0')
+        self.assertEqual((self.install / '.env').read_text(), first_env)
+        calls = self.calls()
+        database_start = next(i for i, call in enumerate(calls) if 'up' in call and call[-1] == 'postgres')
+        app_start = next(i for i, call in enumerate(calls) if 'up' in call and 'bot' in call)
+        self.assertLess(database_start, app_start)
+        self.assertTrue(any('pull' in call and call[-1] == 'postgres' for call in calls))
+        helper = next(call for call in calls if call[-1] == '/usr/local/lib/tgchatbot-deploy-configure.py')
+        self.assertIn(f'{self.install}:/deployment', helper)
+        self.assertIn(f'{self.install}/data:/deployment/data:ro', helper)
+        self.assert_data_preserved()
+
+    def test_failed_credential_commit_preserves_original_keys_and_removes_temporary_copy(self):
+        env_path = self.install / '.env'
+        original = env_path.read_bytes()
+        env_path.chmod(0o640)
+        before = env_path.stat()
+        configure = runpy.run_path(REPO / 'deploy' / 'configure_database.py')['configure']
+        configuration = {'services': {'bot': {'environment': {'TGBOT_TOKEN': 'secret'}}}}
+
+        def failed_rename(temporary, destination):
+            # The complete replacement has been written before the failure;
+            # existing API keys and file ownership must still be untouched.
+            self.assertEqual(destination, env_path)
+            self.assertTrue(Path(temporary).read_bytes().startswith(original))
+            self.assertIn(b'POSTGRES_PASSWORD=', Path(temporary).read_bytes())
+            self.assertEqual(env_path.read_bytes(), original)
+            raise OSError('simulated filesystem failure immediately before rename')
+
+        with patch('os.replace', side_effect=failed_rename):
+            with self.assertRaisesRegex(OSError, 'immediately before rename'):
+                configure(configuration, env_path, self.install / 'data')
+        self.assertEqual(env_path.read_bytes(), original)
+        self.assertEqual((env_path.stat().st_uid, env_path.stat().st_gid, env_path.stat().st_mode),
+                         (before.st_uid, before.st_gid, before.st_mode))
+        self.assertEqual(list(self.install.glob('.env-update-*')), [])
+
+        self.assertEqual(configure(configuration, env_path, self.install / 'data'), 'local')
+        self.assertTrue(env_path.read_bytes().startswith(original))
+        self.assertEqual((env_path.stat().st_uid, env_path.stat().st_gid, env_path.stat().st_mode),
+                         (before.st_uid, before.st_gid, before.st_mode))
+        self.assertEqual(list(self.install.glob('.env-update-*')), [])
+
+    def test_real_compose_uses_created_credential_for_bot_and_database(self):
+        docker = shutil.which('docker')
+        if not docker or subprocess.run([docker, 'compose', 'version'], capture_output=True).returncode:
+            self.skipTest('Docker Compose is unavailable')
+        shutil.copy2(REPO / 'deploy' / 'compose.yml', self.install / 'compose.yml')
+        original = b"TGBOT_TOKEN=fixture\r\nDEFAULT_SYSTEM_PROMPT='literal $cash $(not-a-command)\r\nPOSTGRES_PASSWORD=prompt-text'\r\n"
+        (self.install / '.env').write_bytes(original)
+        command = [docker, 'compose', '--project-directory', str(self.install), '-f', str(self.install / 'compose.yml')]
+
+        def config(*extra):
+            return json.loads(subprocess.check_output([*command, *extra, 'config', '--format', 'json'], stderr=subprocess.PIPE))
+
+        before = config()
+        configure = runpy.run_path(REPO / 'deploy' / 'configure_database.py')['configure']
+        self.assertEqual(configure(before, self.install / '.env', self.install / 'data'), 'local')
+        self.assertTrue((self.install / '.env').read_bytes().startswith(original))
+        default = config()
+        local = config('--profile', 'local-database')
+        self.assertNotIn('postgres', default['services'])
+        bot_env = local['services']['bot']['environment']
+        self.assertEqual(bot_env['POSTGRES_PASSWORD'], local['services']['postgres']['environment']['POSTGRES_PASSWORD'])
+        self.assertRegex(bot_env['POSTGRES_PASSWORD'], r'^[0-9a-f]{64}$')
+        self.assertEqual(bot_env['DEFAULT_SYSTEM_PROMPT'].replace('$$', '$'), 'literal $cash $(not-a-command)\r\nPOSTGRES_PASSWORD=prompt-text')
+
+    def test_external_database_does_not_start_local_postgres_or_create_password(self):
+        self.env_content += 'DATABASE_URL=postgresql://fixture:secret@database.example/tgchatbot\n'
+        (self.install / '.env').write_text(self.env_content)
+        self.run_update()
+        self.assertEqual((self.install / '.env').read_text(), self.env_content)
+        self.assertFalse(any(('up' in call or 'pull' in call) and call[-1] == 'postgres' for call in self.calls()))
+        self.assert_data_preserved()
+
+    def test_existing_database_without_password_never_gets_a_replacement(self):
+        cluster = self.install / 'data' / 'postgres'
+        cluster.mkdir()
+        (cluster / 'PG_VERSION').write_text('17\n')
+        result = self.run_update(success=False)
+        self.assertIn('original POSTGRES_PASSWORD', result.stderr)
+        self.assertEqual((self.install / '.env').read_text(), self.env_content)
+        self.assertFalse(any('up' in call or 'stop' in call for call in self.calls()))
+
+    def test_failed_external_database_preflight_does_not_stop_previous_local_database(self):
+        self.run_update('v0.1.0')
+        previous_calls = len(self.calls())
+        with (self.install / '.env').open('a') as stream:
+            stream.write('DATABASE_URL=postgresql://fixture:secret@database.example/tgchatbot\n')
+        self.environment['FAIL_SCHEMA_TAG'] = 'v0.2.0'
+        self.run_update('v0.2.0', success=False)
+        self.assertFalse(any('stop' in call for call in self.calls()[previous_calls:]))
+        self.assertEqual(self.image_tag('tgchatbot:current'), 'v0.1.0')
+
+    def test_incompatible_candidate_does_not_stop_working_application(self):
+        self.run_update('v0.1.0')
+        prior_calls = len(self.calls())
+        self.run_update('v0.2.0', success=False, FAIL_SCHEMA_TAG='v0.2.0')
+        self.assertEqual(self.image_tag('tgchatbot:current'), 'v0.1.0')
+        self.assertFalse(any('stop' in call and 'bot' in call for call in self.calls()[prior_calls:]))
+
+    def test_failed_activation_cannot_restart_prior_image_after_incompatible_schema_change(self):
+        self.run_update('v0.1.0')
+        prior_calls = len(self.calls())
+        result = self.run_update('v0.2.0', success=False, FAIL_TAG='v0.2.0', INCOMPATIBLE_AFTER_FAILURE='v0.1.0')
+        self.assertIn('no compatible prior image', result.stderr)
+        app_starts = [call for call in self.calls()[prior_calls:] if 'up' in call and 'bot' in call]
+        self.assertEqual(len(app_starts), 1)
+        self.assertEqual(self.image_tag('tgchatbot:current'), 'v0.2.0')
+        self.assert_data_preserved()
+
+    def test_manual_rollback_checks_schema_before_stopping_current_application(self):
+        self.run_update('v0.1.0')
+        self.run_update('v0.2.0')
+        prior_calls = len(self.calls())
+        self.run_update('rollback', success=False, FAIL_SCHEMA_TAG='v0.1.0')
+        self.assertEqual(self.image_tag('tgchatbot:current'), 'v0.2.0')
+        self.assertFalse(any('stop' in call and 'bot' in call for call in self.calls()[prior_calls:]))
 
     def test_previous_image_is_saved_before_current_changes(self):
         self.run_update("v0.1.0")

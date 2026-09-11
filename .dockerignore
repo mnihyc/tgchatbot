@@ -13,5 +13,6 @@
 !scripts/**
 !deploy/
 !deploy/entrypoint.sh
+!deploy/configure_database.py
 **/__pycache__
 **/*.pyc

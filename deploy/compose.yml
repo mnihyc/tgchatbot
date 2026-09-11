@@ -1,7 +1,7 @@
 name: tgchatbot
 
 x-service: &service
-  image: tgchatbot:current
+  image: ${TGCHATBOT_IMAGE:-tgchatbot:current}
   pull_policy: never
   init: true
   restart: unless-stopped
@@ -9,7 +9,10 @@ x-service: &service
   working_dir: /app
   volumes:
     - ./data:/app/data
-  environment:
+  # PostgreSQL alone owns its cluster; application containers cannot see it.
+  tmpfs:
+    - /app/data/postgres:ro
+  environment: &application_environment
     APP_DATA_DIR: /app/data
     APP_TEMP_DIR: /tmp
     APP_HEALTH_FILE: /tmp/tgchatbot-health.json
@@ -21,6 +24,40 @@ x-service: &service
       max-file: "3"
 
 services:
+  postgres:
+    image: pgvector/pgvector:0.8.6-pg17-bookworm@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
+    # update.sh explicitly starts this service only for the bundled database.
+    profiles: [local-database]
+    restart: unless-stopped
+    stop_grace_period: 60s
+    environment:
+      POSTGRES_USER: tgchatbot
+      POSTGRES_DB: tgchatbot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    command:
+      - postgres
+      - -c
+      - fsync=on
+      - -c
+      - synchronous_commit=on
+      - -c
+      - full_page_writes=on
+      - -c
+      - autovacuum=on
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U tgchatbot -d tgchatbot"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   retriever:
     <<: *service
     command: [retriever]
@@ -39,6 +76,10 @@ services:
     command: [python, -m, tgchatbot.app]
     # Compose supplies bot configuration; secrets never enter the image.
     env_file: .env
+    environment:
+      <<: *application_environment
+      DATABASE_URL: ${DATABASE_URL:-}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
     volumes:
       - ./data:/app/data
       - ./tmp/bot:/tmp

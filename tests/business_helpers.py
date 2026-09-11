@@ -4,6 +4,7 @@ import copy
 import os
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -13,12 +14,15 @@ from tgchatbot.core.runtime import AgentRuntime
 from tgchatbot.core.token_estimator import TokenEstimator
 from tgchatbot.domain.models import ProviderResponse, ToolResult
 from tgchatbot.providers.base import ProviderCapabilities, RequestTokenEstimate
-from tgchatbot.storage.sqlite_store import SQLiteStore
+from psycopg import AsyncConnection, sql
+from tgchatbot.storage.postgres_store import PostgresStore
+from tgchatbot.storage.artifacts import ArtifactStore
+from tgchatbot.storage.previews import PreviewCache
 from tgchatbot.tools.base import ToolSpec
 
 
 class ScriptedProvider:
-    """Only the external model boundary is replaced; runtime and SQLite are real."""
+    """Only the external model boundary is replaced; runtime and PostgreSQL are real."""
 
     capabilities = ProviderCapabilities()
 
@@ -28,7 +32,12 @@ class ScriptedProvider:
         self.requests = []
 
     async def generate(self, **kwargs):
-        self.requests.append(copy.deepcopy(kwargs))
+        request = copy.deepcopy({key: value for key, value in kwargs.items() if key != "tools"})
+        # Capture the advertised model contract, not live runners and their
+        # PostgreSQL pools/tasks, which are neither serializable nor sent out.
+        request["tools"] = [ToolSpec(tool.name, tool.description, copy.deepcopy(tool.parameters_schema), None)
+                            for tool in kwargs.get("tools", [])]
+        self.requests.append(request)
         if not self.responses:
             raise AssertionError("Unexpected model request: extend the explicit test script")
         response = self.responses.pop(0)
@@ -66,6 +75,12 @@ class FixtureTools:
 
 class BusinessTestCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.test_dsn = os.getenv("TEST_DATABASE_URL")
+        if not self.test_dsn:
+            self.skipTest("TEST_DATABASE_URL is required for real PostgreSQL business tests")
+        self.schema = f"business_{uuid.uuid4().hex}"
+        self._stores = []
+        self.addAsyncCleanup(self._cleanup_database)
         # Keep fixtures inside the checkout, isolated from deployment ./data.
         self.temp = tempfile.TemporaryDirectory(prefix="fixture-", dir=Path(__file__).parent)
         self.addCleanup(self.temp.cleanup)
@@ -76,12 +91,16 @@ class BusinessTestCase(unittest.IsolatedAsyncioTestCase):
             "DEFAULT_PROVIDER": "openai",
             "OPENAI_API_KEY": "mock-openai-key",
             "DEFAULT_PROVIDER_RETRY_COUNT": "0",
+            "DATABASE_URL": self.test_dsn,
         }, clear=True):
             self.config = load_config()
-        self.store = SQLiteStore(self.config.db_path)
+        self.artifact_store = ArtifactStore(self.path / "replay", max_bytes=32 * 1024 * 1024)
+        self.preview_cache = PreviewCache(self.path / "previews", max_bytes=32 * 1024 * 1024)
+        self.addCleanup(self.preview_cache.close)
+        self.store = await self.new_store()
         self.provider = ScriptedProvider()
         self.tools = FixtureTools()
-        self.runtime = AgentRuntime(config=self.config, store=self.store, tool_registry=self.tools, providers={"openai": self.provider})
+        self.runtime = AgentRuntime(config=self.config, store=self.store, tool_registry=self.tools, providers={"openai": self.provider}, preview_cache=self.preview_cache)
         self.session = "telegram:100"
 
     async def settings(self, **changes):
@@ -90,3 +109,17 @@ class BusinessTestCase(unittest.IsolatedAsyncioTestCase):
             setattr(settings, name, value)
         await self.store.save_session(self.session, settings)
         return settings
+
+    async def new_store(self, *, artifact_store=None):
+        store = PostgresStore(self.test_dsn, schema=self.schema,
+                              artifact_store=artifact_store or self.artifact_store)
+        self._stores.append(store)
+        await store.initialize()
+        return store
+
+    async def _cleanup_database(self):
+        for store in self._stores:
+            await store.close()
+        # Drop only this generated test schema; never use the deployment schema.
+        async with await AsyncConnection.connect(self.test_dsn, autocommit=True) as conn:
+            await conn.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(self.schema)))

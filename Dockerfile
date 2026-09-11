@@ -28,10 +28,12 @@ ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy \
     PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
     APP_DATA_DIR=/app/data APP_TEMP_DIR=/tmp HOME=/app/data/home
 COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project --group indexing --no-cache
 COPY tgchatbot ./tgchatbot
 RUN uv sync --frozen --no-dev --no-editable --group indexing --no-cache
 COPY --from=retriever-build /build/target/release/sticker-retriever /usr/local/bin/sticker-retriever
 COPY scripts ./scripts
 COPY deploy/entrypoint.sh /usr/local/bin/tgchatbot-entrypoint
+COPY deploy/configure_database.py /usr/local/lib/tgchatbot-deploy-configure.py
 ENTRYPOINT ["/usr/local/bin/tgchatbot-entrypoint"]
 CMD ["python", "-m", "tgchatbot.app"]

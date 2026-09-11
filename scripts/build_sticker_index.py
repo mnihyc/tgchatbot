@@ -1174,8 +1174,8 @@ def main() -> None:
     parser.add_argument('--openai-api-key', default=None, help='Legacy override for OPENAI_API_KEY.')
     parser.add_argument('--provider', default=os.getenv('STICKER_TAGGING_PROVIDER', ''), help='Configured provider name; defaults to OpenAI when its key is set, otherwise DEFAULT_PROVIDER.')
     parser.add_argument('--model', '--openai-model', dest='model', default=os.getenv('STICKER_TAGGING_MODEL', ''), help='Analysis model; --openai-model is a legacy alias.')
-    parser.add_argument('--embedding-model', default=None, help='Override STICKER_EMBEDDING_MODEL.')
-    parser.add_argument('--embedding-dimensions', type=int, default=None, help='Override STICKER_EMBEDDING_DIMENSIONS.')
+    parser.add_argument('--embedding-model', default=None, help='Override EMBEDDING_MODEL.')
+    parser.add_argument('--embedding-dimensions', type=int, default=None, help='Override EMBEDDING_DIMENSIONS.')
     parser.add_argument('--no-embeddings', action='store_true', help='Build lexical search artifacts without embedding API calls.')
     parser.add_argument('--read-timeout', '--openai-read-timeout', dest='read_timeout', type=float, default=float(os.getenv('OPENAI_READ_TIMEOUT', '300')))
     parser.add_argument('--connect-timeout', '--openai-connect-timeout', dest='connect_timeout', type=float, default=float(os.getenv('OPENAI_CONNECT_TIMEOUT', '30')))
@@ -1195,7 +1195,7 @@ def main() -> None:
 
     if PaddleOCR is None:
         raise RuntimeError('PaddleOCR is required for build_sticker_index.py. Install paddlepaddle and paddleocr first.')
-    for arg, env_name in ((args.openai_api_key, 'OPENAI_API_KEY'), (args.openai_base_url, 'OPENAI_BASE_URL'), (args.embedding_model, 'STICKER_EMBEDDING_MODEL'), (args.embedding_dimensions, 'STICKER_EMBEDDING_DIMENSIONS')):
+    for arg, env_name in ((args.openai_api_key, 'OPENAI_API_KEY'), (args.openai_base_url, 'OPENAI_BASE_URL'), (args.embedding_model, 'EMBEDDING_MODEL'), (args.embedding_dimensions, 'EMBEDDING_DIMENSIONS')):
         if arg is not None:
             os.environ[env_name] = str(arg)
     config = load_config(require_telegram=False)
@@ -1206,7 +1206,7 @@ def main() -> None:
     analyzer.close()
     embedding = None if args.no_embeddings else EmbeddingProvider.from_env()
     if embedding is not None and not embedding.enabled:
-        raise RuntimeError('Configure STICKER_EMBEDDING_API_KEY (or the selected embedding provider key), or use --no-embeddings.')
+        raise RuntimeError('Configure EMBEDDING_API_KEY (or the selected embedding provider key), or use --no-embeddings.')
     embedding_model = embedding.model if embedding else ''
     embedding_dimensions = embedding.dimensions if embedding else 0
     build_stack = f'paddleocr+{provider_name}+tantivy' + ('+embeddings' if embedding else '')
@@ -1286,8 +1286,11 @@ def main() -> None:
     style_clusters_path.write_text(json.dumps({'clusters': cluster_summary, 'vocab_size': len(vocab)}, ensure_ascii=False, indent=2), encoding='utf-8')
 
     if embedding is not None:
-        caption_matrix = embedding.embed_many(caption_embed_inputs)
-        sticker_matrix = embedding.embed_many(sticker_embed_inputs)
+        try:
+            caption_matrix = embedding.embed_many(caption_embed_inputs)
+            sticker_matrix = embedding.embed_many(sticker_embed_inputs)
+        finally:
+            embedding.close()
         np.save(caption_npy, caption_matrix.astype(np.float32))
         np.save(sticker_npy, sticker_matrix.astype(np.float32))
     _write_validation_report(built_rows=built_rows, output_path=validation_report_path, embedding_dimensions=embedding_dimensions, embedding_model=embedding_model)
@@ -1295,6 +1298,8 @@ def main() -> None:
         'enabled': embedding is not None, 'sticker_ids': sticker_ids,
         'dimensions': embedding_dimensions, 'embedding_model': embedding_model,
         'embedding_backend': embedding.backend if embedding else None,
+        'embedding_space_id': embedding.space_id if embedding else None,
+        'embedding_space': embedding.config.space_spec if embedding else None,
         'embedding_base_url': embedding.base_url if embedding else None,
         'build_stack': build_stack, 'schema_version': STICKER_SCHEMA_VERSION,
     }, ensure_ascii=False, indent=2), encoding='utf-8')

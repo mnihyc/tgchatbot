@@ -2,13 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import hashlib
 import json
-import os
-import sqlite3
 
 import httpx
 import numpy as np
+
+from tgchatbot.embeddings import EmbeddingClient, EmbeddingConfig, EmbeddingService, SyncEmbeddingClient
 
 
 @dataclass(slots=True)
@@ -19,142 +18,86 @@ class SemanticHit:
 
 
 class EmbeddingProvider:
-    def __init__(self, *, api_key: str | None = None, model: str = 'text-embedding-3-large', dimensions: int = 1024, base_url: str = 'https://api.openai.com/v1', cache_db_path: Path | None = None, backend: str = 'openai') -> None:
-        self.api_key = api_key if api_key is not None else os.getenv('OPENAI_API_KEY')
-        if backend not in {'openai', 'gemini'}:
-            raise ValueError('Embedding backend must be openai (compatible API) or gemini')
-        if dimensions <= 0:
-            raise ValueError('Embedding dimensions must be positive')
-        self.backend = backend
-        self.model = model
-        self.dimensions = dimensions
-        self.base_url = base_url.rstrip('/')
-        self._cache: dict[str, np.ndarray] = {}
-        self.cache_db_path = Path(cache_db_path) if cache_db_path else None
-        if self.cache_db_path is not None:
-            self.cache_db_path.parent.mkdir(parents=True, exist_ok=True)
-            with sqlite3.connect(self.cache_db_path) as con:
-                con.execute('CREATE TABLE IF NOT EXISTS query_embeddings (cache_key TEXT PRIMARY KEY, model TEXT NOT NULL, dimensions INTEGER NOT NULL, vector_json TEXT NOT NULL)')
-                con.commit()
+    """Sticker adapter for the shared embedding service.
+
+    Runtime callers use ``aembed``. ``embed``/``embed_many`` are an offline-only
+    facade for the maintenance scripts. Query caches belong to the shared
+    client; no second sticker key or persistent plaintext cache is created.
+    """
+
+    def __init__(self, *, config: EmbeddingConfig | None = None,
+                 client: EmbeddingService | None = None, api_key: str | None = None,
+                 model: str | None = None, dimensions: int | None = None,
+                 base_url: str | None = None, backend: str | None = None,
+                 cache_db_path: Path | None = None,
+                 http_client: httpx.AsyncClient | None = None) -> None:
+        if client is not None:
+            config = client.config
+        if config is None:
+            selected = backend or 'gemini'
+            config = EmbeddingConfig(
+                provider=selected,
+                api_key=api_key or '',
+                model=model or ('gemini-embedding-2' if selected == 'gemini' else 'text-embedding-3-large'),
+                dimensions=dimensions if dimensions is not None else 1536,
+                base_url=base_url or ('https://generativelanguage.googleapis.com/v1beta' if selected == 'gemini' else 'https://api.openai.com/v1'),
+            )
+        self.config = config
+        self.api_key = config.api_key
+        self.backend = config.provider
+        self.model = config.model
+        self.dimensions = config.dimensions
+        self.base_url = config.base_url
+        self.space_id = config.space_id
+        self._client = client
+        self._http_client = http_client
+        self._owns_client = client is None
+        self._sync: SyncEmbeddingClient | None = None
 
     @classmethod
     def from_env(cls, *, cache_db_path: Path | None = None) -> 'EmbeddingProvider':
-        backend = os.getenv('STICKER_EMBEDDING_PROVIDER', 'openai').strip().lower()
-        prefix = 'GEMINI' if backend == 'gemini' else 'OPENAI'
-        default_model = 'gemini-embedding-001' if backend == 'gemini' else 'text-embedding-3-large'
-        default_url = 'https://generativelanguage.googleapis.com/v1beta' if backend == 'gemini' else 'https://api.openai.com/v1'
-        return cls(
-            backend=backend,
-            api_key=os.getenv('STICKER_EMBEDDING_API_KEY', os.getenv(f'{prefix}_API_KEY', '')),
-            base_url=os.getenv('STICKER_EMBEDDING_BASE_URL', os.getenv(f'{prefix}_BASE_URL', default_url)),
-            model=os.getenv('STICKER_EMBEDDING_MODEL', default_model),
-            dimensions=int(os.getenv('STICKER_EMBEDDING_DIMENSIONS', '1024')),
-            cache_db_path=cache_db_path,
-        )
+        return cls(config=EmbeddingConfig.from_env())
 
     @property
     def enabled(self) -> bool:
-        return bool(self.api_key)
+        return self.config.enabled
 
-    def _cache_lookup(self, cache_key: str) -> np.ndarray | None:
-        cached = self._cache.get(cache_key)
-        if cached is not None:
-            return cached
-        if self.cache_db_path is None:
-            return None
-        with sqlite3.connect(self.cache_db_path) as con:
-            row = con.execute('SELECT vector_json FROM query_embeddings WHERE cache_key=? AND model=? AND dimensions=?', (cache_key, self.model, self.dimensions)).fetchone()
-        if not row:
-            return None
-        vector = np.asarray(json.loads(row[0]), dtype=np.float32)
-        self._cache_store(cache_key, vector)
-        return vector
-
-    def _cache_store(self, cache_key: str, vector: np.ndarray) -> None:
-        self._cache[cache_key] = vector
-        if self.cache_db_path is None:
-            return
-        with sqlite3.connect(self.cache_db_path) as con:
-            con.execute('INSERT INTO query_embeddings(cache_key, model, dimensions, vector_json) VALUES(?, ?, ?, ?) ON CONFLICT(cache_key) DO UPDATE SET model=excluded.model, dimensions=excluded.dimensions, vector_json=excluded.vector_json', (cache_key, self.model, self.dimensions, json.dumps(vector.tolist())))
-            con.commit()
+    def _offline(self) -> SyncEmbeddingClient:
+        SyncEmbeddingClient._check_offline()
+        if self._client is not None:
+            raise RuntimeError('This sticker adapter uses an async client; await aembed/asearch instead')
+        if self._sync is None:
+            self._sync = SyncEmbeddingClient(self.config, http_client=self._http_client)
+        return self._sync
 
     def embed(self, text: str) -> np.ndarray:
-        text = (text or '').strip()
-        if not text:
-            raise RuntimeError('Semantic retrieval requires a non-empty query string.')
-        if not self.api_key:
-            raise RuntimeError('Configure an embedding API key or use STICKER_SEMANTIC_MODE=off.')
-        # Endpoint and protocol are part of the vector space identity. Switching
-        # a compatible endpoint must not reuse another service's cached vector.
-        cache_key = hashlib.sha256(f'{self.backend}:{self.base_url}:{self.model}:{self.dimensions}:{text}'.encode('utf-8')).hexdigest()
-        cached = self._cache_lookup(cache_key)
-        if cached is not None:
-            return cached
-        if self.backend == 'gemini':
-            model = self.model.removeprefix('models/')
-            response = httpx.post(
-                f'{self.base_url}/models/{model}:embedContent',
-                headers={'x-goog-api-key': self.api_key},
-                timeout=httpx.Timeout(15.0, connect=3.0),
-                json={'model': f'models/{model}', 'content': {'parts': [{'text': text}]},
-                      'outputDimensionality': self.dimensions},
-            )
-        else:
-            response = httpx.post(
-                f'{self.base_url}/embeddings',
-                headers={'Authorization': f'Bearer {self.api_key}', 'Content-Type': 'application/json'},
-                timeout=httpx.Timeout(15.0, connect=3.0),
-                json={'model': self.model, 'input': text, 'dimensions': self.dimensions},
-            )
-        response.raise_for_status()
-        body = response.json()
-        data = body['embedding']['values'] if self.backend == 'gemini' else body['data'][0]['embedding']
-        vector = np.asarray(data, dtype=np.float32)
-        if vector.shape != (self.dimensions,) or not np.isfinite(vector).all():
-            raise ValueError('Embedding response dimensions or values are invalid')
-        norm = np.linalg.norm(vector)
-        if norm <= 0:
-            raise ValueError('Embedding response is a zero vector')
-        vector = vector / norm
-        self._cache_store(cache_key, vector)
-        return vector
+        return self._offline().embed_query(text, purpose='sticker')
 
     def embed_many(self, texts: list[str]) -> np.ndarray:
         if not texts:
             return np.zeros((0, self.dimensions), dtype=np.float32)
-        if self.backend == 'gemini':
-            return np.stack([self.embed(text) for text in texts])
-        if not self.enabled:
-            raise RuntimeError('Configure an embedding API key before building embeddings.')
-        batches: list[np.ndarray] = []
-        # Preserve the legacy builder's 128-input batches. Sending every sticker
-        # individually would multiply HTTP overhead and request-rate usage.
-        for start in range(0, len(texts), 128):
-            inputs = texts[start:start + 128]
-            response = httpx.post(
-                f'{self.base_url}/embeddings',
-                headers={'Authorization': f'Bearer {self.api_key}', 'Content-Type': 'application/json'},
-                timeout=httpx.Timeout(300.0, connect=30.0),
-                json={'model': self.model, 'input': inputs, 'dimensions': self.dimensions},
-            )
-            response.raise_for_status()
-            rows = response.json()['data']
-            if len(rows) != len(inputs) or sorted(row['index'] for row in rows) != list(range(len(inputs))):
-                raise ValueError('Embedding batch response has missing or duplicate input indices')
-            batch = np.asarray([row['embedding'] for row in sorted(rows, key=lambda row: row['index'])], dtype=np.float32)
-            if batch.shape != (len(inputs), self.dimensions) or not np.isfinite(batch).all():
-                raise ValueError('Embedding batch dimensions or values are invalid')
-            norms = np.linalg.norm(batch, axis=1, keepdims=True)
-            if np.any(norms <= 0):
-                raise ValueError('Embedding batch contains a zero vector')
-            batches.append(batch / norms)
-        return np.vstack(batches)
+        return np.stack(self._offline().embed_documents(texts, purpose='sticker'))
+
+    async def aembed(self, text: str) -> np.ndarray:
+        if self._sync is not None:
+            raise RuntimeError('An offline sticker embedding adapter cannot be reused on the live event loop')
+        if self._client is None:
+            self._client = EmbeddingClient(self.config, http_client=self._http_client)
+        return await self._client.embed_query(text, purpose='sticker')
+
+    def close(self) -> None:
+        if self._sync is not None:
+            self._sync.close()
+
+    async def aclose(self) -> None:
+        if self._owns_client and self._client is not None:
+            await self._client.aclose()
 
 
 class SemanticIndex:
     def __init__(self, index_dir: Path, *, embedding_provider: EmbeddingProvider | None = None, require_ready: bool = True) -> None:
         self.index_dir = Path(index_dir)
-        self.embedding_provider = embedding_provider or EmbeddingProvider()
+        self.embedding_provider = embedding_provider or EmbeddingProvider.from_env()
         self.sticker_ids: list[str] = []
         self.caption_vectors: np.ndarray | None = None
         self.sticker_vectors: np.ndarray | None = None
@@ -178,11 +121,11 @@ class SemanticIndex:
         if not manifest.get('enabled', True):
             raise RuntimeError('This sticker index was built without embeddings; rebuild embeddings or set STICKER_SEMANTIC_MODE=off.')
         provider = self.embedding_provider
-        if (manifest.get('embedding_model') != provider.model
+        if (manifest.get('embedding_space_id') != provider.space_id
+                or manifest.get('embedding_model') != provider.model
                 or int(manifest.get('dimensions', 0)) != provider.dimensions
-                or manifest.get('embedding_backend', provider.backend) != provider.backend
-                or manifest.get('embedding_base_url', provider.base_url).rstrip('/') != provider.base_url):
-            raise RuntimeError('Embedding endpoint/model/backend/dimensions changed; rebuild embeddings or set STICKER_SEMANTIC_MODE=off.')
+                or manifest.get('embedding_backend') != provider.backend):
+            raise RuntimeError('Embedding space/model/backend/dimensions changed; rebuild embeddings or set STICKER_SEMANTIC_MODE=off.')
         self.sticker_ids = [str(x) for x in manifest.get('sticker_ids', [])]
         self.caption_vectors = np.load(caption_path, mmap_mode='r')
         self.sticker_vectors = np.load(sticker_path, mmap_mode='r')
@@ -203,6 +146,15 @@ class SemanticIndex:
         self.ensure_ready()
         caption_vec = self.embedding_provider.embed(caption_query_text)
         sticker_vec = self.embedding_provider.embed(sticker_query_text)
+        return self._rank(caption_vec, sticker_vec, top_k)
+
+    async def asearch(self, *, caption_query_text: str, sticker_query_text: str, top_k: int = 50) -> list[SemanticHit]:
+        self.ensure_ready()
+        caption_vec = await self.embedding_provider.aembed(caption_query_text)
+        sticker_vec = caption_vec if sticker_query_text == caption_query_text else await self.embedding_provider.aembed(sticker_query_text)
+        return self._rank(caption_vec, sticker_vec, top_k)
+
+    def _rank(self, caption_vec: np.ndarray, sticker_vec: np.ndarray, top_k: int) -> list[SemanticHit]:
         k = max(1, min(int(top_k), len(self.sticker_ids)))
         hits: list[SemanticHit] = []
 

@@ -10,6 +10,7 @@ from tgchatbot.domain.models import ToolResult
 class ToolContext:
     session_id: str
     user_display_name: str
+    scope: dict[str, int] | None = None
 
 
 def _nullable_schema(schema: dict[str, Any]) -> dict[str, Any]:

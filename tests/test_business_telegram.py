@@ -11,6 +11,9 @@ from tgchatbot.domain.models import (
     ProcessVisibility, StickerTiming, TurnResult,
 )
 from tgchatbot.transports.telegram_adapter import ReplyCandidate, TelegramBotApp
+from tgchatbot.stickers.catalog import StickerCatalog
+from tgchatbot.stickers.plan import StickerRetrievalPlan
+from tgchatbot.storage.postgres_store import StaleScopeError
 
 
 class TelegramWorkflowTests(BusinessTestCase):
@@ -165,6 +168,49 @@ class TelegramWorkflowTests(BusinessTestCase):
         self.assertEqual(self.app._reply_to_candidate.await_args.args[0].stored_message_id, trigger.db_id)
         self.assertNotIn(self.session, self.runtime._live_sessions)
 
+    async def test_retry_preserves_original_author_when_someone_else_issues_command(self):
+        trigger = await self.runtime.ingest_user_message(session_id=self.session,
+            incoming_message=ConversationMessage.user_text("Original question", metadata={
+                "source": "telegram", "source_chat_id": "100", "source_message_id": "42",
+                "actor_id": "telegram:user:8", "actor_kind": "user", "actor_name": "Original author"}))
+        await self.runtime.record_assistant_text(session_id=self.session, text="old answer")
+        self.app._reply_to_candidate = AsyncMock()
+        self.update.effective_user.full_name = "Command issuer"
+        await self.app.retry_command(self.update, self.context)
+        candidate = self.app._reply_to_candidate.await_args.args[0]
+        self.assertEqual(candidate.stored_message_id, trigger.db_id)
+        self.assertEqual(candidate.user_display_name, "Original author")
+        original = (await self.store.read_messages(self.session, [trigger.db_id]))[0]
+        self.assertEqual(original.message.metadata["actor_id"], "telegram:user:8")
+
+    async def test_full_reset_clears_cached_persona_and_rejects_a_stale_tool_write(self):
+        catalog = StickerCatalog(self.path / "catalog.db", self.path / "stickers", persona_store=self.store)
+        self.addCleanup(catalog.retriever.close)
+        catalog._loaded = True
+        catalog.entries_by_id = {"shared-sticker": object()}
+        self.tools.sticker_catalog = catalog
+        persona = {"affect_profile": {"default_tone": "warm"}}
+        await self.store.save_sticker_persona(self.session, persona)
+        await self.store.save_sticker_persona("telegram:200", persona)
+        await catalog.adescribe_style_context(self.session)
+        await catalog.adescribe_style_context("telegram:200")
+        catalog.style_memory.preload(self.session, recent_sticker_ids=["old-choice"])
+        scope = await self.store.get_scope(self.session)
+        self.context.args = ["all"]
+        await self.app.reset_command(self.update, self.context)
+        await catalog.adescribe_style_context(self.session)
+        self.assertIsNone(catalog.style_memory.get(self.session).session_persona)
+        self.assertEqual(list(catalog.style_memory.get(self.session).recent_sticker_ids), [])
+        self.assertEqual(catalog.style_memory.get("telegram:200").session_persona, persona)
+        self.assertEqual(list(catalog.entries_by_id), ["shared-sticker"])
+        stale_plan = StickerRetrievalPlan.from_payload({"intent_core": "hello",
+            "persona_mode": "merge_and_remember", "persona": persona})
+        with self.assertRaises(StaleScopeError):
+            await catalog.aprepare_query_context(plan=stale_plan, session_id=self.session,
+                persist_persona=True, expected_scope=scope)
+        self.assertIsNone(await self.store.get_sticker_persona(self.session))
+        self.assertIsNone(catalog.style_memory.get(self.session).session_persona)
+
     async def test_rollback_groups_tool_and_assistant_as_one_bot_block(self):
         first = await self.runtime.ingest_user_message(session_id=self.session, incoming_message=ConversationMessage.user_text("question"))
         await self.runtime.record_tool_observation(session_id=self.session, name="shell_exec", payload={}, phase="result")
@@ -236,7 +282,7 @@ class TelegramWorkflowTests(BusinessTestCase):
     async def test_successful_delivery_commits_assistant_history(self):
         await self.settings(process_visibility=ProcessVisibility.OFF)
         self.runtime.run_turn_from_stored = AsyncMock(return_value=TurnResult("delivered"))
-        self.app._deliver_result = AsyncMock()
+        self.app._deliver_result = AsyncMock(return_value=[SimpleNamespace(message_id=123, chat=self.chat)])
         await self.app._reply_to_candidate(self.candidate())
         self.assertEqual((await self.store.list_messages(self.session))[0].parts[0].text, "delivered")
 

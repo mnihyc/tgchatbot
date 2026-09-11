@@ -7,12 +7,17 @@ from dotenv import load_dotenv
 
 from tgchatbot.config import load_config
 from tgchatbot.core.runtime import AgentRuntime
+from tgchatbot.core.memory import MemoryService
+from tgchatbot.core.memory_worker import MemoryWorker
+from tgchatbot.embeddings import EmbeddingClient, EmbeddingConfig
 from tgchatbot.logging_config import configure_logging
+from tgchatbot.healthcheck import health_path
 from tgchatbot.providers.factory import build_providers
 from tgchatbot.stickers.catalog import StickerCatalog
 from tgchatbot.storage.artifacts import ArtifactStore
 from tgchatbot.storage.presets import PresetStore
-from tgchatbot.storage.sqlite_store import SQLiteStore
+from tgchatbot.storage.postgres_store import PostgresStore
+from tgchatbot.storage.previews import PreviewCache
 from tgchatbot.tools.registry import ToolRegistry
 from tgchatbot.tools.remote_workspace import RemoteWorkspaceClient
 from tgchatbot.transports.telegram_adapter import TelegramBotApp
@@ -44,63 +49,73 @@ def main() -> None:
     load_dotenv()
     config = load_config()
     configure_logging(config.log_level)
-
-    artifact_store = ArtifactStore(config.artifact_dir)
-    preset_store = PresetStore(config.preset_dir)
-    store = SQLiteStore(config.db_path)
-    persisted_sessions = store._count_sessions_sync()
-    remote = RemoteWorkspaceClient(config)
-    sticker_catalog = StickerCatalog(config.sticker_index_path, config.sticker_dir, persona_store=store)
-    sticker_catalog.load()
-    sticker_stats = sticker_catalog.stats()
-
-    providers = _build_providers(config)
-    if config.default_provider not in providers:
-        configured_providers = ', '.join(sorted(providers.keys())) or '-'
-        raise RuntimeError(
-            f'DEFAULT_PROVIDER={config.default_provider!r} is not configured. '
-            f'Configured providers: {configured_providers}'
-        )
-    logger.info(
-        'app.start provider_default=%s providers=%s delivery=%s remote=%s data_dir=%s sessions_loaded=%s',
-        config.default_provider,
-        ','.join(providers.keys()),
-        config.default_response_delivery,
-        config.ssh_exec.enabled and bool(config.ssh_exec.host),
-        config.data_dir,
-        persisted_sessions,
-    )
-    logger.info('stickers.ready loaded=%s count=%s packs=%s index=%s', sticker_stats.get('loaded'), sticker_stats.get('stickers'), sticker_stats.get('packs'), config.sticker_index_path)
+    # Container recreation may reuse a PID while retaining /tmp. Readiness
+    # belongs to this startup, not a recent marker from the previous process.
+    marker = health_path()
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text('{}')
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    if remote.enabled:
-        logger.info('remote.warmup.start host=%s port=%s', config.ssh_exec.host, config.ssh_exec.port)
-        loop.run_until_complete(remote.warmup())
-        logger.info('remote.warmup.done ready=%s', getattr(remote, '_master_started', False))
-
-    runtime = AgentRuntime(
-        config=config,
-        store=store,
-        tool_registry=ToolRegistry(config, remote, sticker_catalog),
-        providers=providers,
-    )
-    bot = TelegramBotApp(
-        config=config,
-        runtime=runtime,
-        store=store,
-        artifact_store=artifact_store,
-        preset_store=preset_store,
-        remote_workspace=remote,
-    )
+    store = embeddings = previews = sticker_catalog = worker = remote = None
+    providers = {}
     try:
+        artifact_store = ArtifactStore(config.artifact_dir)
+        preset_store = PresetStore(config.preset_dir)
+        replay_store = ArtifactStore(config.temp_dir / 'provider-replay', max_bytes=config.memory.replay_cache_bytes)
+        store = PostgresStore(config.database_url, artifact_store=replay_store)
+        previews = PreviewCache(config.temp_dir, max_bytes=config.memory.preview_cache_bytes)
+        embeddings = EmbeddingClient(EmbeddingConfig.from_env())
+        if embeddings.config.dimensions != 1536:
+            raise ValueError('Conversation memory requires EMBEDDING_DIMENSIONS=1536; rebuild with a compatible schema to change it')
+        if not embeddings.enabled:
+            logger.warning('memory.embeddings_unconfigured semantic_search=unavailable lexical_search=available')
+        loop.run_until_complete(store.initialize())
+        persisted_sessions = loop.run_until_complete(store.count_sessions())
+        remote = RemoteWorkspaceClient(config)
+        sticker_catalog = StickerCatalog(config.sticker_index_path, config.sticker_dir,
+                                         persona_store=store, embedding_client=embeddings)
+        sticker_catalog.load()
+        providers = _build_providers(config)
+        if config.default_provider not in providers:
+            available = ', '.join(sorted(providers)) or '-'
+            raise RuntimeError(f'DEFAULT_PROVIDER={config.default_provider!r} is not configured. Configured providers: {available}')
+        logger.info('app.start provider_default=%s providers=%s delivery=%s remote=%s sessions_loaded=%s',
+                    config.default_provider, ','.join(providers), config.default_response_delivery,
+                    remote.enabled, persisted_sessions)
+        logger.info('stickers.ready stats=%s', sticker_catalog.stats())
+        if remote.enabled:
+            loop.run_until_complete(remote.warmup())
+        memory = MemoryService(store, embeddings, config=config.memory)
+        worker = MemoryWorker(store=store, embeddings=embeddings, providers=providers, config=config)
+        memory.worker = worker
+        runtime = AgentRuntime(config=config, store=store,
+            tool_registry=ToolRegistry(config, remote, sticker_catalog), providers=providers,
+            memory=memory, preview_cache=previews)
+        bot = TelegramBotApp(config=config, runtime=runtime, store=store,
+            artifact_store=artifact_store, preset_store=preset_store, remote_workspace=remote)
+        async def start_worker():
+            worker.start()
+        loop.run_until_complete(start_worker())
         bot.run_polling()
     except KeyboardInterrupt:
         logger.info('app.stop signal=keyboard_interrupt')
     finally:
+        # Startup can fail after opening a database or HTTP client. The same
+        # cleanup owns both partial startup and normal polling shutdown.
+        if worker is not None:
+            loop.run_until_complete(worker.close())
         loop.run_until_complete(_cleanup(remote, providers))
-        sticker_catalog.retriever.close()
+        if sticker_catalog is not None:
+            sticker_catalog.retriever.close()
+        if embeddings is not None:
+            loop.run_until_complete(embeddings.aclose())
+        if store is not None:
+            loop.run_until_complete(store.close())
+        if previews is not None:
+            previews.close()
         loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()
+        asyncio.set_event_loop(None)
         logger.info('app.stop complete=1')
 
 

@@ -86,6 +86,7 @@ class MessagePart:
     detail: str | None = None
     remote_sync: bool = True
     origin: str | None = None
+    preview_ref: str | None = None
 
 
 @dataclass(slots=True)
@@ -229,3 +230,5 @@ class TurnResult:
     stickers: list[OutboundSticker] = field(default_factory=list)
     provider_name: str | None = None
     provider_history_items: list[dict[str, Any]] = field(default_factory=list)
+    scope: dict[str, int] | None = None
+    reply_target: dict[str, Any] = field(default_factory=dict)

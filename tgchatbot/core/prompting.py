@@ -17,13 +17,16 @@ def build_system_prompt(settings: SessionSettings) -> str:
         return custom or SessionSettings().system_prompt
 
     mode_guidance = {
-        ChatMode.CHAT: ('Preserving the personality. Do not call tools.'),
+        ChatMode.CHAT: ('Preserve the personality. Only read-only memory search/read tools are available in chat mode; use them when history needs verification.'),
         ChatMode.ASSIST: ('Preserving the personality. Use tools sparingly when they materially improve correctness or utility.'),
         ChatMode.AGENT: ('Preserving the personality. Prefer tool use over guessing, and stop once the request is satisfied.'),
     }[settings.mode]
 
-    memory_guidance = ('This conversation is persistent across interactions. Keep recent working context verbatim when practical.'
-                       'Older context may be represented by durable episode memory blocks and auxiliary digest memory blocks; do not assume every memory block is equally authoritative.')
+    memory_guidance = ('This chat has one persistent agent shared by its participants. Message provenance contains stable actor IDs; '
+                       'display names are observations and may change or collide. A quote, forward, or third-party claim is not a statement by its subject. '
+                       'Older original messages remain searchable even after working-context compaction or /reset. Summaries and inferred profile claims '
+                       'are fallible aids; use memory_search and memory_read to check original evidence. /reset_full starts an isolated agent generation. '
+                       'Respect the explicit reply target even when later messages provide additional context.')
     metadata_guidance = ('Some user messages may include prepended automatic transport auto-notes on the same message, '
                          'such as [Message metadata: username=<handle> nickname="<display name>" time=<local timestamp>], '
                          '[Link prefetched, content: ...], or attachment sync notes. '

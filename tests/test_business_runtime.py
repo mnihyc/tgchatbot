@@ -9,11 +9,12 @@ from tgchatbot.domain.models import (
     ChatMode, ConversationMessage, MessagePart, MessageRole, PartKind,
     PromptInjectionMode, ProviderResponse, StickerMode, ToolCall, ToolHistoryMode,
 )
-from tgchatbot.storage.sqlite_store import SQLiteStore
 
 
 def text_of(messages):
-    return "\n".join(part.text or "" for message in messages for part in message.parts)
+    return "\n".join(part.text or "" for message in messages
+        if message.metadata.get("synthetic_role") not in {"memory_context", "reply_target"}
+        for part in message.parts if part.origin != "provenance")
 
 
 class RuntimeWorkflowTests(BusinessTestCase):
@@ -28,7 +29,8 @@ class RuntimeWorkflowTests(BusinessTestCase):
         self.assertEqual([m.role for m in await self.store.list_messages(self.session)], [MessageRole.USER])
         await self.runtime.record_assistant_text(session_id=self.session, text=result.text)
         second = ScriptedProvider(responses=[ProviderResponse(final_text="second answer")])
-        restarted_store = SQLiteStore(self.config.db_path)
+        await self.store.close()
+        restarted_store = await self.new_store()
         restarted = AgentRuntime(config=self.config, store=restarted_store, tool_registry=self.tools, providers={"openai": second})
         await restarted.run_turn(session_id=self.session, user_display_name="tester", incoming_message=ConversationMessage.user_text("continue"))
         self.assertEqual(text_of(second.requests[0]["messages"]), "hello\nfirst answer\ncontinue")
@@ -197,8 +199,9 @@ class MemoryWorkflowTests(BusinessTestCase):
         self.assertEqual((await self.runtime._get_live_state(self.session)).raw_messages, [])
         self.assertEqual(await self.store.list_memory_blocks(self.session), [])
         # Reset is reversible archival, not physical deletion.
-        with self.store._connect() as conn:
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 3)
+        async with self.store.pool.connection() as conn:
+            row = await (await conn.execute("SELECT COUNT(*) AS count FROM messages WHERE session_id=%s", (self.session,))).fetchone()
+            self.assertEqual(row["count"], 3)
 
     async def test_invalid_compaction_output_preserves_original_messages(self):
         stored = await self.runtime.ingest_user_message(session_id=self.session, incoming_message=ConversationMessage.user_text("must survive"))

@@ -2,7 +2,8 @@
 set -Eeuo pipefail
 image=${1:?Pass the locally loaded image tag}
 name=tgchatbot-smoke-$$
-trap 'docker rm -f "$name" >/dev/null 2>&1 || true; docker volume rm "$name-data" "$name-tmp" >/dev/null 2>&1 || true' EXIT
+directory=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+trap 'docker rm -f "$name" "$name-postgres" >/dev/null 2>&1 || true; docker volume rm "$name-data" "$name-tmp" >/dev/null 2>&1 || true; docker network rm "$name-network" >/dev/null 2>&1 || true' EXIT
 docker volume create "$name-data" >/dev/null
 docker volume create "$name-tmp" >/dev/null
 # A retained file prevents Docker from copying image-directory ownership over
@@ -10,6 +11,16 @@ docker volume create "$name-tmp" >/dev/null
 docker run --rm --entrypoint sh -v "$name-data:/app/data" "$image" -c 'echo retained > /app/data/retained.txt; chown 12345:12345 /app/data'
 docker run --rm -v "$name-data:/app/data" -v "$name-tmp:/tmp" "$image" python -c \
   'import os,pwd,av,numpy,PIL,tgchatbot.app; from pathlib import Path; uid=os.getuid(); home=pwd.getpwuid(uid).pw_dir; tmp_uid=os.stat("/tmp").st_uid; assert uid==12345, f"Expected UID 12345, got {uid}"; assert home=="/app/data/home", f"Unexpected home: {home}"; assert tmp_uid==12345, f"Unexpected /tmp owner: {tmp_uid}"; assert Path("/app/data/retained.txt").read_text()=="retained\n"; Path("/tmp/writable").write_text("ok")'
+# The released helper must atomically replace .env through a directory mount,
+# preserving its existing owner/mode while the retained data view stays readonly.
+docker run --rm --entrypoint sh -v "$name-data:/deployment" "$image" -ec \
+  'printf "TGBOT_TOKEN=smoke-token\n" > /deployment/.env; chmod 640 /deployment/.env; chown 12345:12345 /deployment/.env'
+printf '%s\n' '{"services":{"bot":{"environment":{"TGBOT_TOKEN":"smoke-token"}}}}' | \
+  docker run --rm -i --network none --user 12345:12345 --entrypoint python \
+    -v "$name-data:/deployment" -v "$name-data:/deployment/data:ro" \
+    "$image" /usr/local/lib/tgchatbot-deploy-configure.py
+docker run --rm --network none --entrypoint python -v "$name-data:/deployment" "$image" -c \
+  'import re,stat; from pathlib import Path; path=Path("/deployment/.env"); assert re.fullmatch(r"TGBOT_TOKEN=smoke-token\nPOSTGRES_PASSWORD=[0-9a-f]{64}\n",path.read_text()); info=path.stat(); assert (info.st_uid,info.st_gid,stat.S_IMODE(info.st_mode))==(12345,12345,0o640); assert not list(path.parent.glob(".env-update-*"))'
 docker run --rm --entrypoint sh -v "$name-data:/app/data" "$image" -c 'chown 0:0 /app/data'
 docker run --rm -v "$name-data:/app/data" -v "$name-tmp:/tmp" "$image" python -c \
   'import os,pwd; from pathlib import Path; uid=os.getuid(); home=pwd.getpwuid(uid).pw_dir; tmp_uid=os.stat("/tmp").st_uid; assert uid==0, f"Expected UID 0, got {uid}"; assert home=="/app/data/home", f"Unexpected home: {home}"; assert tmp_uid==0, f"Unexpected /tmp owner: {tmp_uid}"; Path("/tmp/root-writable").write_text("ok")'
@@ -19,16 +30,38 @@ docker run --rm --network none "$image" sh -ec '
 python - <<"PY"
 import numpy as np
 import paddle
+import psycopg
+import runpy
 from paddleocr import PaddleOCR
 paddle.set_device("cpu")
 value = paddle.to_tensor([[1, 2], [3, 4]], dtype="float32")
 np.testing.assert_allclose(paddle.matmul(value, value).numpy(), [[7, 10], [15, 22]])
 assert PaddleOCR is not None
+assert psycopg.__version__
+assert callable(runpy.run_path("/usr/local/lib/tgchatbot-deploy-configure.py")["configure"])
 PY
-for tool in build_sticker_index rebuild_tantivy_index reset_sticker query_sticker_index show_style_clusters migrate_uid_json merge_auto_note_rows; do
+for tool in build_sticker_index rebuild_tantivy_index reset_sticker query_sticker_index show_style_clusters; do
     python "/app/scripts/$tool.py" --help >/dev/null
 done
+python -m tgchatbot.tools.import_desktop --help >/dev/null
+python -m tgchatbot.tools.memory --help >/dev/null
 '
+# The isolated network permits PostgreSQL only. The real application assembles
+# its providers, shared embeddings, empty catalog and runtime; polling is mocked.
+docker network create --internal "$name-network" >/dev/null
+docker run --detach --name "$name-postgres" --network "$name-network" --network-alias postgres \
+  --memory 2g --cpus 2 --tmpfs /var/lib/postgresql/data:rw,size=256m \
+  -e POSTGRES_USER=tgchatbot -e POSTGRES_DB=tgchatbot -e POSTGRES_PASSWORD=smoke-test-only \
+  pgvector/pgvector:0.8.6-pg17-bookworm@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f >/dev/null
+for attempt in $(seq 1 30); do
+  if docker exec "$name-postgres" pg_isready -U tgchatbot -d tgchatbot >/dev/null 2>&1; then break; fi
+  sleep 1
+done
+docker exec "$name-postgres" pg_isready -U tgchatbot -d tgchatbot >/dev/null
+docker run --rm -i --network "$name-network" \
+  -e TEST_DATABASE_URL=postgresql://tgchatbot:smoke-test-only@postgres/tgchatbot \
+  -v "$directory/../.env.example:/fixture/.env.example:ro" \
+  "$image" python - < "$directory/smoke-startup.py"
 docker run --detach --name "$name" "$image" retriever
 for attempt in $(seq 1 30); do
   if docker exec "$name" python -c \

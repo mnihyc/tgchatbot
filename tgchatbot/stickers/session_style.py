@@ -391,6 +391,9 @@ class SessionStyleMemory:
             self._states[session_id] = state
         return state
 
+    def clear(self, session_id: str) -> None:
+        self._states.pop(session_id or 'default', None)
+
     def preload(
         self,
         session_id: str,

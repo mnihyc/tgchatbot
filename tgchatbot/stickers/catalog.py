@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -8,8 +9,9 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any, Protocol
 
+from tgchatbot.embeddings import EmbeddingService
 from tgchatbot.stickers.persona import build_persona_dict, compact_persona_dict, merge_persona_dicts, persona_affect_profile, persona_has_values, persona_visual_identity
 from tgchatbot.stickers.plan import StickerRetrievalPlan
 from tgchatbot.stickers.retrieval_client import TantivyRetrieverClient
@@ -17,8 +19,10 @@ from tgchatbot.stickers.schema import STICKER_SCHEMA_VERSION
 from tgchatbot.stickers.semantic_index import EmbeddingProvider, SemanticIndex
 from tgchatbot.stickers.session_style import SessionStyleMemory, SessionStyleState, normalize_style_goal
 
-if TYPE_CHECKING:
-    from tgchatbot.storage.sqlite_store import SQLiteStore
+class StickerPersonaStore(Protocol):
+    async def get_sticker_persona(self, session_id: str) -> dict[str, Any] | None: ...
+    async def save_sticker_persona(self, session_id: str, persona: dict[str, Any], *, expected_scope: dict[str, int] | None = None) -> None: ...
+    async def clear_sticker_persona(self, session_id: str, *, expected_scope: dict[str, int] | None = None) -> None: ...
 
 _WORD_RE = re.compile(r"[\w+\-']+", re.UNICODE)
 _CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]")
@@ -147,10 +151,11 @@ class StickerMatch:
 
 
 class StickerCatalog:
-    def __init__(self, index_db_path: Path, sticker_root: Path, persona_store: 'SQLiteStore | None' = None) -> None:
+    def __init__(self, index_db_path: Path, sticker_root: Path, persona_store: StickerPersonaStore | None = None, *, embedding_client: EmbeddingService | None = None) -> None:
         self.index_db_path = Path(index_db_path)
         self.sticker_root = Path(sticker_root)
         self.persona_store = persona_store
+        self._load_lock = asyncio.Lock()
         self._loaded = False
         self._stats_cache: dict[str, int | bool] = {'loaded': False, 'stickers': 0, 'packs': 0, 'animated': 0, 'static': 0}
         self.entries_by_id: dict[str, StickerIndexEntry] = {}
@@ -161,9 +166,7 @@ class StickerCatalog:
         semantic_mode = os.getenv('STICKER_SEMANTIC_MODE', 'auto').strip().lower()
         if semantic_mode not in {'auto', 'on', 'off'}:
             raise ValueError('STICKER_SEMANTIC_MODE must be auto, on, or off')
-        embedding_provider = EmbeddingProvider.from_env(
-            cache_db_path=self.index_db_path.parent / 'query_embedding_cache.sqlite3',
-        )
+        embedding_provider = EmbeddingProvider(client=embedding_client) if embedding_client is not None else EmbeddingProvider.from_env()
         artifacts_present = all((self.index_db_path.parent / name).exists() for name in (
             'embeddings_manifest.json', 'caption_embeddings.npy', 'sticker_embeddings.npy'))
         if artifacts_present and semantic_mode == 'auto' and embedding_provider.enabled:
@@ -245,15 +248,57 @@ class StickerCatalog:
         persona_context = self._resolve_persona_context(session_id=session_id, state=state, plan=plan, persist=persist_persona)
         return state, persona_context
 
+    def reset_session(self, session_id: str) -> None:
+        """Discard one agent's learned persona and continuity after full reset."""
+        self.style_memory.clear(session_id)
+
+    async def aensure_loaded(self) -> None:
+        if not self._loaded:
+            async with self._load_lock:
+                if not self._loaded:
+                    await asyncio.to_thread(self.load)
+
+    async def _aensure_session_state(self, session_id: str) -> SessionStyleState:
+        state = self.style_memory.get(session_id)
+        if not getattr(state, 'session_persona_loaded', False):
+            persona = await self.persona_store.get_sticker_persona(session_id) if self.persona_store is not None else None
+            state.set_session_persona(persona)
+        return state
+
+    async def adescribe_style_context(self, session_id: str = 'default') -> dict[str, Any]:
+        await self.aensure_loaded()
+        return (await self._aensure_session_state(session_id)).to_context_dict()
+
+    async def adescribe_persona_context(self, session_id: str = 'default', plan: StickerRetrievalPlan | None = None) -> dict[str, Any]:
+        await self.aensure_loaded()
+        state = await self._aensure_session_state(session_id)
+        return self._resolve_persona_context(session_id=session_id, state=state, plan=plan, persist=False)
+
+    async def aprepare_query_context(self, *, plan: StickerRetrievalPlan, session_id: str, persist_persona: bool,
+                                     expected_scope: dict[str, int] | None = None) -> tuple[SessionStyleState, dict[str, Any]]:
+        await self.aensure_loaded()
+        state = await self._aensure_session_state(session_id)
+        previous = compact_persona_dict(state.session_persona)
+        context = self._resolve_persona_context(session_id=session_id, state=state, plan=plan, persist=persist_persona)
+        if persist_persona and self.persona_store is not None:
+            scope_args = {'expected_scope': expected_scope} if expected_scope is not None else {}
+            try:
+                if plan.persona_mode == 'clear_session_persona':
+                    await self.persona_store.clear_sticker_persona(session_id, **scope_args)
+                elif plan.persona_mode == 'merge_and_remember' and compact_persona_dict(plan.persona.as_dict()):
+                    await self.persona_store.save_sticker_persona(session_id, compact_persona_dict(state.session_persona), **scope_args)
+            except BaseException:
+                state.set_session_persona(previous)
+                raise
+        return state, context
+
     def _ensure_session_state(self, session_id: str) -> SessionStyleState:
         state = self.style_memory.get(session_id)
         if getattr(state, 'session_persona_loaded', False):
             return state
-        persona = None
-        persona_store = getattr(self, 'persona_store', None)
-        if persona_store is not None:
-            persona = persona_store.get_sticker_persona_sync(session_id)
-        state.set_session_persona(persona)
+        if self.persona_store is not None:
+            raise RuntimeError('Persistent sticker personas require the async catalog methods')
+        state.set_session_persona(None)
         return state
 
     def _resolve_persona_context(
@@ -272,10 +317,8 @@ class StickerCatalog:
 
         if plan is not None and mode == 'clear_session_persona':
             session_persona = {}
-            state.clear_session_persona()
-            persona_store = getattr(self, 'persona_store', None)
-            if persist and persona_store is not None:
-                persona_store.clear_sticker_persona_sync(session_id)
+            if persist:
+                state.clear_session_persona()
             feedback_summary = 'Cleared the stored session sticker persona; only slight recent sticker continuity remains.'
 
         effective_persona: dict[str, Any] = {}
@@ -285,9 +328,6 @@ class StickerCatalog:
                 session_persona = compact_persona_dict(effective_persona)
                 if persist:
                     state.set_session_persona(session_persona)
-                    persona_store = getattr(self, 'persona_store', None)
-                    if persona_store is not None:
-                        persona_store.save_sticker_persona_sync(session_id, session_persona)
                 feedback_summary = 'Using and remembering this session sticker persona; recent sticker continuity only nudges close variants.'
             elif mode == 'use_once':
                 effective_persona = merge_persona_dicts(session_persona, requested_persona)
@@ -317,6 +357,27 @@ class StickerCatalog:
             context['confidence'] = round(float(recent_implicit.get('confidence', 0.0) or 0.0), 4)
         return context
 
+    async def achoose(self, *, plan: StickerRetrievalPlan, session_id: str = 'default',
+                      session_state: SessionStyleState | None = None,
+                      persona_context: dict[str, Any] | None = None) -> list[StickerMatch]:
+        await self.aensure_loaded()
+        if not plan.send or not plan.intent_core or not self.entries_by_id:
+            return []
+        state = session_state or await self._aensure_session_state(session_id)
+        context = persona_context or self._resolve_persona_context(session_id=session_id, state=state, plan=plan, persist=False)
+        caption_text, sticker_text = plan.caption_query_text(), plan.sticker_query_text()
+        lexical_hits = await asyncio.to_thread(
+            self._search_lexical, caption_query_text=caption_text, sticker_query_text=sticker_text,
+            caption_importance=plan.text_priority, allow_animation=plan.allow_animation,
+            limit=max(40, plan.candidate_budget * 12),
+        )
+        semantic_hits = await self.semantic_index.asearch(
+            caption_query_text=caption_text, sticker_query_text=sticker_text,
+            top_k=max(50, plan.candidate_budget * 12),
+        ) if self.semantic_enabled else []
+        return self.choose(plan=plan, session_id=session_id, session_state=state,
+                           persona_context=context, _lexical_hits=lexical_hits, _semantic_hits=semantic_hits)
+
     def choose(
         self,
         *,
@@ -324,6 +385,8 @@ class StickerCatalog:
         session_id: str = 'default',
         session_state: SessionStyleState | None = None,
         persona_context: dict[str, Any] | None = None,
+        _lexical_hits: list[Any] | None = None,
+        _semantic_hits: list[Any] | None = None,
     ) -> list[StickerMatch]:
         if not self._loaded:
             self.load()
@@ -333,14 +396,14 @@ class StickerCatalog:
             return []
         caption_query_text = plan.caption_query_text()
         sticker_query_text = plan.sticker_query_text()
-        lexical_hits = self._search_lexical(
+        lexical_hits = _lexical_hits if _lexical_hits is not None else self._search_lexical(
             caption_query_text=caption_query_text,
             sticker_query_text=sticker_query_text,
             caption_importance=plan.text_priority,
             allow_animation=plan.allow_animation,
             limit=max(40, plan.candidate_budget * 12),
         )
-        semantic_hits = self.semantic_index.search(
+        semantic_hits = _semantic_hits if _semantic_hits is not None else self.semantic_index.search(
             caption_query_text=caption_query_text,
             sticker_query_text=sticker_query_text,
             top_k=max(50, plan.candidate_budget * 12),

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tgchatbot"
-version = "0.1.5"
+version = "0.2.0"
 description = "Persistent Telegram assistant with switchable model providers"
 requires-python = ">=3.12,<3.14"
 license = "Apache-2.0"
@@ -17,6 +17,8 @@ dependencies = [
   "pydantic>=2.8.2,<3",
   "telegramify-markdown>=1.1.1,<2",
   "numpy>=2.4.3,<3",
+  "psycopg[binary,pool]>=3.2,<4",
+  "ijson>=3.3,<4",
 ]
 
 [project.scripts]
@@ -29,6 +31,9 @@ indexing = ["paddleocr==3.2.0", "paddlepaddle==3.2.1"]
 
 [tool.setuptools.packages.find]
 include = ["tgchatbot*"]
+
+[tool.setuptools.package-data]
+"tgchatbot.storage" = ["*.sql"]
 
 [tool.uv]
 package = true
