@@ -8,8 +8,9 @@ import logging
 
 from tgchatbot.config import OpenAIConfig
 from tgchatbot.core.token_estimator import TokenEstimator
-from tgchatbot.domain.models import ChatMode, ConversationMessage, MessageRole, PartKind, ProviderResponse, SessionSettings, ToolCall, UsageInfo
-from tgchatbot.providers.base import ControlDescriptor, ProviderCapabilities, RequestTokenEstimate, estimate_json_schema_tokens
+from tgchatbot.domain.models import ChatMode, ConversationMessage, MessagePart, MessageRole, PartKind, ProviderResponse, SessionSettings, ToolCall, UsageInfo
+from tgchatbot.providers.base import (ControlDescriptor, ProviderCapabilities, RequestTokenEstimate,
+    estimate_json_schema_tokens, evidence_text, pending_image_tokens, tool_message_evidence)
 from tgchatbot.settings_schema import NATIVE_WEB_SEARCH_MAX_MAX, effective_optional_disabled_int, effective_reasoning_summary
 from tgchatbot.tools.base import ToolSpec
 from tgchatbot.logging_config import dump_llm_exchange
@@ -18,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 class OpenAIResponsesProvider:
     name = 'openai'
-    capabilities = ProviderCapabilities(multimodal_input=True, function_tools=True, native_web_search=True, server_state=False)
+    capabilities = ProviderCapabilities(multimodal_input=True, function_tools=True, native_web_search=True, server_state=False, multimodal_tool_results=True)
 
     def __init__(self, config: OpenAIConfig) -> None:
         if not config.api_key:
@@ -32,6 +33,9 @@ class OpenAIResponsesProvider:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    def supports_tool_evidence(self, settings: SessionSettings) -> bool:
+        return self.capabilities.multimodal_tool_results
 
     def describe_controls(self, settings: SessionSettings) -> dict[str, ControlDescriptor]:
         native_web = settings.native_web_search_mode if settings.native_web_search_mode != 'default' else ('on' if self.config.enable_native_web_search else 'off')
@@ -73,6 +77,8 @@ class OpenAIResponsesProvider:
             for message in messages
             for item in self._message_to_input_items(message)
         )
+        if history_tokens_override is None:
+            history_tokens += pending_image_tokens(messages)
         instructions_tokens = TokenEstimator.estimate_text(instructions)
         tool_defs = self._tool_defs_for_request(settings, tools)
         tools_tokens = sum(self._estimate_tool_definition_tokens(tool_def) for tool_def in tool_defs)
@@ -145,6 +151,9 @@ class OpenAIResponsesProvider:
             'tool_choice': 'auto' if tool_defs else 'none',
             'max_output_tokens': settings.max_output_tokens if settings.max_output_tokens is not None else self.config.max_output_tokens,
         }
+        tier = settings.service_tier or getattr(self.config, 'service_tier', None)
+        if tier:
+            payload['service_tier'] = tier
         effective_native_web_search_max = effective_optional_disabled_int(
             settings.native_web_search_max,
             self.config.native_web_search_max,
@@ -162,8 +171,28 @@ class OpenAIResponsesProvider:
         response.raise_for_status()
         return self._parse_response(response.json())
 
-    def make_tool_result_items(self, tool_call: ToolCall, tool_output: dict) -> list[dict]:
-        return [{'type': 'function_call_output', 'call_id': tool_call.call_id, 'output': json.dumps(tool_output, ensure_ascii=False)}]
+    def make_tool_result_items(self, tool_call: ToolCall, tool_output: dict,
+                               evidence_parts: list[MessagePart] | None = None) -> list[dict]:
+        output: str | list[dict[str, Any]] = json.dumps(tool_output, ensure_ascii=False)
+        if evidence_parts:
+            content: list[dict[str, Any]] = [{'type': 'input_text', 'text': output}]
+            for part in evidence_parts:
+                if part.kind == PartKind.IMAGE and part.data_b64 and part.mime_type:
+                    if part.text:
+                        content.append({'type': 'input_text', 'text': part.text})
+                    content.append({'type': 'input_image', 'image_url': f'data:{part.mime_type};base64,{part.data_b64}',
+                                    'detail': part.detail or 'auto'})
+                elif part.kind == PartKind.FILE and part.data_b64 and part.mime_type:
+                    if part.text:
+                        content.append({'type': 'input_text', 'text': part.text})
+                    content.append({'type': 'input_file', 'file_data': f'data:{part.mime_type};base64,{part.data_b64}',
+                                    'filename': part.filename or 'evidence'})
+                else:
+                    text = evidence_text(part)
+                    if text:
+                        content.append({'type': 'input_text', 'text': text})
+            output = content
+        return [{'type': 'function_call_output', 'call_id': tool_call.call_id, 'output': output}]
 
     def _parse_response(self, body: dict[str, Any]) -> ProviderResponse:
         output = body.get('output', [])
@@ -213,7 +242,11 @@ class OpenAIResponsesProvider:
             tool_calls=tool_calls,
             native_tool_calls=native_tool_calls,
             continuation_items=continuation_items,
-            usage=UsageInfo(input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=total_tokens),
+            usage=UsageInfo(
+                input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=total_tokens,
+                cached_input_tokens=(usage_block.get('input_tokens_details') or {}).get('cached_tokens'),
+                service_tier=body.get('service_tier'),
+            ),
             raw=body,
         )
 
@@ -252,7 +285,10 @@ class OpenAIResponsesProvider:
                 + TokenEstimator.estimate_text(item.get('arguments'))
             )
         if item_type == 'function_call_output':
-            return 24 + TokenEstimator.estimate_text(item.get('call_id')) + TokenEstimator.estimate_text(item.get('output'))
+            output = item.get('output')
+            output_tokens = (sum(self._estimate_input_item_tokens(part) for part in output if isinstance(part, dict))
+                             if isinstance(output, list) else TokenEstimator.estimate_text(output))
+            return 24 + TokenEstimator.estimate_text(item.get('call_id')) + output_tokens
         if item_type == 'reasoning':
             total = 16
             for summary_item in item.get('summary') or []:
@@ -317,10 +353,13 @@ class OpenAIResponsesProvider:
             phase = str(message.metadata.get('tool_phase') or '').strip().lower()
             provider_name = str(message.metadata.get('tool_provider') or '').strip().lower()
             payload = message.metadata.get('tool_payload') if isinstance(message.metadata.get('tool_payload'), dict) else {}
-            if provider_name == self.name and phase == 'call' and payload.get('call_id') and message.name:
+            framework_refresh = message.metadata.get('synthetic_role') == 'profile_refresh'
+            portable_evidence = bool(message.metadata.get('tool_evidence'))
+            if (provider_name == self.name or framework_refresh or portable_evidence) and phase == 'call' and payload.get('call_id') and message.name:
                 return [{'type': 'function_call', 'call_id': str(payload['call_id']), 'name': message.name, 'arguments': json.dumps(payload.get('arguments') or {}, ensure_ascii=False)}]
-            if provider_name == self.name and phase == 'result' and payload.get('call_id'):
-                return [{'type': 'function_call_output', 'call_id': str(payload['call_id']), 'output': json.dumps(payload.get('output') or {}, ensure_ascii=False)}]
+            if (provider_name == self.name or framework_refresh or portable_evidence) and phase == 'result' and payload.get('call_id'):
+                return self.make_tool_result_items(ToolCall(message.name or '', str(payload['call_id']), {}),
+                    payload.get('output') or {}, tool_message_evidence(message))
         role = MessageRole.ASSISTANT.value if message.role == MessageRole.TOOL else message.role.value
         text_item_type = 'output_text' if role == MessageRole.ASSISTANT.value else 'input_text'
         content_items: list[dict[str, Any]] = []

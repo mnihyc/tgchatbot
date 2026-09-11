@@ -17,152 +17,23 @@ def _param(type_: str | list[str], description: str, **extra: Any) -> dict[str, 
     return payload
 
 
-def _round_number(value: Any) -> Any:
-    return round(value, 4) if isinstance(value, float) else value
-
-
-def _round_mapping(values: dict[str, Any]) -> dict[str, Any]:
-    return {key: _round_number(value) for key, value in values.items()}
-
-
-def _compact_text(value: Any, *, limit: int = 160) -> str:
-    text = ' '.join(str(value or '').split()).strip()
-    if len(text) <= limit:
-        return text
-    return text[: limit - 3].rstrip() + '...'
-
-
-def _semantic_summary(entry: Any) -> str:
-    return _compact_text(
-        entry.sticker_card.get('fused_pragmatic_meaning')
-        or entry.sticker_semantic_text
-        or entry.caption_semantic_text
-        or entry.summary
-    )
-
-
-def _style_summary(entry: Any) -> str:
-    return _compact_text(entry.style_text or '')
-
-
-def _caption_summary(entry: Any) -> str:
-    return _compact_text(entry.caption_meaning_en or entry.caption_meaning_zh or entry.source_overlay_text_normalized or '')
-
-
-def _compact_entry_payload(entry: Any) -> dict[str, Any]:
-    return {
-        'sticker_id': entry.sticker_id,
-        'summary': entry.summary,
-        'source_pack_id': entry.source_pack_id,
-        'style_cluster': entry.style_cluster,
-        'style_summary': _style_summary(entry),
-        'semantic_summary': _semantic_summary(entry),
-        'caption_summary': _caption_summary(entry),
-        'animated': entry.animated,
-        'emoji': entry.emoji,
-    }
-
-
-def _first_requested_phrase(profile: dict[str, Any], fields: tuple[str, ...]) -> str:
-    requested = dict(profile.get('requested') or {})
-    for field_name in fields:
-        if requested.get(field_name):
-            return str(requested[field_name])
-    details = dict(profile.get('details') or {})
-    for field_name in fields:
-        detail = dict(details.get(field_name) or {})
-        requested_value = str(detail.get('requested') or '').strip()
-        if requested_value:
-            return requested_value
-    return ''
-
-
-def _candidate_fit_signals(match: StickerMatch) -> list[str]:
-    signals: list[str] = []
-    message_intent = match.match_profile.get('message_intent', {})
-    intent_lens = dict(message_intent.get('selection_lens') or {})
-    if intent_lens.get('social_read', {}).get('requested'):
-        signals.append('social read: ' + str(intent_lens['social_read']['requested']))
-    if intent_lens.get('subtext', {}).get('requested'):
-        signals.append('subtext: ' + str(intent_lens['subtext']['requested']))
-    simple_profile = match.match_profile.get('simple_hints', {})
-    simple_requested = simple_profile.get('requested', {})
-    for field_name in simple_profile.get('matched', [])[:2]:
-        if simple_requested.get(field_name):
-            signals.append(str(simple_requested[field_name]))
-    semantic_profile = match.match_profile.get('semantic_axes', {})
-    semantic_requested = semantic_profile.get('requested', {})
-    for field_name in semantic_profile.get('matched', [])[:2]:
-        if semantic_requested.get(field_name):
-            signals.append(str(semantic_requested[field_name]))
-    visual_profile = match.match_profile.get('visual_cues', {})
-    visual_requested = visual_profile.get('requested', {})
-    for field_name in visual_profile.get('matched', [])[:2]:
-        if visual_requested.get(field_name):
-            signals.append(str(visual_requested[field_name]))
-    text_fit = match.match_profile.get('text_fit', {})
-    if text_fit.get('matched_must_include'):
-        signals.append('caption supports: ' + ', '.join(text_fit['matched_must_include'][:2]))
-    elif text_fit.get('has_visible_text'):
-        signals.append('visible caption meaning available')
-    style_relation = match.match_profile.get('style_relation', {})
-    if style_relation.get('preferred_pack_match') == 'exact_preferred_pack':
-        signals.append(f"preferred pack: {style_relation.get('preferred_pack_requested')}")
-    elif style_relation.get('preferred_pack_match') in {'close_preferred_pack', 'related_preferred_pack', 'loosely_related_preferred_pack'}:
-        signals.append(f"near preferred pack: {style_relation.get('preferred_pack_requested')}")
-    if style_relation.get('preferred_cluster_match') == 'exact_preferred_cluster':
-        signals.append(f"preferred cluster: {style_relation.get('preferred_cluster_requested')}")
-    elif style_relation.get('preferred_cluster_match') in {'related_preferred_cluster', 'loosely_related_preferred_cluster'}:
-        signals.append(f"near preferred cluster: {style_relation.get('preferred_cluster_requested')}")
-    continuity = match.match_profile.get('continuity', {})
-    if continuity.get('session_persona_used'):
-        signals.append('aligned with stored sticker persona')
-    elif continuity.get('recent_implicit_used'):
-        signals.append('aligned with recent sticker continuity')
-    return signals[:6]
-
-
-def _candidate_warnings(match: StickerMatch) -> list[str]:
-    warnings = list(match.match_profile.get('hard_mismatches', []))
-    diversity = match.match_profile.get('diversity_relation', {})
-    labels = diversity.get('labels') or []
-    if 'recently_sent_exact_sticker' in labels:
-        warnings.append('same sticker was sent recently')
-    elif 'recently_surfaced_exact_sticker' in labels:
-        warnings.append('same sticker already appeared in a recent shortlist')
-    return warnings[:6]
-
-
 def _candidate_payload(match: StickerMatch) -> dict[str, Any]:
-    diversity_relation = match.match_profile.get('diversity_relation', {})
-    continuity = match.match_profile.get('continuity', {})
-    message_intent = match.match_profile.get('message_intent', {})
-    affect = match.match_profile.get('affect', {})
-    visual_identity = match.match_profile.get('visual_identity', {})
+    asset = match.entry.asset
     return {
-        **_compact_entry_payload(match.entry),
-        'selection_summary': match.selection_summary,
-        'social_read': _first_requested_phrase(message_intent.get('selection_lens', {}), ('social_read', 'subtext')) or str(match.entry.sticker_card.get('fused_pragmatic_meaning') or match.entry.summary),
-        'persona_fit': _first_requested_phrase(visual_identity.get('persona_visual_identity', {}), ('character_archetype', 'rendering_style', 'palette_mood')) or continuity.get('note', ''),
-        'expression_fit': _first_requested_phrase(affect.get('persona_affect', {}), ('default_tone', 'expression_bias', 'pose_bias', 'delivery_bias', 'humor_bias')) or _first_requested_phrase(affect.get('visual_axes', {}), ('eye_signal', 'mouth_signal', 'motion_signal', 'delivery_style', 'humor_style')),
-        'continuity_note': str(continuity.get('note') or ''),
-        'fit_signals': _candidate_fit_signals(match),
-        'warnings': _candidate_warnings(match),
-        'score': round(match.score, 4),
-        'debug': {
-            'score_breakdown': _round_mapping(match.score_breakdown),
-            'match_profile': match.match_profile,
-            'diversity_relation': diversity_relation,
-        },
+        'sticker_id': asset.asset_id,
+        'caption': asset.card.get('caption', ''),
+        'appearance': asset.card.get('appearance', ''),
+        'action': asset.card.get('action', ''),
+        'readings': asset.card.get('readings', []),
+        'uncertainty': asset.card.get('uncertainty', ''),
+        'matched_reading': match.reading,
+        'packs': list(dict.fromkeys(alias.pack for alias in asset.aliases)),
+        'character_families': list(asset.family_ids),
+        'style_tags': list(asset.style_tags),
+        'animated': match.entry.animated,
+        'recently_delivered': match.recently_delivered,
+        'visually_similar_deliveries': list(match.visually_similar_deliveries),
     }
-
-
-def _send_selection_summary(entry: Any, style_context_after_send: dict[str, Any]) -> str:
-    tone = str(entry.sticker_card.get('fused_pragmatic_meaning') or entry.summary or 'Sticker selected').strip().rstrip('.')
-    current_cluster = style_context_after_send.get('current_style_cluster')
-    if current_cluster:
-        return f'{tone}. Recorded into style memory under cluster {current_cluster}.'
-    return tone + '.'
 
 
 def _advanced_schema() -> dict[str, Any]:
@@ -203,7 +74,7 @@ def _advanced_schema() -> dict[str, Any]:
                     'style_goal': _param('string', 'How strongly to preserve or switch style families.', enum=['preserve', 'allow_switch', 'prefer_switch', 'ignore_style'], default='preserve'),
                     'style_hints': _param('array', 'Optional visual-family hints like rough manga line, pastel, or deadpan meme.', items={'type': 'string'}),
                     'preferred_pack': _param('string', 'Optional pack family or source pack id to preserve or stay near.'),
-                    'preferred_style_cluster': _param('string', 'Optional style cluster id to preserve or stay near.'),
+                    'preferred_style_cluster': _param('string', 'Legacy style reference; include descriptive appearance in expression_cue for a fresh catalog.'),
                 },
                 'additionalProperties': False,
             },
@@ -300,7 +171,7 @@ class StickerQueryTool:
             parameters_schema={
                 'type': 'object',
                 'properties': {
-                    'send': _param('boolean', 'Whether the bot actually wants to send a sticker after this query.', default=True),
+                    'send': _param('boolean', 'false skips the query and preference changes entirely; true inspects candidates without sending them.', default=True),
                     'intent_core': _param('string', 'Required core reaction meaning in plain language, for example dry amused refusal or warm supportive acknowledgement.'),
                     'secondary_goals': _param('array', 'Optional extra nuances that materially refine the reaction.', items={'type': 'string'}),
                     'reaction_tone': _param('string', 'Optional simple reaction tone, for example dry amused, warm, irritated, bashful, or smug.'),
@@ -308,10 +179,13 @@ class StickerQueryTool:
                     'expression_cue': _param('string', 'Optional simple face or pose cue, for example side-eye, blank stare, pout, or tiny shrug.'),
                     'caption_meaning': _param('string', 'Optional caption or overlay meaning hint when visible text matters.'),
                     'preferred_pack': _param('string', 'Optional pack family or source pack id to preserve or stay near.'),
-                    'preferred_style_cluster': _param('string', 'Optional style cluster id to preserve or stay near.'),
+                    'preferred_style_cluster': _param('string', 'Legacy style reference; include descriptive appearance in expression_cue for a fresh catalog.'),
                     'diversity_preference': _param('string', 'Whether to keep normal ranking or slightly prefer fresher variants than very recent ones.', enum=['default', 'prefer_fresh_variant'], default='default'),
                     'allow_animation': _param('boolean', 'Allow animated stickers if they fit better.', default=False),
-                    'candidate_budget': _param('integer', 'How many ranked candidates to return.', minimum=1, maximum=8, default=5),
+                    'candidate_budget': _param('integer', 'How many candidates to inspect.', minimum=1, maximum=catalog.config.max_candidates, default=catalog.config.candidate_count),
+                    'required_pack': _param('string', 'Restrict to this exact returned pack identifier only when the request requires it.'),
+                    'required_character_family': _param('string', 'Restrict to an explicitly cataloged character family when required; pack membership alone does not prove identity.'),
+                    'preferred_character_family': _param('string', 'Soft preference for a cataloged character family, alongside global candidates.'),
                     'persona': _persona_schema(),
                     'persona_mode': _param('string', 'How to use the optional persona for this query.', enum=['inherit', 'merge_and_remember', 'use_once', 'clear_session_persona']),
                     'selection_lens': _selection_lens_schema(),
@@ -325,60 +199,42 @@ class StickerQueryTool:
 
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         try:
+            # A skip does no retrieval, media preparation or persona writes.
+            if args.get('send') is False or str(args.get('send', '')).lower() in {'false', '0', 'no', 'off'}:
+                return ToolResult(call_id='', name=self.spec.name,
+                                  output={'ok': True, 'skipped': True, 'reason': 'send=false'})
+            plan = StickerRetrievalPlan.from_payload(args, config=self.catalog.config)
             await self.catalog.aensure_loaded()
-            plan = StickerRetrievalPlan.from_payload(args)
-            query_understanding = plan.query_interpretation()
-            style_context = await self.catalog.adescribe_style_context(ctx.session_id)
-            if not plan.send:
-                _, persona_context = await self.catalog.aprepare_query_context(plan=plan, session_id=ctx.session_id, persist_persona=False)
-                return ToolResult(
-                    call_id='',
-                    name=self.spec.name,
-                    output={
-                        'ok': True,
-                        'skipped': True,
-                        'reason': 'send=false',
-                        'query_understanding': query_understanding,
-                        'style_context': style_context,
-                        'persona_context': persona_context,
-                        'field_warnings': list(plan.field_warnings),
-                        'dropped_noise_terms': list(plan.dropped_noise_terms),
-                    },
-                )
-            session_state, persona_context = await self.catalog.aprepare_query_context(plan=plan, session_id=ctx.session_id,
+            state, persona = await self.catalog.aprepare_query_context(plan=plan, session_id=ctx.session_id,
                 persist_persona=True, expected_scope=ctx.scope)
-            matches = await self.catalog.achoose(plan=plan, session_id=ctx.session_id, session_state=session_state, persona_context=persona_context)
-            if not matches:
-                return ToolResult(
-                    call_id='',
-                    name=self.spec.name,
-                    output={
-                        'ok': False,
-                        'error': 'No sticker matched the requested intent',
-                        'query_understanding': query_understanding,
-                        'style_context': style_context,
-                        'persona_context': persona_context,
-                        'field_warnings': list(plan.field_warnings),
-                        'dropped_noise_terms': list(plan.dropped_noise_terms),
-                        'likely_culprit_fields': plan.likely_culprit_fields(),
-                        'retry_suggestion': 'Retry with intent_core plus at most one or two helper hints, or remove the highlighted advanced constraints.',
-                    },
-                )
-            return ToolResult(
-                call_id='',
-                name=self.spec.name,
-                output={
-                    'ok': True,
-                    'query_understanding': query_understanding,
-                    'style_context': style_context,
-                    'persona_context': persona_context,
-                    'field_warnings': list(plan.field_warnings),
-                    'dropped_noise_terms': list(plan.dropped_noise_terms),
-                    'candidate_count': len(matches),
-                    'candidates': [_candidate_payload(match) for match in matches],
-                    'selection_guidance': 'Pick one candidate sticker_id using selection_summary, social_read, expression_fit, persona_fit, continuity_note, fit_signals, and warnings first; then pass it as selected_sticker_id to sticker_send_selected. Inspect candidate.debug.score_breakdown only when you need to compare close variants.',
-                },
-            )
+            matches = await self.catalog.achoose(plan=plan, session_id=ctx.session_id,
+                session_state=state, persona_context=persona)
+            constraints = {key: value for key, value in {
+                'must_include': plan.text_constraints.must_include,
+                'avoid_text_meanings': plan.text_constraints.avoid_text_meanings,
+                'avoid_misread_as': plan.selection_lens.avoid_misread_as,
+                'forbid': plan.forbid,
+                'text_priority': plan.text_priority,
+                'style_goal': plan.style_goal,
+                'diversity_preference': plan.diversity_preference,
+            }.items() if value}
+            return ToolResult(call_id='', name=self.spec.name, output={
+                'ok': True, 'status': 'candidates' if matches else 'no_candidates',
+                'catalog_revision': matches[0].entry.revision_id if matches else self.catalog.stats()['revision'],
+                'intent': plan.intent_core, 'constraints': constraints,
+                'search_scope': {'required_pack': plan.required_pack or None,
+                    'required_character_family': plan.required_character_family or None,
+                    'allow_animation': plan.allow_animation,
+                    'intensity_limits': plan.intensity_limits.as_dict()},
+                'persona': persona['effective_persona'],
+                'recent_deliveries': list(state.recent_sticker_ids),
+                'candidate_count': len(matches),
+                'candidates': [_candidate_payload(match) for match in matches],
+                'guidance': 'This shortlist is not the entire catalog. Interpret the actual caption, image and sender/recipient roles with the conversation. '
+                    'Descriptions are conditional interpretations, not verified fit. Inspect supplied images; if unavailable do not claim visual inspection. '
+                    'Choose a fitting expression, refine the query, or use text. No sticker has been sent. '
+                    'Only sticker_send_selected commits a choice; recent and visually similar deliveries are context, not repeat bans.',
+            }, evidence_parts=await self.catalog.evidence(matches))
         except Exception as exc:
             logger.exception('sticker_query failed')
             return ToolResult(call_id='', name=self.spec.name, output={'ok': False, 'error': f'{exc.__class__.__name__}: {exc}'})
@@ -389,7 +245,7 @@ class StickerSendSelectedTool:
         self.catalog = catalog
         self.spec = ToolSpec(
             name='sticker_send_selected',
-            description='Send one previously chosen sticker from the local sticker library and echo back the compact sticker metadata.',
+            description='Select a known sticker for delivery at the requested timing. A queued selection is not confirmed delivery; inspect the actual receipt.',
             parameters_schema={
                 'type': 'object',
                 'properties': {
@@ -410,36 +266,18 @@ class StickerSendSelectedTool:
                 return ToolResult(call_id='', name=self.spec.name, output={'ok': False, 'error': 'Empty selected_sticker_id'})
             timing_raw = str(args.get('delivery_timing', args.get('timing', 'after_final')) or 'after_final').strip().lower()
             timing = StickerTiming.parse(timing_raw)
-            entry = self.catalog.get_by_sticker_id(sticker_id)
+            entry = await self.catalog.aget_available(sticker_id)
             if entry is None:
-                return ToolResult(call_id='', name=self.spec.name, output={'ok': False, 'error': 'Unknown sticker_id', 'sticker_id': sticker_id})
-            await self.catalog.adescribe_style_context(ctx.session_id)
-            self.catalog.record_selection(session_id=ctx.session_id, sticker_id=entry.sticker_id)
-            style_context_after_send = await self.catalog.adescribe_style_context(ctx.session_id)
-            persona_context_after_send = await self.catalog.adescribe_persona_context(ctx.session_id)
-            sticker = OutboundSticker(
-                path=entry.absolute_path,
-                emoji=entry.emoji,
-                timing=timing,
-                label=entry.summary or entry.sticker_id,
-                source_id=entry.sticker_id,
-            )
-            return ToolResult(
-                call_id='',
-                name=self.spec.name,
-                output={
-                    'ok': True,
-                    'status': 'success',
-                    'delivery_timing': timing.value,
-                    'timing': timing.value,
-                    'selection_summary': _send_selection_summary(entry, style_context_after_send),
-                    'style_context_after_send': style_context_after_send,
-                    'persona_context_after_send': persona_context_after_send,
-                    'social_read': str(entry.sticker_card.get('fused_pragmatic_meaning') or entry.summary),
-                    **_compact_entry_payload(entry),
-                },
-                stickers=[sticker],
-            )
+                return ToolResult(call_id='', name=self.spec.name, output={'ok': False,
+                    'error': 'Selected sticker is unknown or its original bytes are unavailable; no substitute sent',
+                    'sticker_id': sticker_id})
+            sticker = OutboundSticker(path=entry.absolute_path, emoji=entry.emoji, timing=timing,
+                label=entry.summary, source_id=entry.sticker_id, content_sha256=entry.asset.content_hash)
+            return ToolResult(call_id='', name=self.spec.name, output={
+                'ok': True, 'status': 'queued', 'sticker_id': entry.sticker_id,
+                'catalog_revision': entry.revision_id, 'delivery_timing': timing.value,
+                'caption': entry.asset.card.get('caption', ''), 'action': entry.asset.card.get('action', ''),
+            }, stickers=[sticker])
         except Exception as exc:
             logger.exception('sticker_send_selected failed')
             return ToolResult(call_id='', name=self.spec.name, output={'ok': False, 'error': f'{exc.__class__.__name__}: {exc}'})

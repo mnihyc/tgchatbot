@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from telegram import Bot, InputFile, Message
 from telegram.error import BadRequest
 
+from tgchatbot.transports.sticker_delivery import send_sticker as deliver_sticker
 from tgchatbot.core.events import RuntimeEvent
 from tgchatbot.domain.models import OutboundArtifact, OutboundSticker, ProcessVisibility, ResponseDelivery
 
@@ -243,7 +244,9 @@ class TelegramMessageRenderer:
         source_message: Message | None = None,
         reply_to_source_message: bool = False,
         process_visibility: ProcessVisibility | str | None = None,
+        sticker_delivery=None,
     ) -> None:
+        self.sticker_delivery = sticker_delivery
         self.message = message
         self.response_delivery = response_delivery
         self.min_edit_interval_s = min_edit_interval_s
@@ -552,24 +555,9 @@ class TelegramMessageRenderer:
 
     async def send_stickers(self, stickers: list[OutboundSticker]) -> list[dict[str, object]]:
         target = self._delivery_target()
-        bot = target.get_bot()
-        reply_to_message_id = self._reply_to_message_id()
-        receipts: list[dict[str, object]] = []
+        receipts = []
         for sticker in stickers:
-            receipt: dict[str, object] = sticker.delivery_receipt()
-            if not sticker.path.exists():
-                receipt['error'] = 'missing_file'
-                logger.warning('Sticker file missing for %s', sticker.display_reference())
-                receipts.append(receipt)
-                continue
-            try:
-                with sticker.path.open('rb') as fh:
-                    sent_message = await bot.send_sticker(chat_id=target.chat.id, sticker=fh, emoji=sticker.emoji, reply_to_message_id=reply_to_message_id)
-                receipt['delivery_state'] = 'sent'
-                receipt['sent'] = True
-                receipt['telegram_message_id'] = getattr(sent_message, 'message_id', None)
-            except Exception as exc:
-                logger.exception('Failed to send sticker %s', sticker.display_reference())
-                receipt['error'] = exc.__class__.__name__
-            receipts.append(receipt)
+            receipts.append(await deliver_sticker(target.get_bot(), chat_id=target.chat.id,
+                sticker=sticker, reply_to_message_id=self._reply_to_message_id(),
+                deliveries=self.sticker_delivery))
         return receipts

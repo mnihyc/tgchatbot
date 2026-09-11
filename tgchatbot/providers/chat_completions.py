@@ -8,9 +8,10 @@ import httpx
 
 from tgchatbot.config import ChatCompletionsConfig
 from tgchatbot.core.token_estimator import TokenEstimator
-from tgchatbot.domain.models import ConversationMessage, MessageRole, PartKind, ProviderResponse, SessionSettings, ToolCall, UsageInfo
+from tgchatbot.domain.models import ConversationMessage, MessagePart, MessageRole, PartKind, ProviderResponse, SessionSettings, ToolCall, UsageInfo
 from tgchatbot.logging_config import dump_llm_exchange
-from tgchatbot.providers.base import ControlDescriptor, ProviderCapabilities, RequestTokenEstimate, estimate_json_schema_tokens
+from tgchatbot.providers.base import (ControlDescriptor, ProviderCapabilities, RequestTokenEstimate,
+    estimate_json_schema_tokens, evidence_text, pending_image_tokens, tool_message_evidence)
 from tgchatbot.tools.base import ToolSpec
 
 
@@ -34,6 +35,11 @@ class ChatCompletionsProvider:
     async def aclose(self) -> None:
         await self._client.aclose()
 
+    def supports_tool_evidence(self, settings: SessionSettings) -> bool:
+        # Standard Chat Completions role=tool accepts text, regardless of
+        # whether this model can read images on ordinary user messages.
+        return False
+
     def describe_controls(self, settings: SessionSettings) -> dict[str, ControlDescriptor]:
         controls = {'native_web_search': ControlDescriptor(False, 'n/a', 'n/a')}
         for name in ('temperature', 'top_p', 'max_output_tokens'):
@@ -53,7 +59,8 @@ class ChatCompletionsProvider:
         if isinstance(native, dict) and native.get('provider') == self.name and isinstance(native.get('items'), list):
             return copy.deepcopy([item for item in native['items'] if isinstance(item, dict)])
         payload = metadata.get('tool_payload')
-        if message.role == MessageRole.TOOL and metadata.get('tool_provider') == self.name and isinstance(payload, dict):
+        framework_refresh = metadata.get('synthetic_role') == 'profile_refresh'
+        if message.role == MessageRole.TOOL and (metadata.get('tool_provider') == self.name or framework_refresh or metadata.get('tool_evidence')) and isinstance(payload, dict):
             call_id = payload.get('call_id')
             if call_id and metadata.get('tool_phase') == 'call' and message.name:
                 return [{'role': 'assistant', 'content': None, 'tool_calls': [{
@@ -61,7 +68,8 @@ class ChatCompletionsProvider:
                     'function': {'name': message.name, 'arguments': json.dumps(payload.get('arguments') or {}, ensure_ascii=False)},
                 }]}]
             if call_id and metadata.get('tool_phase') == 'result':
-                return [{'role': 'tool', 'tool_call_id': str(call_id), 'content': json.dumps(payload.get('output') or {}, ensure_ascii=False)}]
+                return self.make_tool_result_items(ToolCall(message.name or '', str(call_id), {}),
+                    payload.get('output') or {}, tool_message_evidence(message))
         role = 'user' if message.role == MessageRole.TOOL else message.role.value
         parts: list[dict[str, Any]] = []
         for part in message.parts:
@@ -119,6 +127,9 @@ class ChatCompletionsProvider:
                 value = getattr(self.config, name)
             if value is not None:
                 payload[name] = value
+        tier = settings.service_tier or getattr(self.config, 'service_tier', None)
+        if tier:
+            payload['service_tier'] = tier
         if tools and self.capabilities.function_tools:
             payload['tools'] = [{'type': 'function', 'function': tool.generic_function_declaration()} for tool in tools]
             payload['tool_choice'] = 'auto'
@@ -162,16 +173,28 @@ class ChatCompletionsProvider:
             tool_calls.append(ToolCall(name=function['name'], call_id=call['id'], arguments=arguments))
         usage = body.get('usage') or {}
         input_tokens, output_tokens = usage.get('prompt_tokens'), usage.get('completion_tokens')
+        cached_input_tokens = (usage.get('prompt_tokens_details') or {}).get('cached_tokens')
+        if cached_input_tokens is None:
+            cached_input_tokens = usage.get('prompt_cache_hit_tokens')
         total_tokens = usage.get('total_tokens')
         if total_tokens is None and (input_tokens is not None or output_tokens is not None):
             total_tokens = (input_tokens or 0) + (output_tokens or 0)
         return ProviderResponse(
             final_text=text.strip(), tool_calls=tool_calls, continuation_items=[native],
-            usage=UsageInfo(input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=total_tokens), raw=body,
+            usage=UsageInfo(
+                input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=total_tokens,
+                cached_input_tokens=cached_input_tokens,
+                service_tier=body.get('service_tier'),
+            ), raw=body,
         )
 
-    def make_tool_result_items(self, tool_call: ToolCall, tool_output: dict) -> list[dict]:
-        return [{'role': 'tool', 'tool_call_id': tool_call.call_id, 'content': json.dumps(tool_output, ensure_ascii=False)}]
+    def make_tool_result_items(self, tool_call: ToolCall, tool_output: dict,
+                               evidence_parts: list[MessagePart] | None = None) -> list[dict]:
+        content = json.dumps(tool_output, ensure_ascii=False)
+        labels = [evidence_text(part) for part in evidence_parts or []]
+        if any(labels):
+            content += '\n\nTool evidence:\n' + '\n'.join(text for text in labels if text)
+        return [{'role': 'tool', 'tool_call_id': tool_call.call_id, 'content': content}]
 
     def persistent_history_items(self, response: ProviderResponse) -> list[dict]:
         return copy.deepcopy(response.continuation_items)
@@ -199,8 +222,11 @@ class ChatCompletionsProvider:
 
         # Match the legacy estimator's framing allowance. The runtime calibrates
         # these semantic estimates against observed token usage per provider/model.
+        history_tokens = history_tokens_override if history_tokens_override is not None else estimate(self._messages_for_request(messages))
+        if history_tokens_override is None and self.capabilities.multimodal_input:
+            history_tokens += pending_image_tokens([message for message in messages if message.role == MessageRole.USER])
         return RequestTokenEstimate.compose(
-            history_tokens=history_tokens_override if history_tokens_override is not None else estimate(self._messages_for_request(messages)),
+            history_tokens=history_tokens,
             instructions_tokens=TokenEstimator.estimate_text(instructions),
             tools_tokens=estimate([tool.generic_function_declaration() for tool in tools]) + estimate_json_schema_tokens(response_schema, name=response_schema_name),
             extra_input_tokens=estimate(extra_input_items or []),

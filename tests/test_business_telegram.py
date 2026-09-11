@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from tests.business_helpers import BusinessTestCase, ScriptedProvider
 from tgchatbot.domain.models import (
     ChatMode, ConversationMessage, MessageRole, OutboundArtifact, OutboundSticker,
-    ProcessVisibility, StickerTiming, TurnResult,
+    ProcessVisibility, ProviderResponse, StickerTiming, TurnResult,
 )
 from tgchatbot.transports.telegram_adapter import ReplyCandidate, TelegramBotApp
 from tgchatbot.stickers.catalog import StickerCatalog
@@ -183,9 +183,71 @@ class TelegramWorkflowTests(BusinessTestCase):
         original = (await self.store.read_messages(self.session, [trigger.db_id]))[0]
         self.assertEqual(original.message.metadata["actor_id"], "telegram:user:8")
 
+    async def test_retry_selects_original_question_before_persisted_target_and_framework_notes(self):
+        trigger = await self.runtime.ingest_user_message(session_id=self.session,
+            incoming_message=ConversationMessage.user_text("Original question", metadata={
+                "source": "telegram", "source_chat_id": "100", "source_message_id": "42",
+                "actor_id": "telegram:user:8", "actor_kind": "user", "actor_name": "Original author"}))
+        for phase, details in (("call", {"arguments": {"actor_ids": ["telegram:user:8"]}}),
+                               ("result", {"output": {"ok": True, "profiles": []}})):
+            await self.runtime.record_tool_observation(session_id=self.session, name="user_profile_fetch",
+                phase=phase, payload={"call_id": "refresh-retry", **details},
+                metadata_update={"synthetic_role": "profile_refresh", "refresh_reason": "compaction"})
+        self.provider.responses = [ProviderResponse(final_text="Old answer.")]
+        await self.runtime.run_turn_from_stored(session_id=self.session, user_display_name="Original author",
+                                              trigger_message_id=trigger.db_id)
+        await self.runtime.record_assistant_text(session_id=self.session, text="Old answer.")
+        # A late framework note is also USER-shaped; neither it nor the durable
+        # reply target is an original eligible for /retry.
+        await self.runtime.record_auto_user_note(session_id=self.session,
+            parts=ConversationMessage.user_text("Automatic attachment status.").parts)
+        self.app._reply_to_candidate = AsyncMock()
+        await self.app.retry_command(self.update, self.context)
+        candidate = self.app._reply_to_candidate.await_args.args[0]
+        self.assertEqual(candidate.stored_message_id, trigger.db_id)
+        self.assertEqual(candidate.user_display_name, "Original author")
+        self.assertEqual([item.db_id for item in await self.store.list_uncompacted_messages(self.session)],
+                         [trigger.db_id])
+
+    async def test_rollback_does_not_count_profile_refresh_or_reply_target_as_extra_blocks(self):
+        self.provider.responses = [ProviderResponse(final_text="First answer."), ProviderResponse(final_text="Second answer.")]
+        originals = []
+        first_turn_ids = []
+        for number in (1, 2):
+            source = await self.runtime.ingest_user_message(session_id=self.session,
+                incoming_message=ConversationMessage.user_text(f"Question {number}"))
+            originals.append(source.db_id)
+            for phase, details in (("call", {"arguments": {"actor_ids": []}}),
+                                   ("result", {"output": {"ok": True, "profiles": []}})):
+                await self.runtime.record_tool_observation(session_id=self.session, name="user_profile_fetch",
+                    phase=phase, payload={"call_id": f"refresh-{number}", **details},
+                    metadata_update={"synthetic_role": "profile_refresh", "refresh_reason": "compaction"})
+            result = await self.runtime.run_turn_from_stored(session_id=self.session,
+                user_display_name="tester", trigger_message_id=source.db_id)
+            await self.runtime.record_assistant_text(session_id=self.session, text=result.text)
+            if number == 1:
+                first_turn_ids = [item.db_id for item in await self.store.list_uncompacted_messages(self.session)]
+        await self.app.rollback_command(self.update, self.context)
+        self.assertEqual([item.db_id for item in await self.store.list_uncompacted_messages(self.session)],
+                         [*first_turn_ids, originals[1]])
+        await self.app.rollback_command(self.update, self.context)
+        self.assertEqual([item.db_id for item in await self.store.list_uncompacted_messages(self.session)], first_turn_ids)
+        await self.app.rollback_command(self.update, self.context)
+        self.assertEqual([item.db_id for item in await self.store.list_uncompacted_messages(self.session)], [originals[0]])
+
+    async def test_rollback_failed_generation_hides_question_and_its_control_record_together(self):
+        self.provider.responses = [TimeoutError("Model unavailable")]
+        with self.assertRaises(TimeoutError):
+            await self.runtime.run_turn(session_id=self.session, user_display_name="tester",
+                incoming_message=ConversationMessage.user_text("Unanswered question."))
+        before = await self.store.list_uncompacted_messages(self.session)
+        self.assertEqual(len(before), 2)
+        self.assertEqual(before[-1].message.metadata.get("synthetic_role"), "reply_target")
+        await self.app.rollback_command(self.update, self.context)
+        self.assertEqual(await self.store.list_uncompacted_messages(self.session), [])
+
     async def test_full_reset_clears_cached_persona_and_rejects_a_stale_tool_write(self):
-        catalog = StickerCatalog(self.path / "catalog.db", self.path / "stickers", persona_store=self.store)
-        self.addCleanup(catalog.retriever.close)
+        catalog = StickerCatalog(None, self.path / "stickers", persona_store=self.store)
         catalog._loaded = True
         catalog.entries_by_id = {"shared-sticker": object()}
         self.tools.sticker_catalog = catalog
@@ -314,6 +376,7 @@ class TelegramWorkflowTests(BusinessTestCase):
         receipt = (await self.app._send_stickers_direct(self.message, [sticker]))[0]
         self.assertFalse(receipt["sent"])
         self.assertEqual(receipt["error"], "TimeoutError")
+        self.assertEqual(receipt["delivery_state"], "unknown")
 
     async def test_attachment_failure_keeps_caption_and_records_auto_note(self):
         self.message.text = None

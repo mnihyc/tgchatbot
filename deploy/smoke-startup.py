@@ -51,7 +51,9 @@ def check_startup(name: str, credentials: dict[str, str], *, fail_catalog=False,
             assert bot.runtime.memory.store is bot.store
             assert bot.remote_workspace.enabled is False
             assert catalogs[-1].stats()['stickers'] == 0
-            assert not bot.config.sticker_index_path.exists()
+            assert catalogs[-1].loaded
+            assert catalogs[-1].store.store is bot.store
+            assert catalogs[-1].delivery_store is bot.runtime.sticker_delivery
             assert bot.runtime.preview_cache.root.is_dir()
             assert bot.config.artifact_dir.parent == bot.config.temp_dir
             assert bot.runtime.memory.embeddings.config.model == 'gemini-embedding-2'
@@ -59,7 +61,6 @@ def check_startup(name: str, credentials: dict[str, str], *, fail_catalog=False,
                 from tgchatbot.operational import from_env
                 from tgchatbot.tools.import_desktop import ImportConfig
                 from tgchatbot.tools.memory import OperationsConfig
-                assert bot.config.memory.context_messages == 17
                 assert bot.runtime.preview_cache.max_bytes == 4096
                 assert bot.runtime.memory.config.read_messages == 7
                 assert bot.runtime.memory.worker.limits.claim_jobs == 2
@@ -107,7 +108,7 @@ def check_startup(name: str, credentials: dict[str, str], *, fail_catalog=False,
                  patch.object(httpx.AsyncClient, 'send', side_effect=AssertionError('External HTTP is forbidden during startup')), \
                  patch.object(httpx.Client, 'send', side_effect=AssertionError('External HTTP is forbidden during startup')):
                 if fail_catalog:
-                    with patch.object(real_catalog, 'load', side_effect=RuntimeError('synthetic catalog failure')):
+                    with patch.object(real_catalog, 'aensure_loaded', side_effect=RuntimeError('synthetic catalog failure')):
                         try:
                             app.main()
                         except RuntimeError as exc:
@@ -140,7 +141,7 @@ for provider, credentials in (
     check_startup(provider, credentials)
 check_startup('openai', {'OPENAI_API_KEY': 'synthetic-openai-key'}, fail_catalog=True)
 check_startup('openai', {'OPENAI_API_KEY': 'synthetic-openai-key'}, operational_overrides={
-    'MEMORY_CONTEXT_MESSAGES': '17', 'MEMORY_PREVIEW_CACHE_BYTES': '4096',
+    'MEMORY_PREVIEW_CACHE_BYTES': '4096',
     'MEMORY_READ_MESSAGES': '7', 'MEMORY_WORKER_CLAIM_JOBS': '2',
     'MEMORY_WORKER_EXCERPT_TOKENS': '128', 'MEMORY_WORKER_MAX_ACTIVE_BATCHES': '2',
     'MEMORY_DB_READ_PAGE_SIZE': '3', 'MEMORY_DB_POOL_MIN_SIZE': '0',

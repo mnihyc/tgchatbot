@@ -5,6 +5,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from tgchatbot.settings_schema import DEFAULT_METADATA_TIMEZONE
+
 
 class ChatMode(str, Enum):
     CHAT = "chat"
@@ -146,12 +148,14 @@ class SessionSettings:
     spontaneous_reply_chance: int | None = None
     spontaneous_reply_idle_s: int | None = None
     provider_retry_count: int | None = None
+    # Native request tier; unset preserves the configured provider default.
+    service_tier: str | None = None
     private_reply_delay_s: float | None = None
     group_reply_delay_s: float | None = None
     group_spontaneous_reply_delay_s: float | None = None
     reply_delay_s: float | None = None
     metadata_injection_mode: str = "on"
-    metadata_timezone: str = "UTC"
+    metadata_timezone: str = DEFAULT_METADATA_TIMEZONE
     system_prompt: str = field(default_factory=default_system_prompt)
 
 
@@ -180,6 +184,8 @@ class OutboundSticker:
     delivery_state: str | None = None
     telegram_message_id: int | None = None
     error: str | None = None
+    delivery_operation_id: str | None = None
+    content_sha256: str | None = None
 
     def display_reference(self) -> str:
         return str(self.source_id or self.label or self.path.stem or 'sticker').strip() or 'sticker'
@@ -192,6 +198,7 @@ class OutboundSticker:
             'emoji': self.emoji,
             'delivery_state': 'failed',
             'sent': False,
+            'operation_id': self.delivery_operation_id,
         }
 
 
@@ -202,6 +209,8 @@ class ToolResult:
     output: dict[str, Any]
     artifacts: list[OutboundArtifact] = field(default_factory=list)
     stickers: list[OutboundSticker] = field(default_factory=list)
+    # Ordered evidence for the model, never implicitly sent to Telegram.
+    evidence_parts: list[MessagePart] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -209,6 +218,9 @@ class UsageInfo:
     input_tokens: int | None = None
     output_tokens: int | None = None
     total_tokens: int | None = None
+    # Already included in input_tokens; None means the provider did not report it.
+    cached_input_tokens: int | None = None
+    service_tier: str | None = None
 
 
 @dataclass(slots=True)

@@ -4,19 +4,22 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import httpx
 
 from tgchatbot.config import ChatCompletionsConfig, load_config
 from tgchatbot.core.compaction_schema import compaction_json_schema
-from tgchatbot.core.runtime import AgentRuntime
-from tgchatbot.domain.models import ChatMode, ConversationMessage, MessagePart, MessageRole, PartKind, SessionSettings, ToolHistoryMode
+from tgchatbot.domain.models import ChatMode, ConversationMessage, MessagePart, MessageRole, PartKind, SessionSettings, ToolCall, ToolHistoryMode, ToolResult
 from tgchatbot.providers.chat_completions import ChatCompletionsProvider
 from tgchatbot.providers.factory import build_provider, build_providers
+from tgchatbot.providers.gemini import GeminiProvider
+from tgchatbot.providers.openai_responses import OpenAIResponsesProvider
 from tgchatbot.tools.base import ToolSpec
 
 
@@ -37,6 +40,21 @@ class ProviderConfigTests(unittest.TestCase):
                 self.assertEqual(config.configured_provider_names(), (name,))
                 self.assertEqual(config.default_provider, name)
                 self.assertEqual(config.default_session_settings().model, 'chosen-model')
+
+    def test_new_session_metadata_defaults_to_utc_plus_eight(self):
+        for env in ({}, {'DEFAULT_METADATA_TIMEZONE': '  '}):
+            with self.subTest(env=env):
+                settings = self.load(OPENAI_API_KEY='mock', **env).default_session_settings()
+                moment = datetime(2026, 1, 1, tzinfo=timezone.utc).astimezone(ZoneInfo(settings.metadata_timezone))
+                self.assertEqual(moment.utcoffset(), timedelta(hours=8))
+                self.assertEqual(moment.isoformat(), '2026-01-01T08:00:00+08:00')
+                self.assertEqual(SessionSettings().metadata_timezone, settings.metadata_timezone)
+
+    def test_explicit_metadata_timezone_overrides_the_new_default(self):
+        for zone in ('UTC', 'Asia/Tokyo', 'Europe/Berlin'):
+            with self.subTest(zone=zone):
+                settings = self.load(OPENAI_API_KEY='mock', DEFAULT_METADATA_TIMEZONE=f' {zone} ').default_session_settings()
+                self.assertEqual(settings.metadata_timezone, zone)
 
     def test_mixed_profiles_select_explicit_default_without_cross_provider_model_fallback(self):
         config = self.load(OPENAI_API_KEY='mock', GEMINI_API_KEY='mock', DEEPSEEK_API_KEY='mock', DEFAULT_PROVIDER='deepseek')
@@ -73,6 +91,223 @@ class ProviderConfigTests(unittest.TestCase):
             self.assertEqual(load_config(require_telegram=False).default_provider, 'deepseek')
             with self.assertRaisesRegex(RuntimeError, 'TGBOT_TOKEN'):
                 load_config()
+
+
+class CachedUsageContractTests(unittest.TestCase):
+    def test_reported_cache_reads_are_a_subset_of_input_not_added_to_totals(self):
+        # Parse documented wire shapes without constructing an HTTP client.
+        fixtures = (
+            (GeminiProvider, {'candidates': [{'content': {'parts': [{'text': 'done'}]}}]},
+             'usageMetadata', {'promptTokenCount': 10000, 'candidatesTokenCount': 23, 'totalTokenCount': 10023},
+             lambda value: {'cachedContentTokenCount': value}),
+            (OpenAIResponsesProvider, {'output': [{'type': 'message', 'content': [{'type': 'output_text', 'text': 'done'}]}]},
+             'usage', {'input_tokens': 10000, 'output_tokens': 23},
+             lambda value: {'input_tokens_details': {'cached_tokens': value, 'cache_write_tokens': 500}}),
+            (ChatCompletionsProvider, {'choices': [{'message': {'role': 'assistant', 'content': 'done'}}]},
+             'usage', {'prompt_tokens': 10000, 'completion_tokens': 23},
+             lambda value: {'prompt_tokens_details': {'cached_tokens': value, 'cache_write_tokens': 500}}),
+            (ChatCompletionsProvider, {'choices': [{'message': {'role': 'assistant', 'content': 'done'}}]},
+             'usage', {'prompt_tokens': 10000, 'completion_tokens': 23},
+             lambda value: {'prompt_cache_hit_tokens': value, 'prompt_cache_miss_tokens': 10000 - value}),
+        )
+        for provider_class, body, usage_key, counters, cache_fields in fixtures:
+            provider = object.__new__(provider_class)
+            for cached in (8192, 0, None):
+                with self.subTest(provider=provider_class.__name__, fields=cache_fields(0), cached=cached):
+                    usage = counters | (cache_fields(cached) if cached is not None else {})
+                    response = provider._parse_response(body | {usage_key: usage})
+                    self.assertEqual(response.final_text, 'done')
+                    self.assertEqual(response.usage.cached_input_tokens, cached)
+                    self.assertEqual(response.usage.input_tokens, 10000)
+                    self.assertEqual(response.usage.output_tokens, 23)
+                    self.assertEqual(response.usage.total_tokens, 10023)
+            self.assertIsNone(provider._parse_response(body).usage.cached_input_tokens)
+
+    def test_compatible_standard_zero_is_not_replaced_by_an_alias_counter(self):
+        provider = object.__new__(ChatCompletionsProvider)
+        body = {'choices': [{'message': {'content': 'done'}}], 'usage': {
+            'prompt_tokens': 10000, 'completion_tokens': 23,
+            'prompt_tokens_details': {'cached_tokens': 0}, 'prompt_cache_hit_tokens': 8192}}
+        self.assertEqual(provider._parse_response(body).usage.cached_input_tokens, 0)
+
+    def test_gemini_usage_survives_a_response_without_candidates(self):
+        provider = object.__new__(GeminiProvider)
+        response = provider._parse_response({'usageMetadata': {
+            'promptTokenCount': 10000, 'cachedContentTokenCount': 8192, 'totalTokenCount': 10000}})
+        self.assertEqual(response.final_text, '')
+        self.assertEqual(response.usage.cached_input_tokens, 8192)
+        self.assertEqual(response.usage.input_tokens, 10000)
+        self.assertEqual(response.usage.total_tokens, 10000)
+
+
+class FrameworkProfileToolHistoryTests(unittest.TestCase):
+    def test_framework_pair_uses_native_tool_shapes_across_provider_switches(self):
+        arguments = {'actor_ids': ['telegram:user:7'], 'include_agent_preferences': True}
+        output = {'ok': True, 'profiles': [{'actor_id': 'telegram:user:7', 'facts': [{'claim': 'Prefers jasmine tea.'}]}]}
+        for previous_provider in (None, 'other-provider'):
+            call, result = [ConversationMessage(role=MessageRole.TOOL, name='user_profile_fetch', parts=[], metadata={
+                'synthetic_role': 'profile_refresh', 'refresh_reason': 'compaction',
+                'tool_phase': phase, 'tool_provider': previous_provider,
+                'tool_payload': {'call_id': 'profile-refresh-fixture', **payload},
+            }) for phase, payload in (('call', {'arguments': arguments}), ('result', {'output': output}))]
+            for provider_class in (GeminiProvider, OpenAIResponsesProvider, ChatCompletionsProvider):
+                with self.subTest(provider=provider_class.__name__, previous_provider=previous_provider):
+                    provider = object.__new__(provider_class)
+                    if provider_class is ChatCompletionsProvider:
+                        provider.name = 'openrouter'
+                    encode = provider._message_to_contents if provider_class is GeminiProvider else provider._message_to_input_items
+                    encoded_call, encoded_result = encode(call)[0], encode(result)[0]
+                    if provider_class is GeminiProvider:
+                        part = encoded_call['parts'][0]
+                        self.assertEqual(encoded_call['role'], 'model')
+                        self.assertEqual(part['thoughtSignature'], 'skip_thought_signature_validator')
+                        self.assertEqual(part['functionCall'], {'name': call.name, 'id': 'profile-refresh-fixture', 'args': arguments})
+                        self.assertEqual(encoded_result['parts'][0]['functionResponse'], {
+                            'name': call.name, 'id': 'profile-refresh-fixture', 'response': {'result': output}})
+                    elif provider_class is OpenAIResponsesProvider:
+                        self.assertEqual(encoded_call['type'], 'function_call')
+                        self.assertEqual(encoded_result['type'], 'function_call_output')
+                        self.assertEqual(encoded_call['call_id'], encoded_result['call_id'])
+                        self.assertEqual(json.loads(encoded_call['arguments']), arguments)
+                        self.assertEqual(json.loads(encoded_result['output']), output)
+                    else:
+                        self.assertEqual(encoded_call['role'], 'assistant')
+                        self.assertEqual(encoded_result['role'], 'tool')
+                        tool_call = encoded_call['tool_calls'][0]
+                        self.assertEqual(tool_call['id'], encoded_result['tool_call_id'])
+                        self.assertEqual(json.loads(tool_call['function']['arguments']), arguments)
+                        self.assertEqual(json.loads(encoded_result['content']), output)
+
+    def test_actual_gemini_thought_signature_is_preserved(self):
+        provider = object.__new__(GeminiProvider)
+        native = {'role': 'model', 'parts': [{'functionCall': {'name': 'user_profile_fetch',
+            'args': {'actor_ids': []}, 'id': 'model-call'}, 'thoughtSignature': 'opaque-real-signature'}]}
+        message = ConversationMessage(role=MessageRole.TOOL, name='user_profile_fetch', parts=[],
+            metadata={'tool_provider': 'gemini', 'tool_phase': 'call',
+                      'provider_native': {'provider': 'gemini', 'items': [native]}})
+        self.assertEqual(provider._message_to_contents(message), [native])
+
+
+class ToolEvidenceContractTests(unittest.TestCase):
+    def exchange(self, evidence=None):
+        metadata = {'tool_evidence': True, 'tool_provider': 'another-provider'}
+        call = ConversationMessage(MessageRole.TOOL, [], name='sticker_query', metadata=metadata | {
+            'tool_phase': 'call', 'tool_payload': {'call_id': 'portable-query-1', 'arguments': {'intent_core': 'offer comfort'}}})
+        output = {'candidates': [{'sticker_id': 'asset-a'}, {'sticker_id': 'asset-b'}]}
+        evidence = evidence if evidence is not None else [
+            MessagePart(PartKind.TEXT, text='asset-a, frame 1 at 0ms'),
+            MessagePart(PartKind.IMAGE, mime_type='image/png', data_b64='AAAA'),
+            MessagePart(PartKind.TEXT, text='asset-b, frame 1 at 0ms'),
+            MessagePart(PartKind.IMAGE, mime_type='image/png', data_b64='BBBB'),
+        ]
+        result = ConversationMessage(MessageRole.TOOL,
+            [MessagePart(PartKind.TEXT, text='duplicate JSON summary', origin='tool_output'), *evidence],
+            name='sticker_query', metadata=metadata | {'tool_phase': 'result', 'tool_payload': {
+                'call_id': 'portable-query-1', 'output': output}})
+        return call, result
+
+    def test_native_replay_preserves_candidate_frame_pairing_and_tool_provenance(self):
+        call, result = self.exchange()
+        gemini = object.__new__(GeminiProvider)
+        encoded_call = gemini._message_to_contents(call)[0]['parts'][0]
+        response = gemini._message_to_contents(result)[0]['parts'][0]['functionResponse']
+        self.assertEqual(encoded_call['functionCall']['id'], response['id'])
+        self.assertEqual(encoded_call['thoughtSignature'], 'skip_thought_signature_validator')
+        refs = response['response']['evidence']
+        self.assertEqual([x['text'] for x in refs if 'text' in x], ['asset-a, frame 1 at 0ms', 'asset-b, frame 1 at 0ms'])
+        images = [part['inlineData']['data'] for part in response['parts']]
+        self.assertEqual([images[x['image_part']-1] for x in refs if 'image_part' in x], ['AAAA', 'BBBB'])
+        self.assertNotIn('$ref', json.dumps(response))
+        self.assertTrue(all(set(part['inlineData']) == {'mimeType', 'data'} for part in response['parts']))
+        self.assertNotIn('duplicate JSON summary', json.dumps(response))
+        openai = object.__new__(OpenAIResponsesProvider)
+        item = openai._message_to_input_items(result)[0]
+        self.assertEqual(item['type'], 'function_call_output')
+        self.assertEqual(item['call_id'], openai._message_to_input_items(call)[0]['call_id'])
+        self.assertEqual([p['type'] for p in item['output']], ['input_text', 'input_text', 'input_image', 'input_text', 'input_image'])
+        self.assertEqual([p['image_url'] for p in item['output'] if p['type'] == 'input_image'], ['data:image/png;base64,AAAA', 'data:image/png;base64,BBBB'])
+        self.assertEqual(result.role, MessageRole.TOOL)
+        tool_result = ToolResult('portable-query-1', 'sticker_query', {}, evidence_parts=result.parts[1:])
+        self.assertEqual((tool_result.artifacts, tool_result.stickers), ([], []))
+
+    def test_text_only_tool_route_keeps_ids_and_never_makes_a_fake_user_image(self):
+        call, result = self.exchange()
+        compatible = object.__new__(ChatCompletionsProvider)
+        compatible.name = 'custom'
+        self.assertFalse(compatible.supports_tool_evidence(SessionSettings()))
+        wire = compatible._message_to_input_items(result)
+        self.assertEqual(len(wire), 1)
+        self.assertEqual(wire[0]['role'], 'tool')
+        self.assertIn('asset-a', wire[0]['content'])
+        self.assertIn('visual evidence unavailable', wire[0]['content'])
+        self.assertNotIn('AAAA', wire[0]['content'])
+        self.assertEqual(compatible._message_to_input_items(call)[0]['tool_calls'][0]['id'], wire[0]['tool_call_id'])
+        gemini = object.__new__(GeminiProvider)
+        self.assertFalse(gemini.supports_tool_evidence(SessionSettings(model='gemini-2.5-flash')))
+        older = gemini._message_to_contents(result, tool_images=False)[0]['parts'][0]['functionResponse']
+        self.assertNotIn('parts', older)
+        self.assertIn('visual evidence unavailable', json.dumps(older))
+
+    def test_retired_evidence_remains_text_on_every_adapter_and_nested_image_cost_is_counted(self):
+        call, live = self.exchange()
+        _, retired = self.exchange([MessagePart(PartKind.TEXT, text='asset-a [Image compacted]')])
+        for cls in (GeminiProvider, OpenAIResponsesProvider):
+            provider = object.__new__(cls)
+            encode = provider._message_to_contents if cls is GeminiProvider else provider._message_to_input_items
+            estimate = provider._estimate_content_tokens if cls is GeminiProvider else provider._estimate_input_item_tokens
+            first, second = encode(live)[0], encode(retired)[0]
+            self.assertGreaterEqual(estimate(first) - estimate(second), 1800)
+            self.assertIn('[Image compacted]', json.dumps(second))
+            self.assertNotIn('AAAA', json.dumps(second))
+            enlarged = replace(live, parts=[replace(p, data_b64=p.data_b64 * 10000) if p.data_b64 else p for p in live.parts])
+            self.assertEqual(estimate(first), estimate(encode(enlarged)[0]))
+
+
+class ServiceTierContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_explicit_tier_reaches_native_request_and_errors_do_not_fall_back(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as directory:
+            for name in ('gemini', 'openai', 'deepseek'):
+                with self.subTest(provider=name), patch.dict(os.environ, {
+                    'APP_DATA_DIR': directory, 'TGBOT_TOKEN': 'mock', f'{name.upper()}_API_KEY': 'mock',
+                    f'{name.upper()}_MODEL': 'gemini-3.8-flash' if name == 'gemini' else 'configured-model',
+                }, clear=True):
+                    config = load_config()
+                    provider = build_provider(config, name)
+                    await provider.aclose()
+                    requests = []
+                    reject = False
+                    def handle(request):
+                        requests.append(json.loads(request.content))
+                        if reject:
+                            return httpx.Response(503, json={'error': {'message': 'Flex capacity unavailable'}})
+                        if name == 'gemini':
+                            body = {'candidates': [{'content': {'role': 'model', 'parts': [{'text': 'done'}]}}],
+                                    'usageMetadata': {'promptTokenCount': 12, 'candidatesTokenCount': 3, 'totalTokenCount': 15, 'serviceTier': 'flex'}}
+                        elif name == 'openai':
+                            body = {'output': [], 'usage': {'input_tokens': 12, 'output_tokens': 3, 'total_tokens': 15}, 'service_tier': 'flex'}
+                        else:
+                            body = {'choices': [{'message': {'role': 'assistant', 'content': 'done'}}],
+                                    'usage': {'prompt_tokens': 12, 'completion_tokens': 3, 'total_tokens': 15}, 'service_tier': 'flex'}
+                        return httpx.Response(200, json=body)
+                    provider._client = httpx.AsyncClient(base_url='https://test.invalid/', transport=httpx.MockTransport(handle))
+                    try:
+                        settings = replace(config.default_session_settings(), service_tier='flex', native_web_search_mode='off')
+                        args = {'settings': settings, 'messages': [ConversationMessage.user_text('Synthetic annotation')], 'instructions': 'Describe.', 'tools': []}
+                        result = await provider.generate(**args)
+                        self.assertEqual(requests[-1]['service_tier'], 'flex')
+                        self.assertEqual(result.usage.service_tier, 'flex')
+                        self.assertEqual(result.usage.input_tokens, 12)
+                        reject = True
+                        before = len(requests)
+                        with self.assertRaises(httpx.HTTPStatusError):
+                            await provider.generate(**args)
+                        self.assertEqual(len(requests), before + 1)
+                        self.assertEqual(requests[-1]['service_tier'], 'flex')
+                        reject = False
+                        await provider.generate(**(args | {'settings': replace(settings, service_tier=None)}))
+                        self.assertNotIn('service_tier', requests[-1])
+                    finally:
+                        await provider.aclose()
 
 
 class ChatCompletionsContractTests(unittest.IsolatedAsyncioTestCase):
@@ -178,6 +413,7 @@ class ChatCompletionsContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('tools', payload)
 
     async def test_same_provider_native_history_and_cross_provider_translation(self):
+        from tgchatbot.core.runtime import AgentRuntime
         provider = await self.make_provider(name='deepseek')
         body = self.answer('Visible introduction', reasoning_content='private continuation', tool_calls=[{'id': 'a', 'type': 'function', 'function': {'name': 'lookup', 'arguments': '{}'}}])
         native = provider.persistent_history_items(provider._parse_response(body))
@@ -201,6 +437,7 @@ class ChatCompletionsContractTests(unittest.IsolatedAsyncioTestCase):
 
 class AllAdaptersContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_each_provider_can_generate_validated_compaction(self):
+        from tgchatbot.core.runtime import AgentRuntime
         schema = compaction_json_schema('episode')
         candidate = {name: [] for name in schema['properties']}
         candidate.update(scope='Preserve requested language', interaction_mode='chat_or_sharing', user_profile=['Use English'])
@@ -230,57 +467,6 @@ class AllAdaptersContractTests(unittest.IsolatedAsyncioTestCase):
                         self.assertNotIn('tools', payload) if name in {'deepseek', 'openrouter'} else None
                     finally:
                         await provider.aclose()
-
-
-class StickerAnalysisContractTests(unittest.TestCase):
-    def setUp(self):
-        self.directory = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent)
-        self.addCleanup(self.directory.cleanup)
-        self.environment = patch.dict(os.environ, {'APP_DATA_DIR': self.directory.name, 'GEMINI_API_KEY': 'mock'}, clear=True)
-        self.environment.start()
-        self.addCleanup(self.environment.stop)
-
-    def test_offline_analysis_uses_shared_provider_and_one_event_loop(self):
-        import asyncio
-        from types import SimpleNamespace
-        from unittest.mock import AsyncMock
-        from scripts.build_sticker_index import StickerAnalysisClient
-        from tgchatbot.domain.models import ProviderResponse
-        from tgchatbot.providers.base import ProviderCapabilities
-        loops = []
-        requests = []
-        async def generate(**kwargs):
-            loops.append(asyncio.get_running_loop())
-            requests.append(kwargs)
-            if len(requests) == 1:
-                return ProviderResponse(final_text='{"caption":"hello"}')
-            return ProviderResponse(final_text='{"result":{"caption":"hello"},"alignment_score":1}')
-        provider = SimpleNamespace(capabilities=ProviderCapabilities(), generate=generate, aclose=AsyncMock())
-        with patch('scripts.build_sticker_index.build_provider', return_value=provider) as factory:
-            client = StickerAnalysisClient(config=load_config(require_telegram=False), provider_name='gemini', model='vision-model')
-            try:
-                result = client.analyze(relative_path='pack/example.webp', source_format_name='webp', ocr_summary={'joined_text': 'hello'}, frame_payloads=[{'mime': 'image/png', 'data': 'AAAA'}])
-            finally:
-                client.close()
-        self.assertEqual(result['caption'], 'hello')
-        self.assertIs(loops[0], loops[1])
-        self.assertEqual(factory.call_args.args[1], 'gemini')
-        self.assertEqual(requests[0]['settings'].model, 'vision-model')
-        self.assertEqual(requests[0]['messages'][0].parts[-1].kind, PartKind.IMAGE)
-        self.assertEqual(requests[0]['tools'], [])
-        self.assertTrue(requests[1]['response_schema'])
-        provider.aclose.assert_awaited_once()
-
-    def test_no_embeddings_build_records_disabled_manifest_and_does_not_call_embedding_api(self):
-        from scripts import build_sticker_index
-        argv = ['build_sticker_index.py', '--stickers-dir', self.directory.name, '--index-db', str(Path(self.directory.name) / 'index.sqlite3'), '--no-embeddings', '--workers', '1']
-        with patch('sys.argv', argv), patch.object(build_sticker_index, 'PaddleOCR', object()), patch.object(build_sticker_index, 'StickerAnalysisClient'), patch.object(build_sticker_index, '_build_rows_parallel', return_value={'ok': 0, 'skipped': 0, 'failed': 0}), patch.object(build_sticker_index.EmbeddingProvider, 'from_env') as embedding, patch('builtins.print'):
-            build_sticker_index.main()
-        embedding.assert_not_called()
-        manifest = json.loads((Path(self.directory.name) / 'embeddings_manifest.json').read_text())
-        self.assertFalse(manifest['enabled'])
-        self.assertEqual(manifest['dimensions'], 0)
-        self.assertTrue((Path(self.directory.name) / 'tantivy_docs.jsonl').exists())
 
 
 class ProviderTelegramControlTests(unittest.IsolatedAsyncioTestCase):

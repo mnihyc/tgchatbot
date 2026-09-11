@@ -18,21 +18,4 @@ if [ "$(id -u)" = 0 ]; then
     # Root-owned bind mounts are valid too; continue once as their owner.
 fi
 
-if [ "${1:-}" = retriever ]; then
-    index_dir=/app/data/tantivy_index
-    if [ ! -f "$index_dir/meta.json" ]; then
-        # Never silently replace a partial/corrupt index. Recovery is explicit.
-        if [ -d "$index_dir" ] && [ -n "$(ls -A "$index_dir")" ]; then
-            echo 'Existing Tantivy index lacks meta.json; inspect ./data/tantivy_index before rebuilding' >&2
-            exit 1
-        fi
-        docs=/app/data/tantivy_docs.jsonl
-        if [ ! -f "$docs" ]; then
-            docs=/tmp/tgchatbot-empty-stickers.jsonl
-            : > "$docs"
-        fi
-        sticker-retriever build --docs-jsonl "$docs" --index-dir "$index_dir"
-    fi
-    exec sticker-retriever serve --index-dir "$index_dir" --bind 0.0.0.0 --port 4107
-fi
 exec "$@"

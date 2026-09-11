@@ -29,6 +29,7 @@ from tgchatbot.settings_schema import (
     COMPACT_TOKEN_MIN,
     COMPACT_TOOL_RATIO_THRESHOLD_MAX,
     COMPACT_TOOL_RATIO_THRESHOLD_MIN,
+    DEFAULT_METADATA_TIMEZONE,
     GEMINI_THINKING_BUDGET_MAX,
     GEMINI_THINKING_BUDGET_MIN,
     GEMINI_THINKING_LEVEL_VALUES,
@@ -241,10 +242,6 @@ class AppConfig:
     def preset_dir(self) -> Path:
         return self.data_dir / "presets"
 
-    @property
-    def sticker_index_path(self) -> Path:
-        return self.data_dir / "sticker_index.sqlite3"
-
     def provider_config(self, provider: str) -> OpenAIConfig | GeminiConfig | ChatCompletionsConfig:
         if provider == 'openai':
             return self.openai
@@ -354,7 +351,7 @@ def load_config(*, require_telegram: bool = True) -> AppConfig:
         default_group_reply_delay_s=parse_bounded_float_env(os.getenv('DEFAULT_GROUP_REPLY_DELAY_S', os.getenv('TGBOT_GROUP_REPLY_DELAY_S')), default=5.0, minimum=0.0, maximum=600.0),
         default_provider_retry_count=parse_bounded_int_env(os.getenv("DEFAULT_PROVIDER_RETRY_COUNT"), default=1, minimum=PROVIDER_RETRY_COUNT_MIN, maximum=PROVIDER_RETRY_COUNT_MAX),
         default_metadata_injection_mode=_choice(os.getenv('DEFAULT_METADATA_INJECTION_MODE', 'on'), 'on', {'on', 'off'}),
-        default_metadata_timezone=os.getenv('DEFAULT_METADATA_TIMEZONE', 'UTC').strip() or 'UTC',
+        default_metadata_timezone=os.getenv('DEFAULT_METADATA_TIMEZONE', '').strip() or DEFAULT_METADATA_TIMEZONE,
         default_system_prompt=default_system_prompt_value,
         telegram=TelegramConfig(
             token=token,

@@ -47,10 +47,3 @@ jobs:
           bash -n deploy/update.sh
           sh -n deploy/entrypoint.sh
           bash -n deploy/smoke-image.sh
-
-  retriever:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Test Rust retriever with committed dependency lock
-        run: cargo test --locked --manifest-path retriever/Cargo.toml

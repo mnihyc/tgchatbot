@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Iterable
 
 
+DEFAULT_METADATA_TIMEZONE = "Asia/Singapore"
+
 REASONING_EFFORT_VALUES = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
 REASONING_SUMMARY_VALUES = frozenset({"off", "on", "auto", "detailed", "concise"})
 TEXT_VERBOSITY_VALUES = frozenset({"low", "medium", "high"})

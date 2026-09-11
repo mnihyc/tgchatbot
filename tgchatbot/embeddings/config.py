@@ -58,8 +58,24 @@ class EmbeddingConfig:
                 raise ValueError(f'EMBEDDING_{name.upper()} must be finite and nonnegative')
 
     @classmethod
-    def from_env(cls, env: Mapping[str, str] | None = None) -> "EmbeddingConfig":
+    def from_env(cls, env: Mapping[str, str] | None = None, *, prefix: str = 'EMBEDDING') -> "EmbeddingConfig":
         env = os.environ if env is None else env
+        if prefix != 'EMBEDDING':
+            merged = dict(env)
+            def provider_name(value: str) -> str:
+                value = value.strip().lower()
+                return 'openai' if value in {'openai-compatible', 'openai_compatible'} else value
+            shared_provider = provider_name(env.get('EMBEDDING_PROVIDER', 'gemini') or 'gemini')
+            selected_provider = provider_name(env.get(f'{prefix}_PROVIDER', '') or shared_provider)
+            if selected_provider != shared_provider:
+                for name in ('MODEL', 'MODEL_REVISION', 'API_KEY', 'API_KEY_ENV', 'BASE_URL'):
+                    merged.pop(f'EMBEDDING_{name}', None)
+            if env.get(f'{prefix}_API_KEY_ENV', '').strip() and f'{prefix}_API_KEY' not in env:
+                merged.pop('EMBEDDING_API_KEY', None)
+            for name, value in env.items():
+                if name.startswith(prefix + '_') and (value.strip() or name == f'{prefix}_API_KEY'):
+                    merged['EMBEDDING_' + name[len(prefix) + 1:]] = value
+            return cls.from_env(merged)
         provider = env.get("EMBEDDING_PROVIDER", "gemini").strip().lower() or 'gemini'
         if provider in {"openai-compatible", "openai_compatible"}:
             provider = "openai"
@@ -89,6 +105,11 @@ class EmbeddingConfig:
         return "openai-text-v1"
 
     @property
+    def supports_media(self) -> bool:
+        # The compatible embeddings protocol and Gemini 001 accept text only.
+        return self.provider == 'gemini' and self.model != 'gemini-embedding-001'
+
+    @property
     def space_spec(self) -> dict[str, str | int]:
         return {"provider": self.provider, "model": self.model, "model_revision": self.model_revision,
                 "dimensions": self.dimensions, "normalization": "l2-f32-v1", "input_format": self.input_format}
@@ -97,3 +118,11 @@ class EmbeddingConfig:
     def space_id(self) -> str:
         # Moving the same model to another route does not change its vector space.
         return hashlib.sha256(json.dumps(self.space_spec, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def sticker_embedding_config(env: Mapping[str, str] | None = None) -> EmbeddingConfig:
+    """One shared builder/query recipe; memory keeps its own dimensions."""
+    selected = dict(os.environ if env is None else env)
+    if not selected.get('STICKER_EMBEDDING_DIMENSIONS', '').strip():
+        selected['STICKER_EMBEDDING_DIMENSIONS'] = '3072'
+    return EmbeddingConfig.from_env(selected, prefix='STICKER_EMBEDDING')

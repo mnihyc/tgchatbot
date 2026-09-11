@@ -42,7 +42,6 @@ def from_env(cls: type[T], prefix: str, env: Mapping[str, str] | None = None) ->
 @dataclass(frozen=True)
 class MemoryConfig:
     # Prompt windows and disposable caches; originals remain in PostgreSQL.
-    context_messages: int = 256
     cached_sessions: int = 32
     preview_cache_bytes: int = 256 * 1024 * 1024
     replay_cache_bytes: int = 32 * 1024 * 1024
@@ -53,7 +52,6 @@ class MemoryConfig:
     response_chars: int = 24000
     read_messages: int = 20
     read_chars: int = 12000
-    recall_tokens: int = 4096
     profile_facts: int = 20
 
     def __post_init__(self) -> None:

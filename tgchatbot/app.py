@@ -10,6 +10,9 @@ from tgchatbot.core.runtime import AgentRuntime
 from tgchatbot.core.memory import MemoryService
 from tgchatbot.core.memory_worker import MemoryWorker
 from tgchatbot.embeddings import EmbeddingClient, EmbeddingConfig
+from tgchatbot.embeddings.config import sticker_embedding_config
+from tgchatbot.storage.sticker_catalog import StickerCatalogStore
+from tgchatbot.storage.sticker_delivery import StickerDeliveryStore
 from tgchatbot.logging_config import configure_logging
 from tgchatbot.healthcheck import health_path
 from tgchatbot.providers.factory import build_providers
@@ -56,7 +59,7 @@ def main() -> None:
     marker.write_text('{}')
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    store = embeddings = previews = sticker_catalog = worker = remote = None
+    store = embeddings = sticker_embeddings = previews = sticker_catalog = worker = remote = None
     providers = {}
     try:
         artifact_store = ArtifactStore(config.artifact_dir)
@@ -72,9 +75,14 @@ def main() -> None:
         loop.run_until_complete(store.initialize())
         persisted_sessions = loop.run_until_complete(store.count_sessions())
         remote = RemoteWorkspaceClient(config)
-        sticker_catalog = StickerCatalog(config.sticker_index_path, config.sticker_dir,
-                                         persona_store=store, embedding_client=embeddings)
-        sticker_catalog.load()
+        catalog_store = StickerCatalogStore(store)
+        loop.run_until_complete(catalog_store.initialize())
+        delivery_store = StickerDeliveryStore(store)
+        loop.run_until_complete(delivery_store.initialize(recover_interrupted=True))
+        sticker_embeddings = EmbeddingClient(sticker_embedding_config())
+        sticker_catalog = StickerCatalog(catalog_store, config.sticker_dir,
+            persona_store=store, embedding_client=sticker_embeddings, delivery_store=delivery_store)
+        loop.run_until_complete(sticker_catalog.aensure_loaded())
         providers = _build_providers(config)
         if config.default_provider not in providers:
             available = ', '.join(sorted(providers)) or '-'
@@ -90,7 +98,7 @@ def main() -> None:
         memory.worker = worker
         runtime = AgentRuntime(config=config, store=store,
             tool_registry=ToolRegistry(config, remote, sticker_catalog), providers=providers,
-            memory=memory, preview_cache=previews)
+            memory=memory, preview_cache=previews, sticker_delivery=delivery_store)
         bot = TelegramBotApp(config=config, runtime=runtime, store=store,
             artifact_store=artifact_store, preset_store=preset_store, remote_workspace=remote)
         async def start_worker():
@@ -105,8 +113,8 @@ def main() -> None:
         if worker is not None:
             loop.run_until_complete(worker.close())
         loop.run_until_complete(_cleanup(remote, providers))
-        if sticker_catalog is not None:
-            sticker_catalog.retriever.close()
+        if sticker_embeddings is not None:
+            loop.run_until_complete(sticker_embeddings.aclose())
         if embeddings is not None:
             loop.run_until_complete(embeddings.aclose())
         if store is not None:

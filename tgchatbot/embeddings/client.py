@@ -1,4 +1,4 @@
-"""Shared text retrieval embeddings; transport never selects a generation model.
+"""Shared retrieval embeddings; transport never selects a generation model.
 
 API contracts: https://ai.google.dev/api/embeddings and
 https://ai.google.dev/gemini-api/docs/batch-api . Gemini 001 deliberately uses
@@ -26,10 +26,18 @@ Kind = Literal["document", "query"]
 
 
 @dataclass(frozen=True, slots=True)
+class EmbeddingMedia:
+    """Prepared inline media; decoding and sampling belong to the caller."""
+    mime_type: str
+    data_b64: str = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
 class EmbeddingDocument:
     item_id: str
-    text: str
+    text: str = ''
     title: str | None = None
+    media: tuple[EmbeddingMedia, ...] = ()
 
 
 @dataclass(slots=True)
@@ -58,9 +66,13 @@ class BatchItemResult:
 class EmbeddingService(Protocol):
     config: EmbeddingConfig
 
+    @property
+    def supports_media(self) -> bool: ...
+
     async def embed_documents(self, items: Sequence[EmbeddingDocument | str], *, purpose: Purpose = "memory") -> list[np.ndarray]: ...
     async def embed_query(self, text: str, *, purpose: Purpose = "memory") -> np.ndarray: ...
     async def count_tokens(self, text: str, *, kind: Kind = "document", title: str | None = None) -> int: ...
+    async def count_document_tokens(self, document: EmbeddingDocument) -> int: ...
     async def submit_batch(self, items: Sequence[EmbeddingDocument], *, purpose: Purpose = "memory", display_name: str = "tgchatbot-embeddings") -> BatchJob: ...
     async def poll_batch(self, name: str) -> BatchJob: ...
     async def find_batch(self, display_name: str, *, max_pages: int | None = None) -> BatchJob | None: ...
@@ -89,6 +101,10 @@ class EmbeddingClient:
     @property
     def space_id(self) -> str:
         return self.config.space_id
+
+    @property
+    def supports_media(self) -> bool:
+        return self.config.supports_media
 
     async def aclose(self) -> None:
         if self._owns_http:
@@ -191,10 +207,17 @@ class EmbeddingClient:
             return f"title: {(title or '').strip() or 'none'} | text: {text}"
         return text
 
-    def _gemini_request(self, text: str, kind: Kind, title: str | None = None) -> dict[str, Any]:
+    def _gemini_request(self, text: str, kind: Kind, title: str | None = None,
+                        media: Sequence[EmbeddingMedia] = ()) -> dict[str, Any]:
+        parts: list[dict[str, Any]] = []
+        if not media or text.strip():
+            parts.append({'text': self._format(text, kind, title)})
+        elif title:
+            parts.append({'text': f'title: {title.strip()} | text:'})
+        parts.extend({'inlineData': {'mimeType': item.mime_type, 'data': item.data_b64}} for item in media)
         payload: dict[str, Any] = {
             "model": f"models/{self.config.model}",
-            "content": {"parts": [{"text": self._format(text, kind, title)}]},
+            "content": {"parts": parts},
         }
         if self.config.model == "gemini-embedding-001":
             # These flat fields are required by the actual 001 service. Never
@@ -206,6 +229,22 @@ class EmbeddingClient:
         else:
             payload["embedContentConfig"] = {"outputDimensionality": self.config.dimensions, "autoTruncate": False}
         return payload
+
+    def _validate_document(self, item: EmbeddingDocument) -> None:
+        if item.media:
+            if not self.supports_media:
+                raise NotImplementedError('This embedding route accepts text only; media cannot be silently omitted')
+            # Documented Gemini Embedding 2 image-input contract. The builder
+            # decides sampling; the client never drops excess frames for it.
+            if len(item.media) > 6:
+                raise ValueError('Gemini embedding documents accept at most six images')
+            for media in item.media:
+                if media.mime_type not in {'image/png', 'image/jpeg'} or not media.data_b64:
+                    raise ValueError('Gemini embedding images require PNG/JPEG inline data')
+            if not isinstance(item.text, str):
+                raise ValueError('Embedding document text must be a string')
+        else:
+            self._text(item.text)
 
     def _vector(self, values: Any) -> np.ndarray:
         if not isinstance(values, list) or any(type(value) not in {int, float} for value in values):
@@ -263,6 +302,23 @@ class EmbeddingClient:
             if await self.count_tokens(text, kind=kind, title=title) > 2048:
                 raise ValueError("Gemini embedding 001 input exceeds 2048 tokens; split the document")
 
+    async def count_document_tokens(self, document: EmbeddingDocument) -> int:
+        self._validate_document(document)
+        if not document.media:
+            return await self.count_tokens(document.text, title=document.title)
+        payload = self._gemini_request(document.text, 'document', document.title, document.media)
+        key = self._key('tokens', 'document', payload['content'])
+        cached = self._cached(key)
+        if cached is not None:
+            return int(cached)
+        response = await self._request('POST', f'models/{self.config.model}:countTokens',
+                                       payload={'contents': [payload['content']]})
+        count = self._body(response).get('totalTokens')
+        if type(count) is not int or count < 0:
+            raise ValueError('Embedding countTokens response is invalid')
+        self._remember(key, count)
+        return count
+
     async def embed_query(self, text: str, *, purpose: Purpose = "memory") -> np.ndarray:
         self._purpose(purpose)
         payload = self._gemini_request(text, "query") if self.config.provider == "gemini" else {
@@ -301,10 +357,10 @@ class EmbeddingClient:
         for offset in range(0, len(documents), batch_size):
             batch = documents[offset:offset + batch_size]
             for item in batch:
-                self._text(item.text)
+                self._validate_document(item)
                 await self._legacy_length_check(item.text, "document", item.title)
             if self.config.provider == "gemini":
-                payload = {"requests": [self._gemini_request(item.text, "document", item.title) for item in batch]}
+                payload = {"requests": [self._gemini_request(item.text, "document", item.title, item.media) for item in batch]}
                 body = self._body(await self._request("POST", f"models/{self.config.model}:batchEmbedContents", payload=payload))
                 rows = body.get("embeddings", [])
                 if not isinstance(rows, list) or len(rows) != len(batch) or any(not isinstance(row, dict) for row in rows):
@@ -352,8 +408,9 @@ class EmbeddingClient:
         item_ids = self._ids(items)
         requests = []
         for item in items:
+            self._validate_document(item)
             await self._legacy_length_check(item.text, "document", item.title)
-            requests.append({"request": self._gemini_request(item.text, "document", item.title),
+            requests.append({"request": self._gemini_request(item.text, "document", item.title, item.media),
                              "metadata": {"key": item.item_id, "space_id": self.space_id, "purpose": purpose}})
         payload = {"batch": {"displayName": display_name, "inputConfig": {"requests": {"requests": requests}}}}
         if len(json.dumps(payload, ensure_ascii=False).encode()) > self.config.batch_max_bytes:
@@ -479,6 +536,14 @@ class SyncEmbeddingClient:
     def embed_query(self, text: str, *, purpose: Purpose = "sticker") -> np.ndarray:
         self._check_offline()
         return self._runner.run(self.client.embed_query(text, purpose=purpose))
+
+    @property
+    def supports_media(self) -> bool:
+        return self.client.supports_media
+
+    def count_document_tokens(self, document: EmbeddingDocument) -> int:
+        self._check_offline()
+        return self._runner.run(self.client.count_document_tokens(document))
 
     def embed_documents(self, items: Sequence[EmbeddingDocument | str], *, purpose: Purpose = "sticker") -> list[np.ndarray]:
         self._check_offline()

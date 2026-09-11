@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from tgchatbot.core.token_estimator import TokenEstimator
-from tgchatbot.domain.models import ConversationMessage, ProviderResponse, SessionSettings, ToolCall
+from tgchatbot.domain.models import ConversationMessage, MessagePart, MessageRole, PartKind, ProviderResponse, SessionSettings, ToolCall
 from tgchatbot.tools.base import ToolSpec
 
 
@@ -16,6 +16,30 @@ class ProviderCapabilities:
     native_web_search: bool = False
     server_state: bool = False
     structured_output: bool = True
+    multimodal_tool_results: bool = False
+
+
+def tool_message_evidence(message: ConversationMessage) -> list[MessagePart]:
+    """The runtime marks the JSON summary separately from ordered tool evidence."""
+    if not message.metadata.get('tool_evidence'):
+        return []
+    return [part for part in message.parts if part.origin != 'tool_output']
+
+
+def evidence_text(part: MessagePart) -> str:
+    """Truthful fallback for a part whose pixels this route cannot inspect."""
+    if part.kind in {PartKind.TEXT, PartKind.STICKER}:
+        return part.text or ''
+    label = part.text or part.filename or part.kind.value
+    return f'[{label}: visual evidence unavailable on this tool-result route.]'
+
+
+def pending_image_tokens(messages: list[ConversationMessage], *, tool_images: bool = True) -> int:
+    # Disposable previews have not necessarily been materialized at admission.
+    return TokenEstimator.IMAGE_TOKENS * sum(
+        part.kind == PartKind.IMAGE and bool(part.preview_ref) and not part.data_b64
+        for message in messages if tool_images or message.role != MessageRole.TOOL for part in message.parts
+    )
 
 
 @dataclass(frozen=True)
@@ -103,7 +127,10 @@ class ModelProvider(Protocol):
     ) -> ProviderResponse:
         ...
 
-    def make_tool_result_items(self, tool_call: ToolCall, tool_output: dict) -> list[dict]:
+    def make_tool_result_items(self, tool_call: ToolCall, tool_output: dict, evidence_parts: list[MessagePart] | None = None) -> list[dict]:
+        ...
+
+    def supports_tool_evidence(self, settings: SessionSettings) -> bool:
         ...
 
     def describe_controls(self, settings: SessionSettings) -> dict[str, ControlDescriptor]:

@@ -407,67 +407,96 @@ class PostgresStore:
     async def append_message(self, session_id: str, message: ConversationMessage, estimated_tokens: int | None = None,
                              *, expected_scope: Mapping[str, Any] | None = None,
                              generation_only: bool = False, intake: bool = False) -> StoredConversationMessage:
-        body, parts, metadata, fingerprint = await self._encode_message(session_id, message)
+        encoded = await self._encode_message(session_id, message)
+        async with self.pool.connection() as conn:
+            return await self._append_encoded_message(conn, session_id, message, encoded,
+                estimated_tokens=estimated_tokens, expected_scope=expected_scope,
+                generation_only=generation_only, intake=intake)
+
+    async def append_messages(self, session_id: str, messages: Sequence[ConversationMessage], *,
+                              expected_scope: Mapping[str, Any] | None = None) -> list[StoredConversationMessage]:
+        """Persist a completed exchange together, using the normal append path."""
+        # Encoding may touch optional replay artifacts; finish it before taking
+        # the same session lock used by normal intake and reset operations.
+        prepared = [(message, await self._encode_message(session_id, message)) for message in messages]
+        stored = []
+        async with self.pool.connection() as conn:
+            for message, encoded in prepared:
+                stored.append(await self._append_encoded_message(conn, session_id, message, encoded,
+                    expected_scope=expected_scope if not stored else None))
+                # The first append guards the starting scope. Its session lock
+                # lasts until the whole transaction commits, including own edits.
+        return stored
+
+    async def _append_encoded_message(self, conn: AsyncConnection, session_id: str, message: ConversationMessage,
+                                      encoded: tuple, *, estimated_tokens: int | None = None,
+                                      expected_scope: Mapping[str, Any] | None = None,
+                                      generation_only: bool = False, intake: bool = False) -> StoredConversationMessage:
+        body, parts, metadata, fingerprint = encoded
         canonical = self._canonical(message)
         if canonical['source_message_id'] is not None and canonical['source_chat_id'] is None:
             canonical['source_chat_id'] = session_id
         estimate = estimated_tokens if estimated_tokens is not None else TokenEstimator.estimate_message(message)
-        async with self.pool.connection() as conn:
-            scope = await self._session(conn, session_id, lock=True)
-            self._check_scope(scope, expected_scope, context=not generation_only, revision=not intake)
-            existing = None
-            if canonical['source_message_id'] is not None:
-                existing = await (await conn.execute('''SELECT m.*,r.fingerprint,r.edited_at FROM messages m
-                    JOIN message_revisions r ON (r.message_id,r.revision)=(m.id,m.source_revision)
-                    WHERE m.session_id=%s AND m.generation=%s AND m.source=%s AND m.source_chat_id=%s
-                    AND m.source_message_id=%s FOR UPDATE OF m''',
-                    (session_id, scope['generation'], canonical['source'], canonical['source_chat_id'], canonical['source_message_id']))).fetchone()
-            if existing:
-                edited_at = _timestamp(metadata.get('edited_at'))
-                if existing['fingerprint'] == fingerprint or (existing['edited_at'] and (edited_at is None or edited_at < existing['edited_at'])):
-                    return (await self._read_ids(conn, session_id, [existing['id']], include_hidden=True))[0]
-                message_id = existing['id']
-                revision = existing['source_revision'] + 1
-                await conn.execute('''UPDATE messages SET source_revision=%s,actor_id=%s,actor_kind=%s,
-                    actor_name=%s,topic_id=%s,reply_to_source_id=%s,presentation=NULL WHERE id=%s''',
-                    (revision, canonical['actor_id'], canonical['actor_kind'], canonical['actor_name'], canonical['topic_id'], canonical['reply_to_source_id'], message_id))
-                await self._invalidate_sources(conn, session_id, scope['generation'], [message_id])
-                await conn.execute('UPDATE sessions SET revision=revision+1 WHERE session_id=%s', (session_id,))
-            else:
-                row = await (await conn.execute('''INSERT INTO messages
-                    (session_id,generation,context_id,role,source,source_chat_id,source_message_id,actor_id,
-                     actor_kind,actor_name,topic_id,reply_to_source_id,sent_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s,now())) RETURNING id''',
-                    (session_id, scope['generation'], scope['context_id'], message.role.value,
-                     *(canonical[key] for key in _CANONICAL_COLUMNS), canonical['sent_at']))).fetchone()
-                message_id, revision = row['id'], 1
-            await conn.execute('''INSERT INTO message_revisions
-                (message_id,revision,body,parts,metadata,estimated_tokens,fingerprint,edited_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)''',
-                (message_id, revision, body, Jsonb(parts), Jsonb(metadata), max(0, int(estimate)), fingerprint, _timestamp(metadata.get('edited_at'))))
-            searchable = []
-            for part in parts:
-                if part.get('origin') in {'auto_note', 'provenance'}:
-                    continue
-                if part.get('text_span'):
-                    start, end = part['text_span']
-                    searchable.append(body[start:end])
-                searchable.extend(str(part[key]) for key in ('filename', 'mime_type', 'artifact_path') if part.get(key))
-            await conn.execute('''INSERT INTO message_search (message_id,lexemes) VALUES (%s,array_to_tsvector(%s::text[]))
-                ON CONFLICT (message_id) DO UPDATE SET lexemes=excluded.lexemes''', (message_id, lexical_terms('\n'.join(searchable))))
-            if message.role in {MessageRole.USER, MessageRole.ASSISTANT} and not metadata.get('synthetic_role'):
-                await conn.execute('''INSERT INTO jobs
-                    (session_id,generation,context_id,scope_revision,kind,policy,source_ids,source_revisions,payload,dedupe_key)
-                    VALUES (%s,%s,%s,%s,'memory_ingest','memory',%s,%s,%s,%s) ON CONFLICT DO NOTHING''',
-                    (session_id, scope['generation'], scope['context_id'], scope['revision'], [message_id],
-                     Jsonb({str(message_id): revision}), Jsonb({'message_id': message_id}), f'{message_id}:{revision}'))
-            return (await self._read_ids(conn, session_id, [message_id], include_hidden=True, presentation=True))[0]
+        scope = await self._session(conn, session_id, lock=True)
+        self._check_scope(scope, expected_scope, context=not generation_only, revision=not intake)
+        existing = None
+        if canonical['source_message_id'] is not None:
+            existing = await (await conn.execute('''SELECT m.*,r.fingerprint,r.edited_at FROM messages m
+                JOIN message_revisions r ON (r.message_id,r.revision)=(m.id,m.source_revision)
+                WHERE m.session_id=%s AND m.generation=%s AND m.source=%s AND m.source_chat_id=%s
+                AND m.source_message_id=%s FOR UPDATE OF m''',
+                (session_id, scope['generation'], canonical['source'], canonical['source_chat_id'], canonical['source_message_id']))).fetchone()
+        if existing:
+            edited_at = _timestamp(metadata.get('edited_at'))
+            if existing['fingerprint'] == fingerprint or (existing['edited_at'] and (edited_at is None or edited_at < existing['edited_at'])):
+                return (await self._read_ids(conn, session_id, [existing['id']], include_hidden=True))[0]
+            message_id = existing['id']
+            revision = existing['source_revision'] + 1
+            await conn.execute('''UPDATE messages SET source_revision=%s,actor_id=%s,actor_kind=%s,
+                actor_name=%s,topic_id=%s,reply_to_source_id=%s,presentation=NULL WHERE id=%s''',
+                (revision, canonical['actor_id'], canonical['actor_kind'], canonical['actor_name'], canonical['topic_id'], canonical['reply_to_source_id'], message_id))
+            await self._invalidate_sources(conn, session_id, scope['generation'], [message_id])
+            await conn.execute('UPDATE sessions SET revision=revision+1 WHERE session_id=%s', (session_id,))
+        else:
+            row = await (await conn.execute('''INSERT INTO messages
+                (session_id,generation,context_id,role,source,source_chat_id,source_message_id,actor_id,
+                 actor_kind,actor_name,topic_id,reply_to_source_id,sent_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s,now())) RETURNING id''',
+                (session_id, scope['generation'], scope['context_id'], message.role.value,
+                 *(canonical[key] for key in _CANONICAL_COLUMNS), canonical['sent_at']))).fetchone()
+            message_id, revision = row['id'], 1
+        await conn.execute('''INSERT INTO message_revisions
+            (message_id,revision,body,parts,metadata,estimated_tokens,fingerprint,edited_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)''',
+            (message_id, revision, body, Jsonb(parts), Jsonb(metadata), max(0, int(estimate)), fingerprint, _timestamp(metadata.get('edited_at'))))
+        searchable = []
+        # Framework context controls are retained for replay, but must not
+        # compete with their original evidence in historical search.
+        search_parts = [] if metadata.get('synthetic_role') in {'reply_target', 'profile_refresh'} else parts
+        for part in search_parts:
+            if part.get('origin') in {'auto_note', 'provenance'}:
+                continue
+            if part.get('text_span'):
+                start, end = part['text_span']
+                searchable.append(body[start:end])
+            searchable.extend(str(part[key]) for key in ('filename', 'mime_type', 'artifact_path') if part.get(key))
+        await conn.execute('''INSERT INTO message_search (message_id,lexemes) VALUES (%s,array_to_tsvector(%s::text[]))
+            ON CONFLICT (message_id) DO UPDATE SET lexemes=excluded.lexemes''', (message_id, lexical_terms('\n'.join(searchable))))
+        if message.role in {MessageRole.USER, MessageRole.ASSISTANT} and not metadata.get('synthetic_role'):
+            await conn.execute('''INSERT INTO jobs
+                (session_id,generation,context_id,scope_revision,kind,policy,source_ids,source_revisions,payload,dedupe_key)
+                VALUES (%s,%s,%s,%s,'memory_ingest','memory',%s,%s,%s,%s) ON CONFLICT DO NOTHING''',
+                (session_id, scope['generation'], scope['context_id'], scope['revision'], [message_id],
+                 Jsonb({str(message_id): revision}), Jsonb({'message_id': message_id}), f'{message_id}:{revision}'))
+        return (await self._read_ids(conn, session_id, [message_id], include_hidden=True, presentation=True))[0]
 
     def _message(self, row: Mapping[str, Any], *, presentation: bool = False) -> StoredConversationMessage:
         body, part_data, metadata = row['body'], row['parts'], dict(row['metadata'])
         if presentation and row.get('presentation'):
             projection = row['presentation']
             body, part_data = projection['body'], projection['parts']
+            if projection.get('tool_evidence'):
+                metadata['tool_evidence'] = True
         parts = []
         for original in part_data:
             item = dict(original)
@@ -563,6 +592,32 @@ class PostgresStore:
         return list(reversed(await self._recent(session_id, _limit(limit, self.config.history_page_size),
             uncompacted=True, before_message_id=before_message_id)))
 
+    async def load_live_context(self, session_id: str) -> tuple[list[MemoryBlock], list[StoredConversationMessage]]:
+        """Load the complete compaction input; page sizes bound fetches, not history.
+
+        Both projections share a snapshot so a concurrent compaction, edit, or
+        reset cannot put originals and their replacement summaries out of sync.
+        Ordinary list APIs remain limited reads for callers that need a page.
+        """
+        messages, blocks = [], []
+        async with self.pool.connection() as conn:
+            await conn.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+            async with conn.cursor(name='live_context_messages') as cursor:
+                await cursor.execute(self._select_message() + '''
+                    WHERE m.session_id=%s AND m.context_id=s.context_id
+                    AND NOT m.hidden AND NOT m.deleted AND m.compacted_by_block_id IS NULL
+                    ORDER BY m.id''', (session_id,))
+                while rows := await cursor.fetchmany(self.config.history_page_size):
+                    messages.extend(self._message(row, presentation=True) for row in rows)
+            async with conn.cursor(name='live_context_blocks') as cursor:
+                await cursor.execute('''SELECT b.* FROM memory_blocks b JOIN sessions s
+                    ON s.session_id=b.session_id AND s.generation=b.generation AND s.context_id=b.context_id
+                    WHERE b.session_id=%s AND b.valid AND COALESCE(b.details->>'lifecycle','sealed')='sealed'
+                    ORDER BY b.sequence_no,b.id''', (session_id,))
+                while rows := await cursor.fetchmany(self.config.memory_block_page_size):
+                    blocks.extend(self._block(row) for row in rows)
+        return blocks, messages
+
     async def update_message(self, session_id: str, stored_message: StoredConversationMessage) -> StoredConversationMessage:
         """Change only the active context presentation (for example image compaction)."""
         body, parts, _, _ = await self._encode_message(session_id, stored_message.message)
@@ -571,7 +626,8 @@ class PostgresStore:
             scope = await self._session(conn, session_id, lock=True)
             row = await (await conn.execute('''UPDATE messages SET presentation=%s WHERE id=%s AND session_id=%s
                 AND generation=%s AND context_id=%s AND NOT hidden AND NOT deleted RETURNING id''',
-                (Jsonb({'body': body, 'parts': parts, 'estimated_tokens': estimate}), stored_message.db_id,
+                (Jsonb({'body': body, 'parts': parts, 'estimated_tokens': estimate,
+                        **({'tool_evidence': True} if stored_message.message.metadata.get('tool_evidence') else {})}), stored_message.db_id,
                  session_id, scope['generation'], scope['context_id']))).fetchone()
             if not row:
                 raise StaleScopeError('message is no longer in the active context')
@@ -1072,11 +1128,62 @@ class PostgresStore:
     async def get_profile(self, session_id: str, actor_id: str, *, at: Any = None, limit: int | None = None) -> list[dict[str, Any]]:
         when = _timestamp(at) or datetime.now(timezone.utc)
         async with self.pool.connection() as conn:
-            return await (await conn.execute('''SELECT f.* FROM profile_facts f JOIN sessions s
-                ON s.session_id=f.session_id AND s.generation=f.generation
-                WHERE f.session_id=%s AND f.subject_actor_id=%s AND f.valid AND f.status IN ('active','superseded')
-                AND (f.valid_from IS NULL OR f.valid_from <= %s) AND (f.valid_to IS NULL OR f.valid_to > %s)
-                ORDER BY f.id DESC LIMIT %s''', (session_id, actor_id, when, when, _limit(limit, self.config.profile_results)))).fetchall()
+            return await (await conn.execute('SELECT f.* ' + self._current_profile_query() +
+                ' ORDER BY f.id DESC LIMIT %s',
+                (session_id, actor_id, when, when, _limit(limit, self.config.profile_results)))).fetchall()
+
+    @staticmethod
+    def _current_profile_query() -> str:
+        return '''FROM profile_facts f JOIN sessions s
+            ON s.session_id=f.session_id AND s.generation=f.generation
+            WHERE f.session_id=%s AND f.subject_actor_id=%s AND f.valid
+            AND f.status IN ('active','superseded')
+            AND (f.valid_from IS NULL OR f.valid_from <= %s) AND (f.valid_to IS NULL OR f.valid_to > %s)'''
+
+    async def fetch_profile_snapshot(self, session_id: str, actor_ids: Sequence[str], *,
+                                     expected_scope: Mapping[str, Any] | None = None,
+                                     before_fact_id: int | None = None,
+                                     limit: int | None = None) -> dict[str, Any]:
+        """Read identities, current facts and freshness together without loading source bodies."""
+        page_size = _limit(limit, self.config.profile_results)
+        async with self.pool.connection() as conn:
+            # Source writes own fact invalidation. Read their committed identity
+            # and fact state together without blocking intake or reset writes.
+            await conn.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+            scope = await (await conn.execute('SELECT generation,context_id,revision FROM sessions '
+                                              'WHERE session_id=%s', (session_id,))).fetchone()
+            if scope is None and expected_scope is not None:
+                raise StaleScopeError('conversation scope is unavailable')
+            if scope is not None:
+                self._check_scope(scope, expected_scope)
+            as_of = (await (await conn.execute('SELECT clock_timestamp() AS at')).fetchone())['at']
+            profiles = []
+            for actor_id in actor_ids:
+                identity, rows = None, []
+                if scope is not None and actor_id != 'unknown':
+                    identity = await (await conn.execute('''SELECT id AS message_id,source_revision,
+                        sent_at,source,source_chat_id,source_message_id,actor_kind,actor_name FROM messages
+                        WHERE session_id=%s AND generation=%s AND actor_id=%s AND NOT hidden AND NOT deleted
+                        ORDER BY sent_at DESC,id DESC LIMIT 1''',
+                        (session_id, scope['generation'], actor_id))).fetchone()
+                    parameters = (session_id, actor_id, as_of, as_of)
+                    rows = await (await conn.execute('SELECT f.* ' + self._current_profile_query() +
+                        ' AND (%s::bigint IS NULL OR f.id<%s) ORDER BY f.id DESC LIMIT %s',
+                        (*parameters, before_fact_id, before_fact_id, page_size + 1))).fetchall()
+                truncated = len(rows) > page_size
+                facts = rows[:page_size]
+                source_ids = list({mid for fact in facts for mid in fact['source_ids']})
+                evidence_at = None
+                if source_ids:
+                    evidence_at = (await (await conn.execute('SELECT max(sent_at) AS at FROM messages '
+                        'WHERE id=ANY(%s)', (source_ids,))).fetchone())['at']
+                profiles.append({'actor_id': actor_id, 'identity': identity, 'facts': facts,
+                    'latest_returned_fact_at': max((fact['created_at'] for fact in facts), default=None),
+                    'latest_returned_evidence_at': evidence_at,
+                    'truncated': truncated, 'next_before_fact_id': facts[-1]['id'] if truncated else None})
+        if expected_scope is not None:
+            await self.assert_scope(session_id, expected_scope)
+        return {'scope': dict(scope) if scope is not None else None, 'as_of': as_of, 'profiles': profiles}
 
     async def enqueue_job(self, session_id: str, kind: str, *, source_ids: Sequence[int] | None = None,
                             source_message_ids: Sequence[int] | None = None, payload: dict | None = None,

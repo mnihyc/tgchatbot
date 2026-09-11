@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from tgchatbot.stickers.config import StickerConfig
 from tgchatbot.stickers.persona import PERSONA_MODES, build_persona_dict, persona_has_values
 
 _TEXT_PRIORITIES = {'require', 'prefer', 'ignore'}
@@ -36,6 +37,12 @@ _NOISE_LITERAL_TOKENS = {
 
 def _norm_text(value: Any) -> str:
     return ' '.join(str(value or '').replace('\n', ' ').replace('\t', ' ').split()).strip()
+
+
+def _first_present(*values: Any) -> Any:
+    # Strict provider schemas represent omitted optional fields as null.
+    # Null must not erase an explicitly supplied compatibility alias/control.
+    return next((value for value in values if value is not None and value != ''), None)
 
 
 def _norm_mapping(value: Any) -> dict[str, Any]:
@@ -79,39 +86,9 @@ def _request_tokens(text: str) -> list[str]:
 
 
 def _sanitize_text_field(field_name: str, value: Any) -> tuple[str, list[str], str | None]:
-    text = _norm_text(value)
-    if not text:
-        return '', [], None
-    dropped: list[str] = []
-    kept_tokens: list[str] = []
-    for raw_token in text.split():
-        cleaned = raw_token.strip(".,;:!?()[]{}<>\"'")
-        lowered = cleaned.lower()
-        if not cleaned:
-            continue
-        if cleaned.startswith('@') or _URL_RE.match(cleaned) or _PATH_RE.match(cleaned):
-            dropped.append(cleaned)
-            continue
-        if lowered in _NOISE_LITERAL_TOKENS:
-            dropped.append(cleaned)
-            continue
-        if re.fullmatch(r'(?:user(?:name)?|assistant|bot)[:=_-]?[A-Za-z0-9_]+', lowered):
-            dropped.append(cleaned)
-            continue
-        if re.fullmatch(r'[A-Za-z0-9_]+bot', lowered) and len(cleaned) <= 32:
-            dropped.append(cleaned)
-            continue
-        if re.fullmatch(r'[A-Za-z_]+-\d{3,}', lowered) or re.fullmatch(r'[A-Za-z_]*\d{4,}[A-Za-z_]*', lowered):
-            dropped.append(cleaned)
-            continue
-        kept_tokens.append(cleaned)
-    sanitized = ' '.join(kept_tokens).strip()
-    warning = None
-    if dropped and sanitized:
-        warning = f'{field_name} dropped likely non-semantic tokens: {", ".join(dropped[:6])}'
-    elif dropped and not sanitized:
-        warning = f'{field_name} only contained likely non-semantic noise and became empty'
-    return sanitized, dropped[:12], warning
+    # Normalize whitespace only. Names, slang and literal captions may be meaningful;
+    # retrieval is not responsible for guessing which words the caller meant.
+    return _norm_text(value), [], None
 
 
 def _sanitize_text_list(field_name: str, values: Any) -> tuple[list[str], list[str], list[str]]:
@@ -404,12 +381,16 @@ class StickerRetrievalPlan:
     forbid: list[str] = field(default_factory=list)
     candidate_budget: int = 5
     send: bool = True
+    preferred_character_family: str = ''
+    required_pack: str = ''
+    required_character_family: str = ''
     deprecated_aliases_used: dict[str, Any] = field(default_factory=dict)
     field_warnings: list[str] = field(default_factory=list)
     dropped_noise_terms: list[str] = field(default_factory=list)
 
     @classmethod
-    def from_payload(cls, payload: dict[str, Any]) -> 'StickerRetrievalPlan':
+    def from_payload(cls, payload: dict[str, Any], *, config: StickerConfig | None = None) -> 'StickerRetrievalPlan':
+        config = config or StickerConfig.from_env()
         data = _norm_mapping(payload)
         advanced = _norm_mapping(data.get('advanced'))
         deprecated_aliases_used: dict[str, Any] = {}
@@ -450,7 +431,7 @@ class StickerRetrievalPlan:
         secondary_goals, dropped, warnings = _sanitize_text_list('secondary_goals', data.get('secondary_goals'))
         dropped_noise_terms.extend(dropped)
         field_warnings.extend(warnings)
-        forbid, dropped, warnings = _sanitize_text_list('forbid', data.get('forbid'))
+        forbid, dropped, warnings = _sanitize_text_list('forbid', _first_present(advanced.get('forbid'), data.get('forbid')))
         dropped_noise_terms.extend(dropped)
         field_warnings.extend(warnings)
 
@@ -473,19 +454,12 @@ class StickerRetrievalPlan:
         persona_affect_source = _norm_mapping(persona_source.get('affect_profile'))
         selection_lens_source = _norm_mapping(data.get('selection_lens'))
 
-        semantic_source = _norm_mapping(advanced.get('semantic_focus') if 'semantic_focus' in advanced else data.get('semantic_focus'))
-        visual_source = _norm_mapping(advanced.get('visual_focus') if 'visual_focus' in advanced else data.get('visual_focus'))
-        style_source = _norm_mapping(advanced.get('style_focus') if 'style_focus' in advanced else data.get('style_focus'))
-        text_source = _norm_mapping(advanced.get('text_constraints') if 'text_constraints' in advanced else data.get('text_constraints'))
-        intensity_source = _norm_mapping(
-            advanced.get('intensity_limits')
-            if 'intensity_limits' in advanced
-            else advanced.get('safety_limits')
-            if 'safety_limits' in advanced
-            else data.get('intensity_limits')
-            if 'intensity_limits' in data
-            else data.get('safety_limits')
-        )
+        semantic_source = _norm_mapping(_first_present(advanced.get('semantic_focus'), data.get('semantic_focus')))
+        visual_source = _norm_mapping(_first_present(advanced.get('visual_focus'), data.get('visual_focus')))
+        style_source = _norm_mapping(_first_present(advanced.get('style_focus'), data.get('style_focus')))
+        text_source = _norm_mapping(_first_present(advanced.get('text_constraints'), data.get('text_constraints')))
+        intensity_source = _norm_mapping(_first_present(advanced.get('intensity_limits'),
+            advanced.get('safety_limits'), data.get('intensity_limits'), data.get('safety_limits')))
 
         legacy_text_priority = _norm_text(data.get('text_priority', '')).lower()
         legacy_style_policy = _norm_text(data.get('style_policy', '')).lower()
@@ -526,8 +500,8 @@ class StickerRetrievalPlan:
         style_focus = StyleFocus(
             style_goal=raw_style_goal,
             style_hints=style_hints,
-            prefer_pack=_norm_text(style_source.get('preferred_pack', style_source.get('prefer_pack', data.get('preferred_pack', data.get('prefer_pack', ''))))),
-            prefer_cluster=_norm_text(style_source.get('preferred_style_cluster', style_source.get('prefer_cluster', data.get('preferred_style_cluster', data.get('prefer_cluster', ''))))),
+            prefer_pack=_norm_text(_first_present(style_source.get('preferred_pack'), style_source.get('prefer_pack'), data.get('preferred_pack'), data.get('prefer_pack'))),
+            prefer_cluster=_norm_text(_first_present(style_source.get('preferred_style_cluster'), style_source.get('prefer_cluster'), data.get('preferred_style_cluster'), data.get('prefer_cluster'))),
         )
         must_include, dropped, warnings = _sanitize_text_list('advanced.text_constraints.must_include', text_source.get('must_include'))
         dropped_noise_terms.extend(dropped)
@@ -535,7 +509,7 @@ class StickerRetrievalPlan:
         avoid_text_meanings, dropped, warnings = _sanitize_text_list('advanced.text_constraints.avoid_text_meanings', text_source.get('avoid_text_meanings'))
         dropped_noise_terms.extend(dropped)
         field_warnings.extend(warnings)
-        text_priority = _norm_text(text_source.get('text_priority', legacy_text_priority or 'prefer')).lower() or 'prefer'
+        text_priority = _norm_text(_first_present(text_source.get('text_priority'), legacy_text_priority, 'prefer')).lower() or 'prefer'
         if text_priority not in _TEXT_PRIORITIES:
             text_priority = 'prefer'
         text_constraints = TextConstraints(
@@ -544,10 +518,10 @@ class StickerRetrievalPlan:
             avoid_text_meanings=avoid_text_meanings,
         )
         intensity_limits = IntensityLimits(
-            max_harshness=_bounded_int(intensity_source.get('max_harshness', data.get('max_harshness', 3)), default=3, minimum=0, maximum=4),
-            max_intimacy=_bounded_int(intensity_source.get('max_intimacy', data.get('max_intimacy', 4)), default=4, minimum=0, maximum=4),
-            max_meme_dependence=_bounded_int(intensity_source.get('max_meme_dependence', data.get('max_meme_dependence', 4)), default=4, minimum=0, maximum=4),
-            allow_animation=_norm_bool(intensity_source.get('allow_animation', data.get('allow_animation', False)), default=False),
+            max_harshness=_bounded_int(_first_present(intensity_source.get('max_harshness'), data.get('max_harshness'), 3), default=3, minimum=0, maximum=4),
+            max_intimacy=_bounded_int(_first_present(intensity_source.get('max_intimacy'), data.get('max_intimacy'), 4), default=4, minimum=0, maximum=4),
+            max_meme_dependence=_bounded_int(_first_present(intensity_source.get('max_meme_dependence'), data.get('max_meme_dependence'), 4), default=4, minimum=0, maximum=4),
+            allow_animation=_norm_bool(_first_present(intensity_source.get('allow_animation'), data.get('allow_animation'), False), default=False),
         )
         persona = StickerPersona(
             visual_identity=PersonaVisualIdentity(
@@ -555,8 +529,8 @@ class StickerRetrievalPlan:
                 rendering_style=sanitize_from(field_name='persona.visual_identity.rendering_style', primary=persona_visual_source.get('rendering_style')),
                 palette_mood=sanitize_from(field_name='persona.visual_identity.palette_mood', primary=persona_visual_source.get('palette_mood')),
                 style_hints=persona_style_hints,
-                prefer_pack=_norm_text(persona_visual_source.get('preferred_pack', persona_visual_source.get('prefer_pack', ''))),
-                prefer_cluster=_norm_text(persona_visual_source.get('preferred_style_cluster', persona_visual_source.get('prefer_cluster', ''))),
+                prefer_pack=_norm_text(_first_present(persona_visual_source.get('preferred_pack'), persona_visual_source.get('prefer_pack'))),
+                prefer_cluster=_norm_text(_first_present(persona_visual_source.get('preferred_style_cluster'), persona_visual_source.get('prefer_cluster'))),
             ),
             affect_profile=PersonaAffectProfile(
                 default_tone=sanitize_from(field_name='persona.affect_profile.default_tone', primary=persona_affect_source.get('default_tone')),
@@ -587,8 +561,11 @@ class StickerRetrievalPlan:
             text_constraints=text_constraints,
             intensity_limits=intensity_limits,
             forbid=forbid,
-            candidate_budget=_bounded_int(data.get('candidate_budget', 5), default=5, minimum=1, maximum=8),
+            candidate_budget=_bounded_int(data.get('candidate_budget'), default=config.candidate_count, minimum=1, maximum=config.max_candidates),
             send=_norm_bool(data.get('send', True), default=True),
+            preferred_character_family=_norm_text(data.get('preferred_character_family')),
+            required_pack=_norm_text(data.get('required_pack')),
+            required_character_family=_norm_text(data.get('required_character_family')),
             deprecated_aliases_used=deprecated_aliases_used,
             field_warnings=field_warnings[:16],
             dropped_noise_terms=sorted(dict.fromkeys(dropped_noise_terms))[:32],
@@ -676,14 +653,8 @@ class StickerRetrievalPlan:
             parts.append('visible caption text should dominate meaning')
         elif self.text_priority == 'prefer':
             parts.append('caption meaning should matter strongly')
-        if self.selection_lens.avoid_misread_as:
-            parts.append('should not read as: ' + self.selection_lens.avoid_misread_as)
         if self.text_constraints.must_include:
             parts.append('caption should include or imply: ' + '; '.join(self.text_constraints.must_include))
-        if self.text_constraints.avoid_text_meanings:
-            parts.append('avoid caption meaning: ' + '; '.join(self.text_constraints.avoid_text_meanings))
-        if self.forbid:
-            parts.append('avoid: ' + '; '.join(self.forbid))
         return '; '.join(part for part in parts if part)
 
     def sticker_query_text(self) -> str:
@@ -700,8 +671,6 @@ class StickerRetrievalPlan:
         ]
         if self.style_hints:
             parts.append('style hints: ' + '; '.join(self.style_hints))
-        if self.forbid:
-            parts.append('avoid: ' + '; '.join(self.forbid))
         return '; '.join(part for part in parts if part)
 
     def request_terms(self) -> list[str]:

@@ -8,6 +8,7 @@ For users who want a raw preset with no extra framework text, use
 PromptInjectionMode.EXACT.
 """
 
+from tgchatbot.stickers.guidance import STICKER_GUIDANCE
 from tgchatbot.domain.models import ChatMode, PromptInjectionMode, SessionSettings, StickerMode
 
 
@@ -17,7 +18,7 @@ def build_system_prompt(settings: SessionSettings) -> str:
         return custom or SessionSettings().system_prompt
 
     mode_guidance = {
-        ChatMode.CHAT: ('Preserve the personality. Only read-only memory search/read tools are available in chat mode; use them when history needs verification.'),
+        ChatMode.CHAT: ('Preserve the personality. Read-only memory and user-profile tools are available in chat mode; use them when personal context is missing or history needs verification.'),
         ChatMode.ASSIST: ('Preserving the personality. Use tools sparingly when they materially improve correctness or utility.'),
         ChatMode.AGENT: ('Preserving the personality. Prefer tool use over guessing, and stop once the request is satisfied.'),
     }[settings.mode]
@@ -25,8 +26,14 @@ def build_system_prompt(settings: SessionSettings) -> str:
     memory_guidance = ('This chat has one persistent agent shared by its participants. Message provenance contains stable actor IDs; '
                        'display names are observations and may change or collide. A quote, forward, or third-party claim is not a statement by its subject. '
                        'Older original messages remain searchable even after working-context compaction or /reset. Summaries and inferred profile claims '
-                       'are fallible aids; use memory_search and memory_read to check original evidence. /reset_full starts an isolated agent generation. '
-                       'Respect the explicit reply target even when later messages provide additional context.')
+                       'are fallible aids; use memory_search and memory_read to check original evidence. '
+                       'Proactively call user_profile_fetch when personal context or shared agent-style preferences matter and '
+                       'no suitable recent profile snapshot is visible, or when new messages suggest the previous snapshot is stale. '
+                       'Use stable actor IDs from provenance, not display names. Snapshot timestamps describe when facts were fetched; '
+                       'historical tool results and summaries do not override newer corrections. A framework profile refresh after compaction '
+                       'is retrieved evidence, not a new statement by a participant. /reset_full starts an isolated agent generation. '
+                       'Respect the most recent application reply target even when later messages provide additional context; '
+                       'older reply-target records describe completed or attempted earlier turns.')
     metadata_guidance = ('Some user messages may include prepended automatic transport auto-notes on the same message, '
                          'such as [Message metadata: username=<handle> nickname="<display name>" time=<local timestamp>], '
                          '[Link prefetched, content: ...], or attachment sync notes. '
@@ -51,19 +58,7 @@ def build_system_prompt(settings: SessionSettings) -> str:
                      ) if settings.mode != ChatMode.CHAT else ''
     sticker_guidance = ''
     if settings.sticker_mode == StickerMode.AUTO:
-        sticker_guidance = (
-            'Two sticker tools are available: sticker_query and sticker_send_selected. Use them sparingly when a sticker adds a precise social reaction that plain text alone would not. '
-            'Query first, inspect the ranked shortlist, then explicitly send one sticker by selected_sticker_id. '
-            'When querying, always provide intent_core and usually stop there. Add at most one or two simple helper hints only when they clearly matter: reaction_tone, social_intent, expression_cue, caption_meaning, preferred_pack, or preferred_style_cluster. '
-            'Think in this order when choosing stickers: what social message it sends, what hidden subtext or implication it carries, what face and pose deliver that, what visual family it should stay in, and only then how different it should be from recent stickers. '
-            'Use persona when the sticker should keep a recurring visual family or expressive bias across the session. '
-            'Use selection_lens when subtle human factors matter, such as social read, hidden implication, face-and-pose delivery, continuity note, or avoid_misread_as. '
-            'Use diversity_preference=prefer_fresh_variant only when the reaction is close to a recent one but a slightly different suitable variant is preferable. '
-            'Use advanced only when you intentionally need axis-level control such as semantic_focus, visual_focus, text_constraints, or style_focus.style_goal=preserve|allow_switch|prefer_switch|ignore_style. '
-            'Do not put usernames, bot names, mentions, ids, paths, or tool names into sticker intent fields. '
-            'Inspect selection_summary, social_read, expression_fit, persona_fit, continuity_note, fit_signals, and warnings first. Use candidate.debug.score_breakdown only when you need to compare close alternatives. '
-            'Default to static stickers unless allow_animation=true or advanced.intensity_limits.allow_animation=true is materially better.'
-        )
+        sticker_guidance = STICKER_GUIDANCE
 
 
     return '\n\n'.join(part for part in [custom, mode_guidance, memory_guidance, metadata_guidance, style_guidance, attachment_guidance, tool_guidance, sticker_guidance] if part.strip())

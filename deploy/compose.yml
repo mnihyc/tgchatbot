@@ -16,7 +16,6 @@ x-service: &service
     APP_DATA_DIR: /app/data
     APP_TEMP_DIR: /tmp
     APP_HEALTH_FILE: /tmp/tgchatbot-health.json
-    STICKER_RETRIEVER_URL: http://retriever:4107
   logging:
     driver: json-file
     options:
@@ -58,19 +57,6 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  retriever:
-    <<: *service
-    command: [retriever]
-    volumes:
-      - ./data:/app/data
-      - ./tmp/retriever:/tmp
-    healthcheck:
-      test: [CMD, python, -c, "import json,urllib.request; r=json.load(urllib.request.urlopen('http://127.0.0.1:4107/health',timeout=3)); assert r['status']=='ok' and r['service']=='tantivy_retriever' and r['schema_version']=='human_sticker_v1'"]
-      interval: 5s
-      timeout: 5s
-      retries: 6
-      start_period: 30s
-
   bot:
     <<: *service
     command: [python, -m, tgchatbot.app]
@@ -83,9 +69,6 @@ services:
     volumes:
       - ./data:/app/data
       - ./tmp/bot:/tmp
-    depends_on:
-      retriever:
-        condition: service_healthy
     healthcheck:
       test: [CMD, python, -m, tgchatbot.healthcheck]
       interval: 5s

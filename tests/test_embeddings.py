@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import numpy as np
 
-from tgchatbot.embeddings import BatchJob, EmbeddingClient, EmbeddingConfig, EmbeddingDocument, SyncEmbeddingClient
+from tgchatbot.embeddings import BatchJob, EmbeddingClient, EmbeddingConfig, EmbeddingDocument, EmbeddingMedia, SyncEmbeddingClient
 
 
 class EmbeddingConfigTests(unittest.TestCase):
@@ -44,6 +44,29 @@ class EmbeddingConfigTests(unittest.TestCase):
         for changed in [replace(config, dimensions=768), replace(config, model="gemini-embedding-001"), replace(config, model_revision="revision-2")]:
             self.assertNotEqual(config.space_id, changed.space_id)
 
+    def test_sticker_profile_overrides_dimensions_without_changing_memory_or_key_route(self):
+        env = {'GEMINI_API_KEY': 'shared-key', 'GEMINI_BASE_URL': 'https://proxy.invalid/v1beta',
+               'EMBEDDING_DIMENSIONS': '1536', 'EMBEDDING_CACHE_ENTRIES': '20',
+               'STICKER_EMBEDDING_DIMENSIONS': '3072', 'STICKER_EMBEDDING_CACHE_ENTRIES': '0'}
+        memory = EmbeddingConfig.from_env(env)
+        sticker = EmbeddingConfig.from_env(env, prefix='STICKER_EMBEDDING')
+        self.assertEqual((memory.dimensions, sticker.dimensions), (1536, 3072))
+        self.assertEqual((memory.cache_entries, sticker.cache_entries), (20, 0))
+        self.assertEqual((memory.api_key, memory.base_url), (sticker.api_key, sticker.base_url))
+        self.assertNotEqual(memory.space_id, sticker.space_id)
+
+    def test_sticker_provider_change_does_not_inherit_a_foreign_key_model_or_url(self):
+        env = {'EMBEDDING_MODEL': 'gemini-embedding-2', 'EMBEDDING_API_KEY': 'gemini-only',
+               'EMBEDDING_BASE_URL': 'https://gemini.invalid/v1beta', 'OPENAI_API_KEY': 'selected-openai',
+               'STICKER_EMBEDDING_PROVIDER': 'openai'}
+        sticker = EmbeddingConfig.from_env(env, prefix='STICKER_EMBEDDING')
+        self.assertEqual(sticker.model, 'text-embedding-3-large')
+        self.assertEqual(sticker.api_key, 'selected-openai')
+        self.assertEqual(sticker.base_url, 'https://api.openai.com/v1')
+        pointer = EmbeddingConfig.from_env(env | {'STICKER_EMBEDDING_API_KEY_ENV': 'STICKER_KEY',
+            'STICKER_KEY': 'explicit-sticker'}, prefix='STICKER_EMBEDDING')
+        self.assertEqual(pointer.api_key, 'explicit-sticker')
+
     def test_invalid_limits_fail_before_network(self):
         for options in [{"dimensions": 0}, {"dimensions": 4096}, {"requests_per_minute": 0},
                         {"timeout_s": float("inf")}, {"cache_entries": -1}, {"max_retries": -1},
@@ -72,6 +95,61 @@ class EmbeddingClientTests(unittest.IsolatedAsyncioTestCase):
         http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         self.addAsyncCleanup(http.aclose)
         return EmbeddingClient(EmbeddingConfig(**options), http_client=http)
+
+    async def test_multimodal_documents_preserve_frame_order_and_leave_text_memory_format_unchanged(self):
+        seen = []
+        def handle(request):
+            payload = json.loads(request.content)
+            seen.append(payload)
+            return httpx.Response(200, json={'embeddings': [{'values': [3, 4]} for _ in payload['requests']]})
+        client = self.make_client(handle)
+        self.assertTrue(client.supports_media)
+        docs = [EmbeddingDocument('image', media=(EmbeddingMedia('image/png', 'AAAA'), EmbeddingMedia('image/jpeg', 'BBBB'))),
+                EmbeddingDocument('fused', 'offering comfort', media=(EmbeddingMedia('image/png', 'CCCC'),)),
+                EmbeddingDocument('memory', 'Prefers jasmine tea.', 'Known preference')]
+        results = await client.embed_documents(docs, purpose='sticker')
+        self.assertEqual(len(results), 3)
+        payloads = seen[0]['requests']
+        self.assertEqual(payloads[0]['content']['parts'], [
+            {'inlineData': {'mimeType': 'image/png', 'data': 'AAAA'}},
+            {'inlineData': {'mimeType': 'image/jpeg', 'data': 'BBBB'}}])
+        self.assertEqual(payloads[1]['content']['parts'][0], {'text': 'title: none | text: offering comfort'})
+        self.assertEqual(payloads[2]['content']['parts'], [{'text': 'title: Known preference | text: Prefers jasmine tea.'}])
+        self.assertTrue(all(p['embedContentConfig']['autoTruncate'] is False for p in payloads))
+
+    async def test_multimodal_count_and_native_batch_use_the_same_parts_and_stable_ids(self):
+        seen = []
+        def handle(request):
+            seen.append((request.url.path, json.loads(request.content)))
+            if request.url.path.endswith(':countTokens'):
+                return httpx.Response(200, json={'totalTokens': 258})
+            return httpx.Response(200, json={'name': 'batches/media-job', 'metadata': {'state': 'JOB_STATE_PENDING'}})
+        client = self.make_client(handle)
+        document = EmbeddingDocument('asset-hash:frame-v1', media=(EmbeddingMedia('image/png', 'AAAA'),))
+        self.assertEqual(await client.count_document_tokens(document), 258)
+        self.assertEqual(await client.count_document_tokens(document), 258)
+        job = await client.submit_batch([document], purpose='sticker', display_name='sticker-build-id')
+        self.assertEqual(job.item_ids, ('asset-hash:frame-v1',))
+        self.assertEqual(len(seen), 2)
+        row = seen[1][1]['batch']['inputConfig']['requests']['requests'][0]
+        self.assertEqual(row['request']['content'], seen[0][1]['contents'][0])
+        self.assertEqual(row['metadata']['key'], document.item_id)
+        self.assertEqual(row['metadata']['space_id'], client.space_id)
+        await client.count_document_tokens(replace(document, media=(EmbeddingMedia('image/png', 'BBBB'),)))
+        self.assertEqual(len(seen), 3)
+
+    async def test_unsupported_media_and_excess_frames_fail_without_dropping_inputs(self):
+        def no_network(request):
+            self.fail('invalid media must fail before HTTP')
+        for provider, model in [('gemini', 'gemini-embedding-001'), ('openai', 'text-model')]:
+            client = self.make_client(no_network, provider=provider, model=model)
+            self.assertFalse(client.supports_media)
+            with self.assertRaisesRegex(NotImplementedError, 'text only'):
+                await client.embed_documents([EmbeddingDocument('image', media=(EmbeddingMedia('image/png', 'AAAA'),))])
+        client = self.make_client(no_network)
+        for media in [(EmbeddingMedia('image/webp', 'AAAA'),), (EmbeddingMedia('image/png', 'AAAA'),) * 7]:
+            with self.assertRaises(ValueError):
+                await client.embed_documents([EmbeddingDocument('invalid', media=media)])
 
     async def test_gemini2_exact_query_and_document_contracts(self):
         seen = []

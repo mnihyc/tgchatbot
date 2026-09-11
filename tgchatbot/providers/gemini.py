@@ -8,8 +8,9 @@ import httpx
 
 from tgchatbot.config import GeminiConfig
 from tgchatbot.core.token_estimator import TokenEstimator
-from tgchatbot.domain.models import ConversationMessage, MessageRole, PartKind, ProviderResponse, SessionSettings, ToolCall, UsageInfo
-from tgchatbot.providers.base import ControlDescriptor, ProviderCapabilities, RequestTokenEstimate, estimate_json_schema_tokens
+from tgchatbot.domain.models import ConversationMessage, MessagePart, MessageRole, PartKind, ProviderResponse, SessionSettings, ToolCall, UsageInfo
+from tgchatbot.providers.base import (ControlDescriptor, ProviderCapabilities, RequestTokenEstimate,
+    estimate_json_schema_tokens, evidence_text, pending_image_tokens, tool_message_evidence)
 from tgchatbot.settings_schema import (
     GEMINI_THINKING_BUDGET_MAX,
     GEMINI_THINKING_BUDGET_MIN,
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 class GeminiProvider:
     name = 'gemini'
-    capabilities = ProviderCapabilities(multimodal_input=True, function_tools=True, native_web_search=True)
+    capabilities = ProviderCapabilities(multimodal_input=True, function_tools=True, native_web_search=True, multimodal_tool_results=True)
 
     def __init__(self, config: GeminiConfig) -> None:
         self.config = config
@@ -47,6 +48,11 @@ class GeminiProvider:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+
+    def supports_tool_evidence(self, settings: SessionSettings) -> bool:
+        # Gemini 3 introduced nested function-response media. Unknown newer
+        # model IDs use that dialect; do not create a fixed model allowlist.
+        return not settings.model.removeprefix('models/').startswith(('gemini-1', 'gemini-2'))
 
     def describe_controls(self, settings: SessionSettings) -> dict[str, ControlDescriptor]:
         include_thoughts = 'on' if self._include_thoughts_enabled(settings) else 'off'
@@ -136,8 +142,10 @@ class GeminiProvider:
         history_tokens = int(history_tokens_override) if history_tokens_override is not None else sum(
             self._estimate_content_tokens(content)
             for message in messages
-            for content in self._message_to_contents(message)
+            for content in self._message_to_contents(message, tool_images=self.supports_tool_evidence(settings))
         )
+        if history_tokens_override is None:
+            history_tokens += pending_image_tokens(messages, tool_images=self.supports_tool_evidence(settings))
         instructions_tokens = TokenEstimator.estimate_text(instructions)
         request_tools, tool_config, server_side_tool_enabled = self._build_request_tools(settings, tools)
         tools_tokens = sum(self._estimate_request_tool_tokens(tool_entry) for tool_entry in request_tools)
@@ -178,7 +186,7 @@ class GeminiProvider:
         response_schema: dict[str, Any] | None = None,
         response_schema_name: str | None = None,
     ) -> ProviderResponse:
-        contents = [item for message in messages for item in self._message_to_contents(message)]
+        contents = [item for message in messages for item in self._message_to_contents(message, tool_images=self.supports_tool_evidence(settings))]
         if extra_input_items:
             contents.extend(item for item in extra_input_items if isinstance(item, dict))
         contents = self._prepare_contents_for_request(contents)
@@ -208,6 +216,11 @@ class GeminiProvider:
             payload['tools'] = request_tools
         if tool_config:
             payload['toolConfig'] = tool_config
+        tier = settings.service_tier or getattr(self.config, 'service_tier', None)
+        if tier:
+            # Native REST field documented by Gemini's Flex inference guide.
+            # A failed Flex request is never retried as Standard here.
+            payload['service_tier'] = tier
 
         client = self._ensure_client()
         response = await client.post(
@@ -226,16 +239,40 @@ class GeminiProvider:
         response.raise_for_status()
         return self._parse_response(response.json())
 
-    def make_tool_result_items(self, tool_call: ToolCall, tool_output: dict) -> list[dict]:
+    def make_tool_result_items(self, tool_call: ToolCall, tool_output: dict,
+                               evidence_parts: list[MessagePart] | None = None) -> list[dict]:
+        return self._tool_result_items(tool_call, tool_output, evidence_parts or [])
+
+    def _tool_result_items(self, tool_call: ToolCall, tool_output: dict,
+                           evidence_parts: list[MessagePart], *, allow_images: bool = True) -> list[dict]:
+        response: dict[str, Any] = {'result': tool_output}
+        media: list[dict[str, Any]] = []
+        evidence: list[dict[str, Any]] = []
+        for part in evidence_parts:
+            if (allow_images and part.kind in {PartKind.IMAGE, PartKind.FILE} and part.data_b64
+                    and part.mime_type in {'image/png', 'image/jpeg', 'image/webp', 'application/pdf', 'text/plain'}):
+                media.append({'inlineData': {'mimeType': part.mime_type, 'data': part.data_b64}})
+                if part.text:
+                    evidence.append({'text': part.text})
+                # The live Gemini API rejects the guide's optional displayName/
+                # $ref form. Native inline parts work without those references.
+                # Keep frame attribution explicit in the structured result.
+                evidence.append({'image_part': len(media)})
+            else:
+                text = evidence_text(part)
+                if text:
+                    evidence.append({'text': text})
+        if evidence:
+            response['evidence'] = evidence
+        function_response: dict[str, Any] = {
+            'name': tool_call.name, 'id': tool_call.call_id, 'response': response,
+        }
+        if media:
+            function_response['parts'] = media
+            response['media_order'] = 'image_part is the 1-based position in functionResponse.parts; labels describe the following image part.'
         return [{
             'role': 'user',
-            'parts': [{
-                'functionResponse': {
-                    'name': tool_call.name,
-                    'id': tool_call.call_id,
-                    'response': {'result': tool_output},
-                }
-            }],
+            'parts': [{'functionResponse': function_response}],
         }]
 
     def _thinking_config_for_model(self, settings: SessionSettings) -> dict[str, Any] | None:
@@ -318,9 +355,17 @@ class GeminiProvider:
         return [copy.deepcopy(item) for item in contents if isinstance(item, dict)]
 
     def _parse_response(self, body: dict[str, Any]) -> ProviderResponse:
+        usage = body.get('usageMetadata') or {}
+        usage_info = UsageInfo(
+            input_tokens=usage.get('promptTokenCount'),
+            output_tokens=usage.get('candidatesTokenCount'),
+            total_tokens=usage.get('totalTokenCount'),
+            cached_input_tokens=usage.get('cachedContentTokenCount'),
+            service_tier=usage.get('serviceTier'),
+        )
         candidates = body.get('candidates', [])
         if not candidates:
-            return ProviderResponse(raw=body)
+            return ProviderResponse(usage=usage_info, raw=body)
         candidate = candidates[0] or {}
         content = candidate.get('content', {}) or {}
         parts = content.get('parts', []) or []
@@ -375,18 +420,13 @@ class GeminiProvider:
                 'raw_item': grounding,
             })
 
-        usage = body.get('usageMetadata', {}) or {}
         return ProviderResponse(
             final_text=''.join(text_parts).strip(),
             reasoning_summaries=reasoning_summaries,
             tool_calls=tool_calls,
             native_tool_calls=native_tool_calls,
             continuation_items=continuation_items,
-            usage=UsageInfo(
-                input_tokens=usage.get('promptTokenCount'),
-                output_tokens=usage.get('candidatesTokenCount'),
-                total_tokens=usage.get('totalTokenCount'),
-            ),
+            usage=usage_info,
             raw=body,
         )
 
@@ -429,7 +469,9 @@ class GeminiProvider:
             return 24 + TokenEstimator.estimate_text(call.get('name')) + TokenEstimator.estimate_text(call.get('id')) + self._estimate_semantic_value_tokens(call.get('args') or {})
         if 'functionResponse' in part and isinstance(part.get('functionResponse'), dict):
             response = part['functionResponse']
-            return 24 + TokenEstimator.estimate_text(response.get('name')) + TokenEstimator.estimate_text(response.get('id')) + self._estimate_semantic_value_tokens(response.get('response') or {})
+            return (24 + TokenEstimator.estimate_text(response.get('name')) + TokenEstimator.estimate_text(response.get('id'))
+                    + self._estimate_semantic_value_tokens(response.get('response') or {})
+                    + sum(self._estimate_part_tokens(item) for item in response.get('parts', []) if isinstance(item, dict)))
         if part.get('thought') is True:
             total = 12 + TokenEstimator.estimate_text(part.get('text'))
             if part.get('thoughtSignature'):
@@ -475,7 +517,7 @@ class GeminiProvider:
     def _sanitize_history_content(item: dict[str, Any]) -> dict[str, Any] | None:
         return copy.deepcopy(item)
 
-    def _message_to_contents(self, message: ConversationMessage) -> list[dict[str, Any]]:
+    def _message_to_contents(self, message: ConversationMessage, *, tool_images: bool = True) -> list[dict[str, Any]]:
         if isinstance(message.metadata, dict):
             provider_native = message.metadata.get('provider_native') if isinstance(message.metadata.get('provider_native'), dict) else None
             if provider_native and str(provider_native.get('provider') or '').strip().lower() == self.name:
@@ -486,13 +528,19 @@ class GeminiProvider:
             phase = str(message.metadata.get('tool_phase') or '').strip().lower()
             provider_name = str(message.metadata.get('tool_provider') or '').strip().lower()
             payload = message.metadata.get('tool_payload') if isinstance(message.metadata.get('tool_payload'), dict) else {}
-            if provider_name == self.name and phase == 'call' and payload.get('call_id') and message.name:
-                return [{'role': 'model', 'parts': [{'functionCall': {'name': message.name, 'args': payload.get('arguments') or {}, 'id': str(payload['call_id'])}}]}]
-            if provider_name == self.name and phase == 'result' and message.name:
-                response_payload = {'name': message.name, 'response': {'result': payload.get('output') or {}}}
-                if payload.get('call_id'):
-                    response_payload['id'] = str(payload['call_id'])
-                return [{'role': 'user', 'parts': [{'functionResponse': response_payload}]}]
+            framework_refresh = message.metadata.get('synthetic_role') == 'profile_refresh'
+            portable_evidence = bool(message.metadata.get('tool_evidence'))
+            if (provider_name == self.name or framework_refresh or portable_evidence) and phase == 'call' and payload.get('call_id') and message.name:
+                part = {'functionCall': {'name': message.name, 'args': payload.get('arguments') or {}, 'id': str(payload['call_id'])}}
+                if framework_refresh or portable_evidence:
+                    # Google's documented marker for deterministic client-executed
+                    # tool history; this is not a model-generated thought signature.
+                    # https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures
+                    part['thoughtSignature'] = 'skip_thought_signature_validator'
+                return [{'role': 'model', 'parts': [part]}]
+            if (provider_name == self.name or framework_refresh or portable_evidence) and phase == 'result' and message.name:
+                return self._tool_result_items(ToolCall(message.name, str(payload.get('call_id') or ''), {}),
+                    payload.get('output') or {}, tool_message_evidence(message), allow_images=tool_images)
         role = 'model' if message.role in {MessageRole.ASSISTANT, MessageRole.TOOL} else 'user'
         parts: list[dict[str, Any]] = []
         for part in message.parts:

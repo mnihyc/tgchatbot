@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from tgchatbot.domain.models import ToolResult
+from tgchatbot.settings_schema import DEFAULT_METADATA_TIMEZONE
 
 
 @dataclass(frozen=True)
@@ -11,6 +12,7 @@ class ToolContext:
     session_id: str
     user_display_name: str
     scope: dict[str, int] | None = None
+    timezone: str = DEFAULT_METADATA_TIMEZONE
 
 
 def _nullable_schema(schema: dict[str, Any]) -> dict[str, Any]:

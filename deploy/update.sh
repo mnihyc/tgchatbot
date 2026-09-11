@@ -19,7 +19,7 @@ repository=${TGCHATBOT_RELEASE_REPO:-mnihyc/tgchatbot}
 timeout=${TGCHATBOT_HEALTH_TIMEOUT:-180}
 [[ $repository =~ ^[0-9A-Za-z_.-]+/[0-9A-Za-z_.-]+$ ]] || fail 'Invalid release repository'
 [[ $timeout =~ ^[1-9][0-9]{1,3}$ ]] && ((timeout <= 3600)) || fail 'Health timeout must be 10..3600 seconds'
-for tool in docker curl sha256sum tar flock; do command -v "$tool" >/dev/null || fail "Missing required tool: $tool"; done
+for tool in docker curl sha256sum tar flock cmp; do command -v "$tool" >/dev/null || fail "Missing required tool: $tool"; done
 docker compose version >/dev/null || fail 'Docker Compose v2 with up --wait support is required'
 mkdir -p tmp/update data
 exec 9>tmp/update.lock
@@ -38,7 +38,28 @@ verify() {
   [[ $expected =~ ^[0-9a-fA-F]{64}$ ]] || return 1
   printf '%s  %s\n' "$expected" "$2" | sha256sum --check --strict -
 }
-start() { docker compose up -d --no-build --pull never --force-recreate --wait --wait-timeout "$timeout" retriever bot; }
+# Service changes belong to the selected release's Compose definition. Exclude
+# the separately managed database, including when restoring an older release.
+application_services() {
+  docker compose --project-directory "$root" -f "$1" config --services | awk '$0 != "postgres"'
+}
+start() {
+  local services
+  services=$(application_services compose.yml)
+  [[ -n $services ]] || fail 'Deployment has no application services'
+  local -a names
+  mapfile -t names <<< "$services"
+  docker compose up -d --no-build --pull never --force-recreate --wait --wait-timeout "$timeout" "${names[@]}"
+}
+stop_application() {
+  local services
+  services=$(application_services "$1")
+  if [[ -n $services ]]; then
+    local -a names
+    mapfile -t names <<< "$services"
+    docker compose --project-directory "$root" -f "$1" stop "${names[@]}"
+  fi
+}
 schema_compatible() {
   TGCHATBOT_IMAGE="$1" docker compose run --rm --no-deps bot python -m tgchatbot.storage.postgres_store --check-schema
 }
@@ -52,6 +73,8 @@ active=$(docker image inspect --format '{{.Id}}' tgchatbot:current 2>/dev/null |
 if [[ $target == rollback ]]; then
   [[ -f .env && -f compose.yml ]] || fail 'Run ./update.sh before rollback'
   candidate=$(docker image inspect --format '{{.Id}}' tgchatbot:previous 2>/dev/null) || fail 'No previous image; install an exact release tag instead'
+  [[ -f compose.previous.yml ]] || fail 'No matching previous Compose definition; install an exact release tag instead'
+  cp compose.previous.yml "$work/compose.next.yml"
 else
   if [[ $target == latest ]]; then
     url=$(curl --fail --silent --show-error --location --retry 3 --connect-timeout 15 --output /dev/null --write-out '%{url_effective}' "https://github.com/$repository/releases/latest")
@@ -73,6 +96,16 @@ else
   tar -xOzf "$work/deploy.tar.gz" compose.yml > "$work/compose.next.yml"
   tar -xOzf "$work/deploy.tar.gz" update.sh > "$work/update.next.sh"
   [[ -s "$work/compose.next.yml" && -s "$work/update.next.sh" ]] || fail 'Incomplete deployment bundle'
+  bash -n "$work/update.next.sh" || fail 'Invalid release updater'
+  # Transfer control before interpreting the new deployment, not after trying
+  # to activate it with old service/schema assumptions. Re-opening descriptor 9
+  # in the replacement process releases/reacquires the same update lock; if a
+  # competing updater wins, it exits without changing application services.
+  if ! cmp -s "$root/update.sh" "$work/update.next.sh"; then
+    install_updater
+    log 'Continuing with the verified release updater'
+    exec bash "$root/update.sh" "$target"
+  fi
   [[ -f compose.yml ]] || cp "$work/compose.next.yml" compose.yml
   if [[ ! -f .env ]]; then
     tar -xOzf "$work/deploy.tar.gz" .env.example > .env
@@ -103,7 +136,7 @@ on_failure() {
     exit 1
   fi
   log 'Activation failed; stopping attempted services' >&2
-  docker compose stop bot retriever || true
+  stop_application compose.yml || true
   # Database state is never rolled back by swapping an image. The previous
   # application must prove it can read the current schema before it may restart.
   if [[ -n $active ]] && schema_compatible "$active"; then
@@ -116,7 +149,7 @@ on_failure() {
   exit 1
 }
 trap on_failure ERR INT TERM
-[[ $target == rollback ]] || cp "$work/compose.next.yml" compose.yml
+cp "$work/compose.next.yml" compose.yml
 # Compose owns dotenv parsing. The published helper sees the resolved bot
 # environment and creates only a missing local database password, without
 # printing credentials or requiring Python on the Docker host.
@@ -136,17 +169,32 @@ case "$database_mode" in
 esac
 schema_compatible "$candidate"
 activation_started=1
-if [[ -n $active ]]; then docker compose stop bot retriever; fi
+if [[ -n $active ]]; then stop_application "$work/compose.before.yml"; fi
 if [[ $database_mode == external ]]; then
   # The previous bot may still have used this database until it stopped above.
   docker compose stop postgres
 fi
 # Keep a named recovery image before current changes, even if power is lost
 # before the health check can finish. Reinstalling one image keeps the prior tag.
-if [[ -n $active && $active != "$candidate" ]]; then docker tag "$active" tgchatbot:previous; fi
+if [[ -n $active && $active != "$candidate" ]]; then
+  cp "$work/compose.before.yml" compose.previous.yml
+  docker tag "$active" tgchatbot:previous
+fi
 docker tag "$candidate" tgchatbot:current
 start
 if [[ $target != rollback ]]; then
+  # Remove only retired, already-stopped application containers after success.
+  # Their mounted data and images remain intact; no orphan/volume sweep is used.
+  old_services=$(application_services "$work/compose.before.yml")
+  new_services=$(application_services compose.yml)
+  while IFS= read -r service; do
+    [[ -n $service ]] || continue
+    if ! printf '%s\n' "$new_services" | awk -v wanted="$service" '$0 == wanted { found=1 } END { exit !found }'; then
+      if ! docker compose --project-directory "$root" -f "$work/compose.before.yml" rm -f "$service"; then
+        log "Retired service $service is stopped but its container could not be removed" >&2
+      fi
+    fi
+  done <<< "$old_services"
   install_updater
 fi
 trap - ERR INT TERM

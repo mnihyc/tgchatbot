@@ -64,12 +64,11 @@ class ComposeConfigurationTests(unittest.TestCase):
             self.assertEqual(bot_environment['APP_DATA_DIR'], '/app/data')
             self.assertEqual(bot_environment['APP_TEMP_DIR'], '/tmp')
 
-            retriever_environment = services['retriever']['environment']
-            for secret_name in ('TGBOT_TOKEN', 'OPENAI_API_KEY', 'DEFAULT_SYSTEM_PROMPT'):
-                self.assertNotIn(secret_name, retriever_environment)
-            for service_name in ('bot', 'retriever'):
-                volumes = services[service_name]['volumes']
-                bind_mounts = {volume['target']: volume['source'] for volume in volumes if volume['type'] == 'bind'}
-                self.assertEqual(bind_mounts['/app/data'], str(root / 'data'))
-                self.assertEqual(bind_mounts['/tmp'], str(root / 'tmp' / service_name))
-                self.assertFalse(any(Path(volume['source']).name == '.env' or Path(volume['target']).name == '.env' for volume in volumes))
+            self.assertEqual(set(services), {'bot'})
+            self.assertNotIn('STICKER_RETRIEVER_URL', bot_environment)
+            volumes = services['bot']['volumes']
+            bind_mounts = {volume['target']: volume['source'] for volume in volumes if volume['type'] == 'bind'}
+            self.assertEqual(bind_mounts['/app/data'], str(root / 'data'))
+            self.assertEqual(bind_mounts['/tmp'], str(root / 'tmp' / 'bot'))
+            self.assertFalse(any(Path(volume['source']).name == '.env' or Path(volume['target']).name == '.env' for volume in volumes))
+            self.assertIn('/app/data/postgres:ro', services['bot']['tmpfs'])

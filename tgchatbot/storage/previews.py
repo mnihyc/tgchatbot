@@ -65,6 +65,11 @@ class PreviewCache:
     def materialize(self, message: ConversationMessage, *, vision: bool) -> ConversationMessage:
         parts = []
         for part in message.parts:
+            # Sticker ingestion emits a text/emoji hint separately from its
+            # IMAGE frames. The hint never needs a cached image to remain valid.
+            if part.kind == PartKind.STICKER and not part.data_b64 and not part.preview_ref:
+                parts.append(part)
+                continue
             if part.kind not in {PartKind.IMAGE, PartKind.STICKER}:
                 parts.append(part)
                 continue

@@ -38,6 +38,7 @@ from tgchatbot.logging_config import clip_for_log
 from tgchatbot.media.ingest import extract_message_parts
 from tgchatbot.media.link_prefetch import fetch_link_previews, previews_to_parts
 from tgchatbot.storage.artifacts import ArtifactStore
+from tgchatbot.transports.sticker_delivery import send_sticker as deliver_sticker
 from tgchatbot.storage.postgres_store import PostgresStore, StaleScopeError
 from tgchatbot.storage.presets import PresetStore
 from tgchatbot.domain.provenance import telegram_metadata, telegram_actor
@@ -508,7 +509,8 @@ class TelegramBotApp:
         trigger = None
         while True:
             recent = await self.store.list_recent_visible_messages(session_id, limit=40, before_message_id=before_message_id)
-            trigger = next((item for item in recent if item.message.role == MessageRole.USER), None)
+            trigger = next((item for item in recent if item.message.role == MessageRole.USER
+                            and not item.message.metadata.get('synthetic_role')), None)
             if trigger is not None or len(recent) < 40:
                 break
             before_message_id = recent[-1].db_id
@@ -1126,7 +1128,7 @@ class TelegramBotApp:
                 try:
                     ZoneInfo(raw_value)
                 except ZoneInfoNotFoundError:
-                    current = settings.metadata_timezone or 'UTC'
+                    current = settings.metadata_timezone or self.config.default_metadata_timezone
                     await update.effective_message.reply_text(f'Invalid metadata_timezone. Current effective value: {current}')
                     return
                 settings.metadata_timezone = raw_value
@@ -1330,7 +1332,7 @@ class TelegramBotApp:
             if settings.metadata_injection_mode != 'off':
                 event_time = getattr(message, 'edit_date', None) or getattr(message, 'date', None) or datetime.now(timezone.utc)
                 try:
-                    zone = ZoneInfo(settings.metadata_timezone or 'UTC')
+                    zone = ZoneInfo(settings.metadata_timezone or self.config.default_metadata_timezone)
                 except ZoneInfoNotFoundError:
                     zone = ZoneInfo('UTC')
                 local_time = event_time.astimezone(zone).isoformat(timespec='seconds')
@@ -1725,6 +1727,7 @@ class TelegramBotApp:
             source_message=message,
             reply_to_source_message=self.config.telegram.reply_to_user_message,
             process_visibility=settings.process_visibility,
+            sticker_delivery=self.runtime.sticker_delivery,
         )
         if should_show_status:
             await renderer.begin()
@@ -1885,24 +1888,11 @@ class TelegramBotApp:
         return delivered_messages
 
     async def _send_stickers_direct(self, source_message: Message, stickers: list[OutboundSticker]) -> list[dict[str, object]]:
-        receipts: list[dict[str, object]] = []
+        receipts = []
         for sticker in stickers:
-            receipt: dict[str, object] = sticker.delivery_receipt()
-            if not sticker.path.exists():
-                receipt['error'] = 'missing_file'
-                receipts.append(receipt)
-                continue
-            try:
-                with sticker.path.open('rb') as fh:
-                    sent_message = await source_message.get_bot().send_sticker(chat_id=source_message.chat.id, sticker=fh, emoji=sticker.emoji, reply_to_message_id=self._reply_to_message_id(source_message))
-                receipt['delivery_state'] = 'sent'
-                logger.info('tg.sticker.sent chat=%s sticker=%s timing=%s', self._chat_log_id(source_message.chat.id), clip_for_log(sticker.display_reference(), limit=48), sticker.timing.value)
-                receipt['sent'] = True
-                receipt['telegram_message_id'] = getattr(sent_message, 'message_id', None)
-            except Exception as exc:
-                logger.exception('Failed to send sticker %s', sticker.display_reference())
-                receipt['error'] = exc.__class__.__name__
-            receipts.append(receipt)
+            receipts.append(await deliver_sticker(source_message.get_bot(), chat_id=source_message.chat.id,
+                sticker=sticker, reply_to_message_id=self._reply_to_message_id(source_message),
+                deliveries=self.runtime.sticker_delivery))
         return receipts
 
     @staticmethod
@@ -1919,6 +1909,8 @@ class TelegramBotApp:
                 timing=StickerTiming.parse(timing),
                 label=payload.get('label'),
                 source_id=payload.get('source_id'),
+                delivery_operation_id=payload.get('delivery_operation_id'),
+                content_sha256=payload.get('content_sha256'),
             )
         except Exception:
             return None
@@ -1987,6 +1979,11 @@ class TelegramBotApp:
         while True:
             recent = await self.store.list_recent_visible_messages(session_id, limit=40, before_message_id=before_message_id)
             for item in recent:
+                # Framework targets/refreshes describe the surrounding turn;
+                # they do not introduce another human or bot conversation block.
+                if item.message.metadata.get('synthetic_role'):
+                    target_ids.append(item.db_id)
+                    continue
                 side = self._rollback_side(item.message.role)
                 if side != prev_side:
                     groups += 1

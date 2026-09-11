@@ -19,7 +19,7 @@ from unittest.mock import patch
 REPO = Path(__file__).resolve().parents[1]
 COMMIT = "a" * 40
 MOCK = r'''#!/usr/bin/env python3
-import hashlib, json, os, pathlib, runpy, sys
+import hashlib, json, os, pathlib, re, runpy, sys
 args = sys.argv[1:]
 name = pathlib.Path(sys.argv[0]).name
 with open(os.environ["MOCK_LOG"], "a") as out:
@@ -59,6 +59,11 @@ elif args[:1] == ["compose"] and '--check-schema' in args:
     tag = state['images'][identity]['tag']
     if tag in (os.environ.get('FAIL_SCHEMA_TAG'), state.get('incompatible_schema_tag')):
         sys.exit(1)
+elif args[:1] == ['compose'] and 'config' in args and '--services' in args:
+    path = pathlib.Path(args[args.index('-f') + 1]) if '-f' in args else pathlib.Path('compose.yml')
+    section = path.read_text().split('\nservices:\n', 1)[1]
+    print('\n'.join(name for name in re.findall(r'^  ([a-zA-Z0-9_-]+):', section, re.M) if name != 'postgres'))
+    sys.exit(0)
 elif args[:2] == ["image", "inspect"]:
     identity = image_id(args[-1])
     if identity is None:
@@ -202,6 +207,51 @@ class ReleaseUpdaterTests(unittest.TestCase):
         self.assertFalse(any("load" in call or "up" in call for call in self.calls()))
         self.assertFalse(any("tgchatbot-linux-" in call[-1] for call in self.calls() if call[0] == "curl"))
         self.assert_simple_layout()
+
+    def test_verified_release_updater_takes_over_before_obsolete_activation_logic(self):
+        installed = self.install / 'update.sh'
+        installed.write_text(installed.read_text().replace(
+            'start() {', "start() { fail 'obsolete activation must never execute';", 1))
+        result = self.run_update()
+        self.assertIn('Continuing with the verified release updater', result.stdout)
+        self.assertEqual(installed.read_bytes(), (REPO / 'deploy' / 'update.sh').read_bytes())
+        self.assertEqual(self.image_tag('tgchatbot:current'), 'v0.2.0')
+        self.assertEqual(len([call for call in self.calls() if call[:2] == ['docker', 'load']]), 1)
+        self.assert_data_preserved()
+        self.assert_simple_layout()
+
+    def test_removed_service_is_stopped_then_removed_only_after_new_bot_is_healthy(self):
+        self.run_update('v0.1.0')
+        compose = self.install / 'compose.yml'
+        old = compose.read_text() + '\n  retired-search:\n    image: tgchatbot:current\n'
+        compose.write_text(old)
+        prior = len(self.calls())
+        self.run_update('v0.2.0')
+        calls = self.calls()[prior:]
+        stopped = next(i for i, call in enumerate(calls) if 'stop' in call and 'retired-search' in call)
+        started = next(i for i, call in enumerate(calls) if 'up' in call and 'bot' in call)
+        removed = next(i for i, call in enumerate(calls) if 'rm' in call and 'retired-search' in call)
+        self.assertLess(stopped, started)
+        self.assertLess(started, removed)
+        self.assertNotIn('retired-search', calls[started])
+        self.assertEqual((self.install / 'compose.previous.yml').read_text(), old)
+        self.assert_data_preserved()
+        self.run_update('rollback')
+        self.assertEqual(compose.read_text(), old)
+        self.assertIn('retired-search', [call for call in self.calls() if 'up' in call and 'bot' in call][-1])
+
+    def test_failed_replacement_restores_old_service_and_does_not_remove_it(self):
+        self.run_update('v0.1.0')
+        compose = self.install / 'compose.yml'
+        old = compose.read_text() + '\n  retired-search:\n    image: tgchatbot:current\n'
+        compose.write_text(old)
+        prior = len(self.calls())
+        self.run_update('v0.2.0', success=False, FAIL_TAG='v0.2.0')
+        calls = self.calls()[prior:]
+        self.assertFalse(any('rm' in call and 'retired-search' in call for call in calls))
+        self.assertEqual(compose.read_text(), old)
+        self.assertIn('retired-search', [call for call in calls if 'up' in call and 'bot' in call][-1])
+        self.assert_data_preserved()
 
     def test_bad_checksum_never_loads_or_stops_services(self):
         for archive in (self.assets / "v0.2.0").glob("tgchatbot-linux-*.tar.gz"):
