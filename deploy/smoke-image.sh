@@ -5,12 +5,14 @@ name=tgchatbot-smoke-$$
 trap 'docker rm -f "$name" >/dev/null 2>&1 || true; docker volume rm "$name-data" "$name-tmp" >/dev/null 2>&1 || true' EXIT
 docker volume create "$name-data" >/dev/null
 docker volume create "$name-tmp" >/dev/null
-docker run --rm --entrypoint sh -v "$name-data:/app/data" "$image" -c 'chown 12345:12345 /app/data'
+# A retained file prevents Docker from copying image-directory ownership over
+# this otherwise empty named volume when the next container mounts it.
+docker run --rm --entrypoint sh -v "$name-data:/app/data" "$image" -c 'echo retained > /app/data/retained.txt; chown 12345:12345 /app/data'
 docker run --rm -v "$name-data:/app/data" -v "$name-tmp:/tmp" "$image" python -c \
-  'import os,pwd,av,numpy,PIL,tgchatbot.app; from pathlib import Path; assert os.getuid()==12345; assert pwd.getpwuid(os.getuid()).pw_dir=="/app/data/home"; assert os.stat("/tmp").st_uid==12345; Path("/tmp/writable").write_text("ok")'
+  'import os,pwd,av,numpy,PIL,tgchatbot.app; from pathlib import Path; uid=os.getuid(); home=pwd.getpwuid(uid).pw_dir; tmp_uid=os.stat("/tmp").st_uid; assert uid==12345, f"Expected UID 12345, got {uid}"; assert home=="/app/data/home", f"Unexpected home: {home}"; assert tmp_uid==12345, f"Unexpected /tmp owner: {tmp_uid}"; assert Path("/app/data/retained.txt").read_text()=="retained\n"; Path("/tmp/writable").write_text("ok")'
 docker run --rm --entrypoint sh -v "$name-data:/app/data" "$image" -c 'chown 0:0 /app/data'
 docker run --rm -v "$name-data:/app/data" -v "$name-tmp:/tmp" "$image" python -c \
-  'import os,pwd; from pathlib import Path; assert os.getuid()==0; assert pwd.getpwuid(0).pw_dir=="/app/data/home"; assert os.stat("/tmp").st_uid==0; Path("/tmp/root-writable").write_text("ok")'
+  'import os,pwd; from pathlib import Path; uid=os.getuid(); home=pwd.getpwuid(uid).pw_dir; tmp_uid=os.stat("/tmp").st_uid; assert uid==0, f"Expected UID 0, got {uid}"; assert home=="/app/data/home", f"Unexpected home: {home}"; assert tmp_uid==0, f"Unexpected /tmp owner: {tmp_uid}"; Path("/tmp/root-writable").write_text("ok")'
 # Prove the released maintenance stack loads and computes on CPU. Networking
 # is disabled so this check cannot download OCR weights or call model APIs.
 docker run --rm --network none "$image" sh -ec '
