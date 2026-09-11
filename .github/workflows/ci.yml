@@ -30,7 +30,7 @@ jobs:
           sh -n deploy/entrypoint.sh
           bash -n deploy/smoke-image.sh
       - name: Validate Compose without reading secrets
-        run: TGCHATBOT_IMAGE=tgchatbot:ci docker compose --env-file /dev/null -f deploy/compose.yml config --quiet
+        run: docker compose --env-file /dev/null -f deploy/compose.yml config --no-env-resolution --quiet
 
   retriever:
     runs-on: ubuntu-24.04

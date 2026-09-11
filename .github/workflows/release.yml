@@ -78,11 +78,12 @@ jobs:
           RELEASE_COMMIT: ${{ github.sha }}
         run: |
           mkdir -p bundle
-          cp deploy/compose.yml deploy/update.sh deploy/README.md .env.example LICENSE bundle/
+          cp deploy/compose.yml deploy/update.sh deploy/README.md .env.example .env.full.example LICENSE bundle/
+          cp deploy/update.sh dist/update.sh
           printf '%s\n' "$RELEASE_TAG" > bundle/RELEASE_TAG
           printf '%s\n' "$RELEASE_COMMIT" > bundle/RELEASE_COMMIT
-          tar -czf "dist/tgchatbot-deploy-$RELEASE_TAG.tar.gz" -C bundle compose.yml update.sh README.md .env.example LICENSE RELEASE_TAG RELEASE_COMMIT
-          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+          tar -czf "dist/tgchatbot-deploy-$RELEASE_TAG.tar.gz" -C bundle compose.yml update.sh README.md .env.example .env.full.example LICENSE RELEASE_TAG RELEASE_COMMIT
+          (cd dist && sha256sum *.tar.gz update.sh > SHA256SUMS)
       - name: Publish immutable exact-tag assets
         env:
           GH_TOKEN: ${{ github.token }}

@@ -22,4 +22,9 @@ sticker-retriever
 
 # Isolated unittest temporary state, created within the checkout.
 /tests/fixture-*/
+/tests/deploy-test-*/
 /tests/tmp*/
+
+# Local deployment scratch and recovery copies.
+tmp/
+backups/

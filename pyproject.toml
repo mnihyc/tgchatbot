@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tgchatbot"
-version = "0.1.1"
+version = "0.1.2"
 description = "Persistent Telegram assistant with switchable model providers"
 requires-python = ">=3.12,<3.14"
 license = "Apache-2.0"
@@ -21,6 +21,11 @@ dependencies = [
 
 [project.scripts]
 tgchatbot = "tgchatbot.app:main"
+
+[dependency-groups]
+# Release maintenance tools use CPU OCR; ordinary bot development/CI can omit it.
+# These versions provide CPython 3.12 wheels for both published architectures.
+indexing = ["paddleocr==3.2.0", "paddlepaddle==3.2.1"]
 
 [tool.setuptools.packages.find]
 include = ["tgchatbot*"]

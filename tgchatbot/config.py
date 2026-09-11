@@ -187,6 +187,7 @@ class ContextConfig:
 @dataclass(frozen=True)
 class AppConfig:
     data_dir: Path
+    temp_dir: Path
     log_level: str
     default_provider: str
     default_chat_mode: str
@@ -220,7 +221,7 @@ class AppConfig:
 
     @property
     def artifact_dir(self) -> Path:
-        return self.data_dir / "artifacts"
+        return self.temp_dir / "artifacts"
 
     @property
     def sticker_dir(self) -> Path:
@@ -304,6 +305,9 @@ class AppConfig:
 def load_config(*, require_telegram: bool = True) -> AppConfig:
     data_dir = Path(os.getenv("APP_DATA_DIR", "./data")).expanduser().resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
+    # Source runs keep scratch files beside retained data; Docker overrides this
+    # with /tmp, backed by the deployment's disposable tmp/bot directory.
+    temp_dir = Path(os.getenv('APP_TEMP_DIR', '').strip() or data_dir.parent / 'tmp' / 'bot').expanduser().resolve()
 
     token = os.getenv("TGBOT_TOKEN", "").strip()
     if require_telegram and not token:
@@ -320,6 +324,7 @@ def load_config(*, require_telegram: bool = True) -> AppConfig:
 
     return AppConfig(
         data_dir=data_dir,
+        temp_dir=temp_dir,
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         default_provider=default_provider,
         chat_completions=chat_completions,

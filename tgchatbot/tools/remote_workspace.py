@@ -41,7 +41,7 @@ class RemoteWorkspaceClient:
         self._master_lock = asyncio.Lock()
         self._master_started = False
         digest = hashlib.sha1(f"{self.ssh.host}:{self.ssh.port}".encode('utf-8')).hexdigest()[:12] if self.ssh.host else 'disabled'
-        self._control_dir = self.config.data_dir / 'ssh_mux'
+        self._control_dir = self.config.temp_dir / 'ssh_mux'
         self._control_dir.mkdir(parents=True, exist_ok=True)
         with contextlib.suppress(PermissionError, FileNotFoundError):
             self._control_dir.chmod(0o700)
