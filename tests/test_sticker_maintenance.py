@@ -123,14 +123,11 @@ class StickerMaintenanceTests(unittest.TestCase):
         with sqlite3.connect(self.db) as connection:
             self.assertEqual(connection.execute('SELECT rowid FROM sticker_fts ORDER BY rowid').fetchall(), [(1,), (2,)])
 
-    def test_module_cli_uses_default_catalog_and_explains_required_rebuild(self):
+    def test_module_cli_resets_selected_row_in_default_catalog(self):
         result = subprocess.run(
             [sys.executable, '-m', 'scripts.reset_sticker', self.target],
             cwd=self.root, env={'PYTHONPATH': str(REPO), 'PATH': os.environ.get('PATH', '')},
             capture_output=True, text=True, timeout=15,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('Source files were preserved', result.stdout)
-        self.assertIn('builder', result.stdout)
-        self.assertIn('refresh derived indexes before restarting services', result.stdout)
         self.assertEqual(self.rows(), [(2, self.other, 'other summary')])

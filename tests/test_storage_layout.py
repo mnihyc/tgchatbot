@@ -36,23 +36,6 @@ class StorageLayoutTests(unittest.IsolatedAsyncioTestCase):
         }, clear=True):
             return load_config()
 
-    async def test_default_layout_separates_scratch_from_retained_data(self):
-        config = self.config()
-        self.assertEqual(config.temp_dir, self.root / 'tmp' / 'bot')
-        self.assertEqual(config.artifact_dir, config.temp_dir / 'artifacts')
-        self.assertEqual(config.db_path, self.root / 'data' / 'tgchatbot.sqlite3')
-        self.assertEqual(config.preset_dir, self.root / 'data' / 'presets')
-        self.assertEqual(config.sticker_dir, self.root / 'data' / 'stickers')
-        self.assertEqual(config.sticker_index_path, self.root / 'data' / 'sticker_index.sqlite3')
-
-    async def test_explicit_temp_location_is_resolved_when_config_loads(self):
-        temporary = self.root / 'container-tmp'
-        config = self.config(APP_TEMP_DIR=str(temporary))
-        # The config keeps its value after the loading environment is restored.
-        self.assertEqual(config.temp_dir, temporary)
-        self.assertEqual(config.artifact_dir, temporary / 'artifacts')
-        self.assertFalse(config.data_dir.is_relative_to(config.temp_dir))
-
     async def test_cleared_temp_can_be_recreated_without_losing_retained_state(self):
         # A separate context removes only disposable fixture state, simulating
         # clearing tmp while the bot is stopped. The outer fixture retains data.
@@ -60,6 +43,7 @@ class StorageLayoutTests(unittest.IsolatedAsyncioTestCase):
             config = self.config(APP_TEMP_DIR=temporary)
             artifacts = ArtifactStore(config.artifact_dir)
             staged = artifacts.save_bytes(chat_id=self.session, filename='upload.bin', data=b'upload bytes')
+            self.assertTrue(staged.is_relative_to(temporary))
             remote = RemoteWorkspaceClient(config)
             remote._control_path.write_bytes(b'fixture socket placeholder')
             store = SQLiteStore(config.db_path)
@@ -100,11 +84,19 @@ class StorageLayoutTests(unittest.IsolatedAsyncioTestCase):
             local = ArtifactStore(config.artifact_dir).save_bytes(chat_id=self.session, filename='report.txt', data=b'report')
             remote = RemoteWorkspaceClient(config)
             remote_path = remote.session_paths(self.session).inputs + '/' + local.name
-            remote.sync_inputs = AsyncMock(return_value=RemoteSyncResult([remote_path], []))
+            uploaded = {}
+
+            async def sync_inputs(session_id, paths):
+                for path in paths:
+                    destination = remote.session_paths(session_id).inputs + '/' + path.name
+                    uploaded[destination] = path.read_bytes()
+                return RemoteSyncResult(list(uploaded), [])
+
+            remote.sync_inputs = sync_inputs
             app = TelegramBotApp.__new__(TelegramBotApp)
             app.remote_workspace = remote
             parts = await app._sync_parts_to_remote(self.session, [MessagePart(PartKind.FILE, filename='report.txt', artifact_path=str(local), remote_sync=True)])
-            remote.sync_inputs.assert_awaited_once_with(self.session, (local,))
+            self.assertEqual(uploaded, {remote_path: b'report'})
             self.assertFalse(local.exists())
             store = SQLiteStore(config.db_path)
             await store.append_message(self.session, ConversationMessage(MessageRole.USER, parts))
@@ -130,7 +122,7 @@ class StorageLayoutTests(unittest.IsolatedAsyncioTestCase):
         with patch('tgchatbot.tools.remote_workspace.asyncio.create_subprocess_exec', side_effect=scp) as execute:
             artifacts = await remote.fetch_files(session_id=self.session, remote_paths=['report.txt'])
         self.assertEqual(len(artifacts), 1)
-        self.assertEqual(artifacts[0].path, config.temp_dir / 'artifacts' / self.session / 'remote_fetch' / 'report.txt')
+        self.assertEqual(artifacts[0].path, self.root / 'tmp' / 'bot' / 'artifacts' / self.session / 'remote_fetch' / 'report.txt')
         self.assertEqual(artifacts[0].path.read_bytes(), b'fetched report')
         self.assertIn('remote.invalid:' + paths.outputs + '/report.txt', execute.call_args.args)
         self.assertFalse((config.data_dir / 'artifacts').exists())

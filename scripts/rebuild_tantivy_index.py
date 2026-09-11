@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description='Build or rebuild the Tantivy lexical index from tantivy_docs.jsonl.')
+    parser = argparse.ArgumentParser(description='Rebuild the Tantivy lexical index offline. Stop the retriever before replacing its index.')
     parser.add_argument('--repo-root', default='.', help='Source checkout used only with --build-from-source.')
     parser.add_argument('--build-from-source', action='store_true', help='Developer option: compile the retriever with locked Cargo dependencies.')
     parser.add_argument('--docs-jsonl', default='./data/tantivy_docs.jsonl')
@@ -30,7 +32,35 @@ def main() -> None:
         if binary is None:
             raise RuntimeError('sticker-retriever is not on PATH. Run this tool in the release image, or use --build-from-source in a source checkout.')
         command = [binary]
-    subprocess.run(command + ['build', '--docs-jsonl', str(docs_jsonl), '--index-dir', str(index_dir)], check=True)
+    index_dir.parent.mkdir(parents=True, exist_ok=True)
+    # A sibling stays on the same filesystem so directory promotion uses rename.
+    # Build errors never touch the previous index, even after partial indexing.
+    staging = Path(tempfile.mkdtemp(prefix=f'.{index_dir.name}.build-', dir=index_dir.parent))
+    previous = None
+    try:
+        subprocess.run(command + ['build', '--docs-jsonl', str(docs_jsonl), '--index-dir', str(staging)], check=True)
+        metadata = json.loads((staging / 'meta.json').read_text())
+        if not isinstance(metadata, dict) or not isinstance(metadata.get('schema'), list) or not isinstance(metadata.get('segments'), list):
+            raise RuntimeError('Retriever did not produce valid index metadata; the previous index is unchanged.')
+        if index_dir.exists():
+            previous = Path(tempfile.mkdtemp(prefix=f'.{index_dir.name}.previous-', dir=index_dir.parent))
+            # rename replaces this empty reserved directory, without a name race.
+            try:
+                index_dir.rename(previous)
+            except BaseException:
+                previous.rmdir()
+                raise
+        try:
+            staging.rename(index_dir)
+        except BaseException:
+            if previous is not None:
+                previous.rename(index_dir)
+            raise
+        if previous is not None:
+            shutil.rmtree(previous)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
 
 
 if __name__ == '__main__':

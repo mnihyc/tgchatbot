@@ -1240,6 +1240,14 @@ def main() -> None:
         max_in_flight=max_in_flight,
         worker_max_tasks=args.worker_max_tasks,
     )
+    if build_stats['failed']:
+        # Successful rows have already been committed for resume. Do not publish
+        # a partial set of derived indexes or let maintenance continue as success.
+        con.close()
+        raise RuntimeError(
+            f"Sticker analysis failed for {build_stats['failed']} sticker(s). Completed rows were saved; "
+            f"rerun without --rebuild to resume. See {failures_log_path} for failures."
+        )
 
     built_rows = _load_all_built_rows(con)
     style_matrix, vocab = _style_vectors(built_rows)
@@ -1299,8 +1307,6 @@ def main() -> None:
     else:
         print('Embeddings disabled; this index uses lexical search.')
     print(f'Wrote validation report to {validation_report_path}')
-    if build_stats['failed']:
-        print(f'Logged per-sticker failures to {failures_log_path}')
 
 
 if __name__ == '__main__':

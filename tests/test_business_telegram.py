@@ -35,33 +35,34 @@ class TelegramWorkflowTests(BusinessTestCase):
     def candidate(self, number=1, spontaneous=False):
         return ReplyCandidate(number, "tester", self.message, spontaneous=spontaneous)
 
-    async def test_whitelist_and_trusted_controls_are_separate(self):
-        self.telegram_config(whitelist=("100",), control_uids=("8",))
-        self.assertTrue(self.app._command_allowed(self.update))
-        self.assertFalse(self.app._advanced_allowed(self.update))
-        self.update.effective_user.id = 8
-        self.assertTrue(self.app._advanced_allowed(self.update))
-        self.chat.id = 200
-        self.assertFalse(self.app._command_allowed(self.update))
-        self.assertFalse(self.app._advanced_allowed(self.update))
-
-    async def test_empty_whitelists_preserve_open_legacy_behavior(self):
-        self.telegram_config(whitelist=(), control_uids=())
-        self.assertTrue(self.app._allowed(self.chat))
-        self.assertTrue(self.app._advanced_allowed(self.update))
-
-    async def test_denied_chat_cannot_change_session_mode(self):
-        self.telegram_config(whitelist=("200",))
+    async def test_mode_command_obeys_chat_access_independently_of_trusted_users(self):
+        self.telegram_config(whitelist=("200",), control_uids=("7",))
         self.context.args = ["agent"]
         await self.app.mode_command(self.update, self.context)
         self.assertEqual(await self.store.count_sessions(), 0)
-        self.message.reply_text.assert_not_awaited()
 
-    async def test_untrusted_user_cannot_change_advanced_parameters(self):
-        self.telegram_config(control_uids=("8",))
-        self.context.args = ["provider_retry_count", "9"]
-        await self.app.param_command(self.update, self.context)
-        self.assertIsNone((await self.settings()).provider_retry_count)
+        for whitelist, controls in [(("100",), ("8",)), ((), ())]:
+            with self.subTest(whitelist=whitelist, controls=controls):
+                await self.settings(mode=ChatMode.CHAT)
+                self.telegram_config(whitelist=whitelist, control_uids=controls)
+                await self.app.mode_command(self.update, self.context)
+                self.assertEqual((await self.settings()).mode, ChatMode.AGENT)
+
+    async def test_advanced_parameter_changes_require_both_chat_and_user_access(self):
+        self.context.args = ["provider_retry_count", "2"]
+        cases = [
+            (("100",), ("8",), 7, False),
+            (("100",), ("8",), 8, True),
+            (("200",), ("8",), 8, False),
+            ((), (), 7, True),
+        ]
+        for whitelist, controls, user_id, allowed in cases:
+            with self.subTest(whitelist=whitelist, controls=controls, user_id=user_id):
+                await self.settings(provider_retry_count=0)
+                self.telegram_config(whitelist=whitelist, control_uids=controls)
+                self.update.effective_user.id = user_id
+                await self.app.param_command(self.update, self.context)
+                self.assertEqual((await self.settings()).provider_retry_count, 2 if allowed else 0)
 
     async def test_group_keyword_and_bot_reply_trigger_but_ignore_wins(self):
         self.telegram_config(keywords=("helper",), ignore_keywords=("quiet",))

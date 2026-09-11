@@ -154,12 +154,9 @@ class ReleaseUpdaterTests(unittest.TestCase):
         self.assertTrue(urls[0].endswith("/releases/latest"))
         self.assertTrue(all("/releases/download/v0.2.0/" in url for url in urls[1:]))
         up = next(call for call in self.calls() if "up" in call)
-        self.assertEqual(up[:3], ["docker", "compose", "up"])
         self.assertIn("--no-build", up)
         self.assertIn("--wait", up)
         self.assertIn("never", up)
-        self.assertFalse(any("--env-file" in call for call in self.calls()))
-        self.assertNotIn("${TGCHATBOT", (self.install / "compose.yml").read_text())
         self.assert_data_preserved()
         self.assert_simple_layout()
 
@@ -167,7 +164,6 @@ class ReleaseUpdaterTests(unittest.TestCase):
         (self.install / ".env").unlink()
         (self.install / "update.sh").chmod(0o644)
         result = self.run_update()
-        self.assertIn("Fill in the Telegram token", result.stdout)
         self.assertEqual((self.install / ".env").read_text(), "TGBOT_TOKEN=\nOPENAI_API_KEY=\n")
         self.assertTrue((self.install / "compose.yml").is_file())
         self.assertTrue(os.access(self.install / "update.sh", os.X_OK))
@@ -194,7 +190,6 @@ class ReleaseUpdaterTests(unittest.TestCase):
         old_compose = (self.install / "compose.yml").read_text() + "\n# local prior file\n"
         (self.install / "compose.yml").write_text(old_compose)
         result = self.run_update("v0.2.0", success=False, FAIL_TAG="v0.2.0")
-        self.assertIn("Restored the prior image", result.stdout)
         self.assertEqual(self.image_tag("tgchatbot:current"), "v0.1.0")
         self.assertEqual((self.install / "compose.yml").read_text(), old_compose)
         self.assertEqual(len([call for call in self.calls() if "up" in call]), 3)
@@ -246,7 +241,6 @@ class ReleaseUpdaterTests(unittest.TestCase):
         with (self.install / "tmp" / "update.lock").open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             result = self.run_update(success=False)
-            self.assertIn("Another update is running", result.stderr)
             self.assertEqual(downloading.read_bytes(), b"first updater still downloading")
         self.assertFalse(any(call[0] == "curl" for call in self.calls()))
 

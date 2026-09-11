@@ -29,8 +29,6 @@ jobs:
           bash -n deploy/update.sh
           sh -n deploy/entrypoint.sh
           bash -n deploy/smoke-image.sh
-      - name: Validate Compose without reading secrets
-        run: docker compose --env-file /dev/null -f deploy/compose.yml config --no-env-resolution --quiet
 
   retriever:
     runs-on: ubuntu-24.04

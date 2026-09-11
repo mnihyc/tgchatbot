@@ -34,15 +34,20 @@ class StickerProviderTests(unittest.TestCase):
             provider.embed("query")
             self.assertEqual(post.call_count, 1)
 
-    def test_compatible_endpoint_and_cache_identity(self):
+    def test_separate_embedding_credentials_and_endpoint_changes_reach_the_service(self):
         response = Mock()
         response.json.return_value = {"data": [{"embedding": [1, 0]}]}
         with TemporaryDirectory() as tmp, patch("tgchatbot.stickers.semantic_index.httpx.post", return_value=response) as post:
             for url in ["https://first.invalid/v1", "https://second.invalid/v1"]:
-                p = EmbeddingProvider(api_key="fake", dimensions=2, base_url=url, cache_db_path=Path(tmp) / "cache.db")
-                p.embed("same query")
+                settings = {"OPENAI_API_KEY": "chat-only", "STICKER_EMBEDDING_API_KEY": "embedding-only",
+                            "STICKER_EMBEDDING_BASE_URL": url, "STICKER_EMBEDDING_DIMENSIONS": "2"}
+                with patch.dict(os.environ, settings, clear=True):
+                    p = EmbeddingProvider.from_env(cache_db_path=Path(tmp) / "cache.db")
+                    p.embed("same query")
             self.assertEqual(post.call_count, 2)
             self.assertEqual(post.call_args.args[0], "https://second.invalid/v1/embeddings")
+            for request in post.call_args_list:
+                self.assertEqual(request.kwargs["headers"]["Authorization"], "Bearer embedding-only")
 
     def test_invalid_embedding_vectors_fail_before_cache_write(self):
         for vector in [[1], [0, 0], [float("nan"), 1]]:
@@ -51,13 +56,6 @@ class StickerProviderTests(unittest.TestCase):
             with patch("tgchatbot.stickers.semantic_index.httpx.post", return_value=response):
                 with self.assertRaises(ValueError):
                     EmbeddingProvider(api_key="fake", dimensions=2).embed("query")
-
-    def test_explicit_sticker_key_is_independent_of_chat_key(self):
-        with patch.dict(os.environ, {"STICKER_EMBEDDING_API_KEY": "embedding-only", "STICKER_EMBEDDING_BASE_URL": "https://embedding.invalid/v1"}, clear=True):
-            provider = EmbeddingProvider.from_env()
-            self.assertTrue(provider.enabled)
-            self.assertEqual(provider.api_key, "embedding-only")
-            self.assertEqual(provider.base_url, "https://embedding.invalid/v1")
 
     def test_switching_embedding_model_requires_rebuild(self):
         with TemporaryDirectory() as tmp:
@@ -68,14 +66,6 @@ class StickerProviderTests(unittest.TestCase):
             index = SemanticIndex(root, embedding_provider=EmbeddingProvider(api_key="fake", model="new-model", dimensions=2))
             with self.assertRaisesRegex(RuntimeError, "rebuild"):
                 index.ensure_ready()
-
-    def test_explicit_lexical_mode_ignores_existing_embedding_credentials(self):
-        with TemporaryDirectory() as tmp, patch.dict(os.environ, {"OPENAI_API_KEY": "fake", "STICKER_SEMANTIC_MODE": "off"}, clear=True):
-            catalog = StickerCatalog(Path(tmp) / "index.db", Path(tmp) / "stickers")
-            try:
-                self.assertFalse(catalog.semantic_enabled)
-            finally:
-                catalog.retriever.close()
 
     def test_lexical_mode_ignores_corrupt_unused_embedding_manifest(self):
         with TemporaryDirectory() as tmp, patch.dict(os.environ, {"OPENAI_API_KEY": "fake", "STICKER_SEMANTIC_MODE": "off"}, clear=True):

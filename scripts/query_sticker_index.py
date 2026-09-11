@@ -37,9 +37,6 @@ def main() -> None:
     args = parser.parse_args()
 
     retriever_url = os.getenv('STICKER_RETRIEVER_URL', 'http://127.0.0.1:4107')
-    if not os.getenv('OPENAI_API_KEY'):
-        raise RuntimeError('OPENAI_API_KEY is required for live query embeddings.')
-
     os.environ.setdefault('STICKER_RETRIEVER_URL', retriever_url)
     catalog = StickerCatalog(Path(args.index_db).expanduser().resolve(), Path(args.stickers_dir).expanduser().resolve())
     catalog.load()

@@ -40,28 +40,67 @@ import subprocess
 import time
 import urllib.request
 
-# Search a real indexed fixture; this catches tokenizer/schema/linking defects
-# that an empty-index health probe cannot find.
+# Exercise the released Python CLI against the real indexer and HTTP server.
 docs = Path('/tmp/fixture-docs.jsonl')
-docs.write_text(json.dumps({'sticker_id': 'fixture-wave', 'source_overlay_text_normalized': 'hello',
-                           'caption_semantic_text': 'hello wave', 'sticker_semantic_text': 'friendly greeting'}) + '\n')
-subprocess.run(['sticker-retriever', 'build', '--docs-jsonl', str(docs), '--index-dir', '/tmp/fixture-index'], check=True)
-server = subprocess.Popen(['sticker-retriever', 'serve', '--index-dir', '/tmp/fixture-index', '--port', '4108'])
-try:
+index = Path('/tmp/fixture-index')
+command = ['python', '/app/scripts/rebuild_tantivy_index.py', '--docs-jsonl', str(docs), '--index-dir', str(index)]
+
+def document(sticker_id, text):
+    return json.dumps({'sticker_id': sticker_id, 'source_overlay_text_normalized': text,
+                      'caption_semantic_text': text, 'sticker_semantic_text': text}) + '\n'
+
+def serve():
+    process = subprocess.Popen(['sticker-retriever', 'serve', '--index-dir', str(index), '--port', '4108'])
     for attempt in range(30):
         try:
             urllib.request.urlopen('http://127.0.0.1:4108/health', timeout=1).close()
-            break
+            return process
         except OSError:
             time.sleep(0.1)
+    process.terminate()
+    process.wait(timeout=5)
+    raise AssertionError('Fixture retriever did not start')
+
+def search(text):
     request = urllib.request.Request('http://127.0.0.1:4108/search',
-        data=json.dumps({'caption_query_text': 'hello', 'sticker_query_text': 'friendly'}).encode(),
+        data=json.dumps({'caption_query_text': text, 'sticker_query_text': text}).encode(),
         headers={'Content-Type': 'application/json'})
-    result = json.load(urllib.request.urlopen(request, timeout=3))
-    assert any(hit['sticker_id'] == 'fixture-wave' for hit in result['hits']), result
+    return [hit['sticker_id'] for hit in json.load(urllib.request.urlopen(request, timeout=3))['hits']]
+
+docs.write_text(document('fixture-old', 'oldonly'))
+subprocess.run(command, check=True)
+server = serve()
+try:
+    assert search('oldonly') == ['fixture-old']
 finally:
     server.terminate()
     server.wait(timeout=5)
+
+# Rebuild an existing index offline; old documents must disappear.
+replacement = document('fixture-new', 'newonly')
+docs.write_text(replacement)
+subprocess.run(command, check=True)
+server = serve()
+try:
+    assert search('newonly') == ['fixture-new']
+    assert search('oldonly') == []
+finally:
+    server.terminate()
+    server.wait(timeout=5)
+
+# A failed offline rebuild must preserve an index that a fresh server can open.
+docs.write_text('{malformed JSON\n')
+failed = subprocess.run(command, capture_output=True, text=True)
+assert failed.returncode != 0, 'Malformed documents unexpectedly rebuilt the index'
+server = serve()
+try:
+    assert search('newonly') == ['fixture-new'], 'Failed rebuild damaged the working index'
+    assert search('oldonly') == []
+    assert not list(index.parent.glob('.fixture-index.*')), 'Rebuild left staging/backup debris'
+finally:
+    server.terminate()
+    server.wait(timeout=5)
+    docs.write_text(replacement)
 PY
     # Restart with changed source documents: an already-created index must be
     # reused, never silently rebuilt during normal container startup.
