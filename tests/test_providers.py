@@ -274,7 +274,7 @@ class StickerAnalysisContractTests(unittest.TestCase):
     def test_no_embeddings_build_records_disabled_manifest_and_does_not_call_embedding_api(self):
         from scripts import build_sticker_index
         argv = ['build_sticker_index.py', '--stickers-dir', self.directory.name, '--index-db', str(Path(self.directory.name) / 'index.sqlite3'), '--no-embeddings', '--workers', '1']
-        with patch('sys.argv', argv), patch.object(build_sticker_index, 'load_dotenv', return_value=False), patch.object(build_sticker_index, 'PaddleOCR', object()), patch.object(build_sticker_index, 'StickerAnalysisClient'), patch.object(build_sticker_index, '_build_rows_parallel', return_value={'ok': 0, 'skipped': 0, 'failed': 0}), patch.object(build_sticker_index.EmbeddingProvider, 'from_env') as embedding, patch('builtins.print'):
+        with patch('sys.argv', argv), patch.object(build_sticker_index, 'PaddleOCR', object()), patch.object(build_sticker_index, 'StickerAnalysisClient'), patch.object(build_sticker_index, '_build_rows_parallel', return_value={'ok': 0, 'skipped': 0, 'failed': 0}), patch.object(build_sticker_index.EmbeddingProvider, 'from_env') as embedding, patch('builtins.print'):
             build_sticker_index.main()
         embedding.assert_not_called()
         manifest = json.loads((Path(self.directory.name) / 'embeddings_manifest.json').read_text())

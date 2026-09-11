@@ -11,5 +11,7 @@
 !retriever/src/**
 !scripts/
 !scripts/**
+!deploy/
+!deploy/entrypoint.sh
 **/__pycache__
 **/*.pyc

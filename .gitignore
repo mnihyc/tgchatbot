@@ -25,9 +25,6 @@ sticker-retriever
 /tests/deploy-test-*/
 /tests/tmp*/
 
-# Private development examples, recovery copies, and transfer archive.
+# Local deployment scratch and recovery copies.
 tmp/
 backups/
-
-/updated.zip
-/.ignore

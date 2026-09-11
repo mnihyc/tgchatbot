@@ -26,9 +26,9 @@ jobs:
         run: uv run --frozen python -m unittest discover -s tests -v
       - name: Check deployment shell syntax
         run: |
-          bash -n .github/release/update.sh
-          sh -n scripts/docker-entrypoint.sh
-          bash -n scripts/smoke-image.sh
+          bash -n deploy/update.sh
+          sh -n deploy/entrypoint.sh
+          bash -n deploy/smoke-image.sh
 
   retriever:
     runs-on: ubuntu-24.04
