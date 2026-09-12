@@ -20,9 +20,10 @@ class FileSendTool:
         self.spec = ToolSpec(
             name='file_send',
             description=(
-                'Send files from the remote session workspace directly to the user in chat. '
-                'Prefer absolute paths when the file is known; otherwise, it is resolved relative to the scope. '
-                'This tool does not feed file contents back into the model.'
+                'Prepare selected workspace files for delivery to this chat. '
+                'Paths resolve within the requested inputs, outputs or workspace scope; known workspace absolute paths are accepted. '
+                'This returns file and delivery status, not file contents for analysis. '
+                'Wait for a confirmed delivery result before saying the files were sent.'
             ),
             parameters_schema={
                 'type': 'object',

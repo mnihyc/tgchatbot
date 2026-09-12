@@ -18,9 +18,11 @@ class ShellExecTool:
         self.spec = ToolSpec(
             name='shell_exec',
             description=(
-                'Run shell commands in the persistent remote container workspace for this chat. '
-                'Use it for package installs, file inspection, archive handling, CLI tools, and short workspace orchestration. '
-                'Return the useful command output in stdout or stderr instead of trying to send files back through the tool call.'
+                'Run POSIX sh commands in this chat\'s persistent remote workspace for file inspection and command-line tasks. '
+                'The working directory is the session root unless cwd_subdir is supplied. '
+                'Successfully mirrored uploads are in TGCHATBOT_INPUT_DIR; TGCHATBOT_OUTPUT_DIR holds outputs, '
+                'and TGCHATBOT_SESSION_DIR is the root. Files may change after edits. '
+                'Inspect stdout, stderr and returncode; use file_send for files the user should receive.'
             ),
             parameters_schema={
                 'type': 'object',

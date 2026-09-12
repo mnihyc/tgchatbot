@@ -6,7 +6,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 
-from tgchatbot.domain.models import ConversationMessage, MessagePart, PartKind
+from tgchatbot.domain.models import ConversationMessage, MessagePart, MessageRole, PartKind
 
 
 def utc_time(value: Any) -> str | None:
@@ -83,7 +83,10 @@ def attribution(message: ConversationMessage, *, message_id: int | None = None) 
 
 
 def attributed_message(message: ConversationMessage, *, message_id: int | None = None) -> ConversationMessage:
-    if not message.metadata.get('source'):
+    # The assistant role already identifies our own output. Adding transport
+    # labels there teaches an output format the agent should never generate.
+    # Incoming peers (including other bots) use USER and retain attribution.
+    if message.role == MessageRole.ASSISTANT or not message.metadata.get('source'):
         return message
     label = json.dumps(attribution(message, message_id=message_id), ensure_ascii=False, default=str)
     return replace(message, parts=[MessagePart(kind=PartKind.TEXT,

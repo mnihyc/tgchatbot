@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+
+import httpx
 
 from tests.business_helpers import BusinessTestCase, ScriptedProvider
 from tgchatbot.core.memory import MemoryService
 from tgchatbot.core.runtime import AgentRuntime, CompactionModelRequestFailed
+from tgchatbot.providers.gemini import GeminiProvider
 from tgchatbot.storage.previews import PreviewCache
 from tgchatbot.domain.models import (
     ChatMode, ConversationMessage, MessagePart, MessageRole, PartKind,
@@ -43,6 +47,76 @@ class RuntimeWorkflowTests(BusinessTestCase):
         self.assertEqual(text_of(second.requests[0]["messages"]), "hello\nfirst answer\ncontinue")
         self.assertEqual(second.requests[0]["settings"].model, "chosen-model")
         self.assertIn("Keep this voice.", second.requests[0]["instructions"])
+
+    async def test_own_reply_replays_verbatim_but_peer_bot_keeps_attribution_after_restart(self):
+        settings = await self.settings(provider='gemini', model='gemini-3.8-flash',
+            tool_history_mode=ToolHistoryMode.TRANSLATED)
+        wire = []
+
+        def handler(request):
+            wire.append(json.loads(request.content))
+            return httpx.Response(200, json={'candidates': [{'content': {
+                'role': 'model', 'parts': [{'text': 'Continuation.'}]}}]})
+
+        provider = GeminiProvider(replace(self.config.gemini, api_key='synthetic-key'))
+        provider._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        self.addAsyncCleanup(provider.aclose)
+        self.runtime.providers['gemini'] = provider
+        peer = await self.runtime.ingest_user_message(session_id=self.session,
+            incoming_message=ConversationMessage.user_text('The train leaves at eleven.', metadata={
+                'source': 'telegram', 'source_chat_id': '100', 'source_message_id': '81',
+                'actor_id': 'telegram:user:888', 'actor_kind': 'bot', 'actor_name': 'Helper'}))
+        own_text = 'I can wait until eleven.'
+        native = [{'role': 'model', 'parts': [{'text': own_text, 'thoughtSignature': 'fixture-signature'}]}]
+        own = await self.runtime.record_assistant_text(session_id=self.session, text=own_text, metadata={
+            'source': 'telegram', 'source_chat_id': '100', 'source_message_id': '82',
+            'actor_id': 'telegram:user:999', 'actor_kind': 'bot', 'actor_name': 'Helper',
+            'sent_at': '2026-01-02T03:04:05+00:00', 'topic_id': '77',
+            'reply_to_source_id': '81', 'reply_to_source_chat_id': '100',
+            'provider_native': {'provider': 'gemini', 'model': settings.model, 'items': native}})
+        original_rows = await self.store.read_messages(self.session, [peer.db_id, own.db_id])
+
+        for text in ('Continue.', 'Continue again.'):
+            latest = await self.runtime.ingest_user_message(session_id=self.session,
+                incoming_message=ConversationMessage.user_text(text))
+            await self.runtime.run_turn_from_stored(session_id=self.session,
+                user_display_name='Participant', trigger_message_id=latest.db_id)
+        self.assertEqual(wire[1]['contents'][:len(wire[0]['contents'])], wire[0]['contents'])
+        for payload in wire:
+            self.assertEqual([item for item in payload['contents'] if item['role'] == 'model'],
+                [{'role': 'model', 'parts': [{'text': own_text}]}])
+            peer_turn = next(item for item in payload['contents']
+                if any(part.get('text') == 'The train leaves at eleven.' for part in item['parts']))
+            self.assertEqual(peer_turn['role'], 'user')
+            self.assertIn('telegram:user:888', json.dumps(peer_turn))
+            self.assertIn('"actor_kind": "bot"', '\n'.join(part.get('text', '') for part in peer_turn['parts']))
+
+        await self.store.close()
+        restarted_store = await self.new_store()
+        memory = MemoryService(restarted_store, SimpleNamespace(enabled=False))
+        restarted = AgentRuntime(config=self.config, store=restarted_store, tool_registry=self.tools,
+            providers={'gemini': provider}, memory=memory)
+        await restarted.run_turn_from_stored(session_id=self.session,
+            user_display_name='Participant', trigger_message_id=latest.db_id)
+        self.assertEqual(wire[2]['contents'], wire[1]['contents'])
+        rows = await restarted_store.read_messages(self.session, [peer.db_id, own.db_id])
+        # Source reads omit replay-only metadata; native continuity is checked
+        # separately below through the actual post-restart provider request.
+        self.assertEqual([row.message for row in rows], [row.message for row in original_rows])
+        recalled = {item['message_id']: item for item in
+            (await memory.read(self.session, [peer.db_id, own.db_id]))['messages']}
+        self.assertEqual(recalled[own.db_id]['text'], own_text)
+        self.assertEqual(recalled[own.db_id]['actor_id'], 'telegram:user:999')
+        self.assertEqual(recalled[own.db_id]['reply_to_source_id'], '81')
+        self.assertEqual(recalled[own.db_id]['sent_at'], '2026-01-02T03:04:05+00:00')
+        self.assertEqual(recalled[own.db_id]['topic_id'], '77')
+        self.assertEqual(recalled[peer.db_id]['actor_id'], 'telegram:user:888')
+
+        settings.tool_history_mode = ToolHistoryMode.NATIVE_SAME_PROVIDER
+        await restarted_store.save_session(self.session, settings)
+        await restarted.run_turn_from_stored(session_id=self.session,
+            user_display_name='Participant', trigger_message_id=latest.db_id)
+        self.assertEqual([item for item in wire[3]['contents'] if item['role'] == 'model'], native)
 
     async def test_retry_recovers_without_duplicate_ingestion(self):
         await self.settings(provider_retry_count=1)
@@ -83,6 +157,12 @@ class RuntimeWorkflowTests(BusinessTestCase):
         self.provider.responses = [ProviderResponse(final_text="hello")]
         await self.turn()
         self.assertEqual(self.provider.requests[0]["instructions"], "Speak as the fixture character.")
+
+    async def test_empty_turn_without_a_sticker_keeps_the_existing_fallback(self):
+        self.provider.responses = [ProviderResponse(final_text='')]
+        result = await self.turn()
+        self.assertEqual(result.text, '(empty response)')
+        self.assertEqual(result.stickers, [])
 
     async def test_chat_mode_never_executes_unsolicited_tools(self):
         self.provider.responses = [ProviderResponse(tool_calls=[ToolCall("shell_exec", "c1", {})]), ProviderResponse(final_text="done")]

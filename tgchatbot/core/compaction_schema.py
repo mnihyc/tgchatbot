@@ -50,7 +50,7 @@ class EpisodeMemoryBlock(_CompactionModel):
 
 class DigestMemoryBlock(_CompactionModel):
     scope: str = Field(description='One concise sentence naming what earlier shard this digest reconciles and why it still matters now.')
-    interaction_modes_seen: list[InteractionMode] = Field(description='Interaction modes that appear across the parent episodes, in rough importance order without duplicates.')
+    interaction_modes_seen: list[InteractionMode] = Field(description='Interaction modes that appear across the parent episode or digest blocks, in rough importance order without duplicates.')
     participants: list[str] = Field(description='Only people or systems that remain materially relevant across the shard.')
     topics: list[str] = Field(description='2 to 6 short retrieval-oriented labels for this digest shard.')
     user_profile: list[str] = Field(description='Only durable user preferences, stable environment facts, recurring constraints, or habits that still matter across the shard.')
@@ -62,7 +62,7 @@ class DigestMemoryBlock(_CompactionModel):
     open_loops: list[str] = Field(description='Important unresolved items that still matter after reconciliation.')
     artifacts: list[str] = Field(description='Retrieval-worthy files, repos, URLs, tools, commands, environments, or exact error identifiers.')
     uncertainties: list[str] = Field(description='Ambiguities, conflicts, or evidence gaps that remain after reconciliation.')
-    parent_refs: list[str] = Field(description='Parent episode block refs such as L1#12. Keep chronological order.')
+    parent_refs: list[str] = Field(description='Supplied parent episode or digest block refs, such as L1#12 or L2#13. Keep chronological order.')
 
 
 _COMPACTION_MODELS: dict[str, type[_CompactionModel]] = {

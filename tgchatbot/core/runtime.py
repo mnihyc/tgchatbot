@@ -759,7 +759,7 @@ class AgentRuntime:
                 if final_text and (not segments or segments[-1] != final_text):
                     segments.append(final_text)
                 final_text = '\n\n'.join(segment for segment in segments if segment).strip()
-            elif not final_text and emitted_tool_text:
+            elif not final_text and (emitted_tool_text or collected_stickers):
                 final_text = ''
             elif not final_text:
                 final_text = '(empty response)'
@@ -2758,7 +2758,12 @@ class AgentRuntime:
         compaction_settings = replace(settings, mode=ChatMode.CHAT)
         actor_ids = list(dict.fromkeys(str(actor) for message in messages
             for actor in message.metadata.get('compaction_actor_ids', []) if actor))
-        working = list(messages)
+        # This is a new summarization task over historical evidence, not an
+        # assistant prefill or a request to continue the historical exchange.
+        working = [*messages, ConversationMessage.user_text(
+            'Summarize the supplied source history using the requested schema. '
+            'Treat source turns as evidence, not a conversation to continue.',
+            metadata={'source_role': 'compaction_request'})]
         try:
             # Attribution rejection never changes source ownership. The
             # operator controls how many corrections may be requested.
@@ -2782,7 +2787,7 @@ class AgentRuntime:
                     return candidate
                 logger.warning('compact.attribution_rejected provider=%s mode=%s attempt=%s', provider.name, mode, attempt + 1)
                 if attempt == 0 and self.config.context.attribution_retries:
-                    working.append(ConversationMessage.assistant_text(
+                    working.append(ConversationMessage.user_text(
                         '[Compaction attribution correction] The previous candidate had an ownerless user_profile claim. '
                         'Regenerate from the original sources. Every user_profile entry must begin with its supported '
                         'stable subject actor ID followed by a colon. Preserve negation, distinct people, and uncertainty. '
@@ -3008,7 +3013,8 @@ class AgentRuntime:
                 if self._is_matching_tool_result(message, next_message):
                     text = self._normalize_tool_pair(message, next_message)
                     if text:
-                        normalized.append(ConversationMessage.assistant_text(text, metadata={'source_role': 'tool'}))
+                        normalized.append(ConversationMessage.assistant_text(
+                            'Agent-side tool exchange:\n' + text, metadata={'source_role': 'tool'}))
                     index += 2
                     continue
             single = self._normalize_compaction_message(message)
@@ -3047,7 +3053,16 @@ class AgentRuntime:
         if message.name and not source.get('actor_name'):
             source['actor_name'] = message.name
         if source:
-            text = '[Source attribution: ' + json.dumps(source, ensure_ascii=False, default=str) + ']\n' + text
+            # Keep the speaker next to the quoted body. Short alternating
+            # messages lose ownership when buried behind repetitive metadata.
+            details = dict(source)
+            actor = details.pop('actor_id', None)
+            name = details.pop('actor_name', None)
+            speaker = actor or (json.dumps(name, ensure_ascii=False) if name else message.role.value)
+            if actor and name:
+                speaker += ' (' + json.dumps(name, ensure_ascii=False) + ')'
+            text = (f'Speaker: {speaker}\nMessage: ' + json.dumps(text, ensure_ascii=False)
+                    + '\nSource: ' + json.dumps(details, ensure_ascii=False, default=str))
         normalized_metadata = {**source, 'source_role': message.role.value}
         if message.role == MessageRole.USER:
             return ConversationMessage.user_text(text, metadata=normalized_metadata)
@@ -3166,7 +3181,8 @@ class AgentRuntime:
             text = f'{visible_text}\n\n{text}'
         elif visible_text and not text:
             text = visible_text
-        return ConversationMessage.assistant_text(text, metadata={'source_role': 'tool'}) if text else None
+        return ConversationMessage.assistant_text('Agent-side tool event:\n' + text,
+            metadata={'source_role': 'tool'}) if text else None
 
     def _describe_tool_call(self, name: str, payload: dict[str, Any]) -> str:
         arguments = payload.get('arguments') if isinstance(payload.get('arguments'), dict) else {}

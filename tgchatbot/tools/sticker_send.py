@@ -162,18 +162,16 @@ class StickerQueryTool:
         self.spec = ToolSpec(
             name='sticker_query',
             description=(
-                'Query the sticker system with a simple-first plan. Always provide intent_core. '
-                'Add helper hints when they materially affect the choice: reaction_tone, social_intent, expression_cue, caption_meaning, or preferred_pack. '
-                'Use diversity_preference=prefer_fresh_variant when you want an alternative to recently delivered stickers. '
-                'Use persona when the sticker should keep a recurring visual or expressive identity across the session. '
-                'Use selection_lens when subtle subtext, face, pose, or social read matters. '
-                'Leave advanced empty unless you intentionally want axis-level control. Do not put usernames, bot names, or transport metadata into semantic fields.'
+                'Find stickers for the reply you intend to express. Put the social move in intent_core and add only useful tone, caption, expression or style constraints. '
+                'Candidates have not been sent. Inspect available images and captions, then select, refine the query or reply without a sticker. '
+                'Use diversity_preference=prefer_fresh_variant to prefer alternatives to recent deliveries. '
+                'Change persistent persona only for an intended continuing preference. Leave advanced empty unless you need its specific controls.'
             ),
             parameters_schema={
                 'type': 'object',
                 'properties': {
                     'send': _param('boolean', 'false skips the query and preference changes entirely; true inspects candidates without sending them.', default=True),
-                    'intent_core': _param('string', 'Required core reaction meaning in plain language, for example dry amused refusal or warm supportive acknowledgement.'),
+                    'intent_core': _param('string', 'What this reply should convey to its recipient. Include direction when it matters: offering comfort, asking for a hug, accepting blame or playfully handing it back. Use the actual exchange, without copying identities or whole profiles.'),
                     'secondary_goals': _param('array', 'Optional extra nuances that materially refine the reaction.', items={'type': 'string'}),
                     'reaction_tone': _param('string', 'Optional simple reaction tone, for example dry amused, warm, irritated, bashful, or smug.'),
                     'social_intent': _param('string', 'Optional simple social intent, for example reassure, lightly tease, acknowledge, celebrate, or dismiss.'),
@@ -232,11 +230,12 @@ class StickerQueryTool:
                 'recent_deliveries': list(state.recent_sticker_ids),
                 'candidate_count': len(matches),
                 'candidates': [_candidate_payload(match) for match in matches],
-                'guidance': 'This shortlist is not the entire catalog. Interpret the actual caption, image and sender/recipient roles with the conversation. '
-                    'Literal lookup alone does not establish contextual fit. '
-                    'Descriptions are conditional interpretations, not verified fit. Inspect supplied images; if unavailable do not claim visual inspection. '
-                    'Choose a fitting expression, refine the query, or use text. No sticker has been sent. '
-                    'Only sticker_send_selected commits a choice; recent and visually similar deliveries are context, not repeat bans.',
+                'guidance': 'Inspect supplied images and captions as part of the complete reply: who acts, who is addressed, and what the words and image convey together. '
+                    'Literal captions constrain meaning; descriptions are conditional interpretations, not proof of fit. '
+                    'Do not claim visual inspection without images or invent relationship consent or history to rescue a choice. '
+                    'An uncertain detail need not invalidate what is clear. This shortlist is not the entire catalog, and no sticker has been sent. '
+                    'Select a fitting sticker_id with sticker_send_selected, refine the query, or use text. '
+                    'Recent and visually similar deliveries guide variety, not repeat bans; unsent candidates do not establish preference.',
             }, evidence_parts=await self.catalog.evidence(matches))
         except Exception as exc:
             logger.exception('sticker_query failed')

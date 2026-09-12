@@ -64,6 +64,29 @@ class ThinkingControlWorkflows(unittest.IsolatedAsyncioTestCase):
         await self.generate(replace(settings, model='gemini-2.0-flash'))
         self.assertNotIn('thinkingConfig', self.requests[-1]['generationConfig'])
 
+    async def test_flash_model_thinking_levels_preserve_supported_wire_values(self):
+        for model, level in (
+            ('gemini-3.7-flash', 'low'),
+            ('gemini-3.8-flash', 'low'),
+            ('gemini-3.6-flash', 'minimal'),
+        ):
+            with self.subTest(model=model, level=level):
+                result = await self.generate(SessionSettings(provider='gemini', model=model,
+                    thinking_budget=65536, thinking_level=level))
+                self.assertEqual(result.final_text, 'Answer')
+                self.assertEqual(self.requests[-1]['generationConfig']['thinkingConfig'],
+                    {'thinkingLevel': level})
+
+    async def test_saved_minimal_is_not_sent_to_flash_models_that_reject_it(self):
+        # A model switch may leave a level accepted by the previous model in
+        # saved settings. Do not forward that unsupported value to the API.
+        for model in ('gemini-3.7-flash', 'gemini-3.8-flash'):
+            with self.subTest(model=model):
+                await self.generate(SessionSettings(provider='gemini', model=model,
+                    thinking_level='minimal'))
+                thinking = self.requests[-1]['generationConfig'].get('thinkingConfig', {})
+                self.assertNotIn('thinkingLevel', thinking)
+
     async def test_api_capacity_error_is_reported_without_silently_changing_allowance(self):
         self.status = 400
         with self.assertRaises(httpx.HTTPStatusError):
@@ -73,6 +96,37 @@ class ThinkingControlWorkflows(unittest.IsolatedAsyncioTestCase):
 
 
 class ThinkingCommandWorkflows(BusinessTestCase):
+    async def test_thinking_level_command_matches_flash_model_choices(self):
+        self.runtime.providers['gemini'] = GeminiProvider(self.config.gemini)
+        app = TelegramBotApp.__new__(TelegramBotApp)
+        app.config, app.runtime, app.store = self.config, self.runtime, self.store
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(effective_chat=SimpleNamespace(id=100),
+            effective_message=message, effective_user=SimpleNamespace(id=7))
+        for model, supports_minimal in (
+            ('gemini-3.7-flash', False),
+            ('gemini-3.8-flash', False),
+            ('gemini-3.6-flash', True),
+        ):
+            with self.subTest(model=model):
+                await self.settings(provider='gemini', model=model, thinking_level='high')
+                await app.param_command(update, SimpleNamespace(args=[]))
+                choices = next(line for line in message.reply_text.call_args.args[0].splitlines()
+                    if line.startswith('thinking_level '))
+                self.assertEqual(choices, 'thinking_level <' +
+                    ('minimal|' if supports_minimal else '') + 'low|medium|high|default>')
+
+                await app.param_command(update, SimpleNamespace(args=['thinking_level', 'minimal']))
+                if not supports_minimal:
+                    self.assertIn('Invalid thinking_level', message.reply_text.call_args.args[0])
+                self.assertEqual((await self.settings()).thinking_level,
+                    'minimal' if supports_minimal else 'high')
+
+                await app.param_command(update, SimpleNamespace(args=['thinking_level', 'low']))
+                restored = await (await self.new_store()).get_or_create_session(self.session,
+                    self.config.default_session_settings())
+                self.assertEqual(restored.thinking_level, 'low')
+
     async def test_requested_budget_survives_command_save_and_new_database_handle(self):
         await self.settings(provider='gemini', model='gemini-3.8-flash', thinking_level='high')
         self.runtime.providers['gemini'] = GeminiProvider(self.config.gemini)

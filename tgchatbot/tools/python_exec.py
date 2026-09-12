@@ -18,9 +18,10 @@ class PythonExecTool:
         self.spec = ToolSpec(
             name='python_exec',
             description=(
-                'Run Python 3 code inside the persistent remote container for this chat session. '
-                'Use it for analysis, transformations, scraping local files, and structured computation. '
-                'Input files from the current chat are mirrored into the remote input directory automatically, and results should be summarized through stdout or stderr.'
+                'Run Python 3 code in this chat\'s persistent remote workspace for structured analysis and file transformations. '
+                'Use the supplied TGCHATBOT_INPUT_DIR, TGCHATBOT_OUTPUT_DIR and TGCHATBOT_SESSION_DIR environment paths. '
+                'Only successfully mirrored uploads are available there; files may change after edits. '
+                'Print useful results. Producing a file does not send it; use file_send when needed.'
             ),
             parameters_schema={
                 'type': 'object',

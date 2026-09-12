@@ -192,7 +192,7 @@ def gemini_supports_tool_combination(model: str) -> bool:
 def gemini_allowed_thinking_levels(model: str) -> tuple[str, ...]:
     normalized = (model or "").strip().lower()
     if normalized.startswith("gemini-3"):
-        if "-pro" in normalized:
+        if "-pro" in normalized or normalized.startswith(("gemini-3.7-flash", "gemini-3.8-flash")):
             return ("low", "medium", "high")
         return ("minimal", "low", "medium", "high")
     return ()

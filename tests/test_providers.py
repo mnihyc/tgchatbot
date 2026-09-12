@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -436,6 +437,59 @@ class ChatCompletionsContractTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AllAdaptersContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_gemini_compaction_layers_request_a_summary_without_assistant_prefill(self):
+        from tgchatbot.core.runtime import AgentRuntime
+        actors = ['telegram:user:7', 'telegram:user:8']
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as directory, patch.dict(
+            os.environ, {'APP_DATA_DIR': directory, 'TGBOT_TOKEN': 'mock',
+                'GEMINI_API_KEY': 'mock', 'GEMINI_MODEL': 'gemini-3.8-flash'}, clear=True
+        ):
+            config = load_config()
+            for mode in ('toolspan', 'episode', 'digest'):
+                with self.subTest(mode=mode):
+                    fields = compaction_json_schema(mode)['properties']
+                    candidate = {name: [] for name in fields}
+                    candidate.update(scope='Separate drink preferences', participants=actors,
+                        user_profile=['telegram:user:7: Prefers coffee', 'telegram:user:8: Avoids coffee'])
+                    if mode == 'digest':
+                        candidate['interaction_modes_seen'] = ['chat_or_sharing']
+                    else:
+                        candidate['interaction_mode'] = 'chat_or_sharing'
+                    history = [
+                        ConversationMessage.assistant_text('Source actors are supplied separately.',
+                            metadata={'compaction_actor_ids': actors}),
+                        ConversationMessage.assistant_text(
+                            'Earlier evidence: telegram:user:7 prefers coffee; telegram:user:8 avoids coffee.'),
+                    ]
+                    original_history = deepcopy(history)
+                    captured = []
+
+                    def handler(request):
+                        payload = json.loads(request.content)
+                        captured.append(payload)
+                        if payload['contents'][-1]['role'] == 'model':
+                            return httpx.Response(400, json={'error': {
+                                'message': 'Requests ending with a model turn are not supported.'}})
+                        return httpx.Response(200, json={'candidates': [{'content': {
+                            'role': 'model', 'parts': [{'text': json.dumps(candidate)}]}}]})
+
+                    provider = GeminiProvider(config.gemini)
+                    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                        provider._client = client
+                        runtime = object.__new__(AgentRuntime)
+                        runtime.config = config
+                        result = await runtime._generate_structured_candidate(provider,
+                            replace(config.default_session_settings(), provider='gemini', model='gemini-3.8-flash'),
+                            history, mode=mode)
+                    self.assertEqual(result['user_profile'], candidate['user_profile'])
+                    self.assertEqual(result['participants'], actors)
+                    self.assertEqual(history, original_history)
+                    self.assertEqual(len(captured), 1)
+                    self.assertEqual(captured[0]['contents'][-1]['role'], 'user')
+                    self.assertIn('summar', json.dumps(captured[0]['contents'][-1]).lower())
+                    self.assertIn('telegram:user:7 prefers coffee', json.dumps(captured[0]))
+                    self.assertIn('telegram:user:8 avoids coffee', json.dumps(captured[0]))
+
     async def test_each_provider_can_generate_validated_compaction(self):
         from tgchatbot.core.runtime import AgentRuntime
         schema = compaction_json_schema('episode')

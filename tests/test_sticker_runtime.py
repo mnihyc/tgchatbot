@@ -15,7 +15,7 @@ from telegram.error import BadRequest
 from tests.business_helpers import BusinessTestCase, ScriptedProvider
 from tgchatbot.core.runtime import AgentRuntime
 from tgchatbot.domain.models import (ChatMode, ConversationMessage, MessagePart, MessageRole,
-    OutboundSticker, PartKind, ProviderResponse, StickerMode, StickerTiming, ToolResult)
+    OutboundSticker, PartKind, ProcessVisibility, ProviderResponse, StickerMode, StickerTiming, ToolResult)
 from tgchatbot.providers.openai_responses import OpenAIResponsesProvider
 from tgchatbot.providers.gemini import GeminiProvider
 from tgchatbot.storage.sticker_delivery import StickerDeliveryStore
@@ -174,6 +174,44 @@ class StickerEvidenceWorkflowTests(BusinessTestCase):
                 normalized = runtime._describe_tool_result('sticker_send_selected',{'output':output})
                 self.assertIn(digest,normalized)
                 self.assertIn('offers an embrace',normalized)
+
+    async def test_sticker_only_reply_sends_selected_asset_without_placeholder_text(self):
+        asset = self.path / 'sticker-only.webp'
+        asset.write_bytes(b'fixture sticker-only selection')
+        digest = hashlib.sha256(asset.read_bytes()).hexdigest()
+        deliveries = StickerDeliveryStore(self.store)
+        await deliveries.initialize()
+        for timing in (StickerTiming.SEND_NOW, StickerTiming.AFTER_FINAL):
+            with self.subTest(timing=timing):
+                settings = await self.settings(mode=ChatMode.ASSIST, max_interaction_rounds=1,
+                    process_visibility=ProcessVisibility.OFF)
+                provider = await self.make_provider([
+                    function('sticker_send_selected', 'sticker-only-' + timing.value), {'output': []}])
+                sticker = OutboundSticker(asset, source_id=digest, content_sha256=digest, timing=timing)
+                runner = SimpleNamespace(run=AsyncMock(return_value=ToolResult('', 'sticker_send_selected',
+                    {'ok': True, 'status': 'queued', 'sticker_id': digest}, stickers=[sticker])))
+                self.tools.list_tools.return_value = [ToolSpec('sticker_send_selected',
+                    'Send chosen asset', {'type': 'object'}, runner)]
+                bot = SimpleNamespace(send_sticker=AsyncMock(return_value=SimpleNamespace(message_id=91)),
+                    send_message=AsyncMock(return_value=SimpleNamespace(message_id=92)))
+                message = SimpleNamespace(chat=SimpleNamespace(id=100), message_id=10, get_bot=lambda: bot)
+
+                async def emit(event):
+                    if event.kind == 'sticker':
+                        await send_sticker(bot, chat_id=100, sticker=TelegramBotApp._sticker_from_event(event),
+                            deliveries=deliveries)
+
+                runtime = AgentRuntime(config=self.config, store=self.store, tool_registry=self.tools,
+                    providers={'openai': provider}, preview_cache=self.preview_cache, sticker_delivery=deliveries)
+                result = await runtime.run_turn(session_id=self.session, user_display_name='Participant',
+                    incoming_message=ConversationMessage.user_text('A comforting sticker only, please.'), emit=emit)
+                app = TelegramBotApp.__new__(TelegramBotApp)
+                app.config, app.runtime, app.store = self.config, runtime, self.store
+                await app._deliver_result(message, SimpleNamespace(), settings, result, sent_before_receipts=[])
+                bot.send_sticker.assert_awaited_once()
+                self.assertEqual((await deliveries.get(sticker.delivery_operation_id))['status'], 'sent')
+                bot.send_message.assert_not_awaited()
+                self.assertEqual(result.text, '')
 
     async def test_explicit_retry_can_choose_a_different_sticker_with_reused_provider_call_id(self):
         await self.settings(mode=ChatMode.ASSIST,max_interaction_rounds=1)
