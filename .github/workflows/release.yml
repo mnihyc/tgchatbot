@@ -35,6 +35,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
+          git for-each-ref --format='%(contents)' "refs/tags/$RELEASE_TAG" > "$RUNNER_TEMP/release-notes.md"
           gh release create "$RELEASE_TAG" \
             "dist/tgchatbot-deploy-$RELEASE_TAG.tar.gz" \
-            --verify-tag --title "$RELEASE_TAG" --notes-from-tag
+            --verify-tag --title "$RELEASE_TAG" --notes-file "$RUNNER_TEMP/release-notes.md"
