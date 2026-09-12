@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+from dataclasses import replace
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TimedOut
 
 from tests.business_helpers import BusinessTestCase
-from tgchatbot.domain.models import ConversationMessage, OutboundArtifact, OutboundSticker, ProcessVisibility, ResponseDelivery, StickerTiming, TurnResult
+from tgchatbot.core.events import RuntimeEvent
+from tgchatbot.domain.models import ChatMode, ConversationMessage, MessageRole, OutboundArtifact, OutboundSticker, ProcessVisibility, ProviderResponse, ResponseDelivery, StickerTiming, ToolCall, TurnResult
 from tgchatbot.storage.postgres_store import StaleScopeError
 from tgchatbot.transports.telegram_adapter import ReplyCandidate, TelegramBotApp
 from tgchatbot.transports.telegram_render import TelegramMessageRenderer
@@ -138,6 +141,134 @@ class TelegramDeliverySourceTests(BusinessTestCase):
         self.assertEqual([message.message_id for message in delivered], [self.sent[-1][0].message_id])
         self.assertNotEqual(delivered[0].message_id, 60)
         fallback.delete.assert_awaited_once()
+
+    async def test_typing_status_failure_does_not_block_the_answer_or_next_turn(self):
+        self.bot.send_chat_action.side_effect = TimedOut()
+        self.provider.responses = [ProviderResponse(final_text='The key is in the blue bag.'),
+            ProviderResponse(final_text='Yes, the blue bag.')]
+        originals = []
+        for number, question in ((10, 'Where is the spare key?'), (11, 'The blue bag, correct?')):
+            incoming = ConversationMessage.user_text(question, metadata={
+                'source': 'telegram', 'source_chat_id': '100', 'source_message_id': str(number),
+                'actor_id': 'telegram:user:7', 'actor_name': 'Alex', 'actor_kind': 'user'})
+            original = await self.runtime.ingest_user_message(session_id=self.session, incoming_message=incoming)
+            originals.append(original.db_id)
+            await self.app._reply_to_candidate(ReplyCandidate(original.db_id, 'Alex', self.message(number, actor=7)))
+        self.assertEqual([text for _, text in self.sent], [r'The key is in the blue bag\.', r'Yes, the blue bag\.'])
+        self.assertEqual(len(self.provider.requests), 2, 'Typing failures must not cause extra generation calls')
+        self.assertGreaterEqual(self.bot.send_chat_action.await_count, 1)
+        self.assertTrue(all(call.kwargs.get('reply_to_message_id') is None
+            for call in self.bot.send_message.await_args_list))
+        self.app._notify_user_error.assert_not_awaited()
+        stored = await (await self.new_store()).list_canonical_messages(self.session)
+        self.assertEqual([row.message.parts[0].text for row in stored if row.db_id in originals],
+            ['Where is the spare key?', 'The blue bag, correct?'])
+        self.assertEqual([row.message.parts[0].text for row in stored if row.message.role == MessageRole.ASSISTANT],
+            ['The key is in the blue bag.', 'Yes, the blue bag.'])
+
+    async def test_failed_optional_placeholder_does_not_prevent_delivering_the_answer(self):
+        send = self.bot.send_message.side_effect
+        for mode in (ProcessVisibility.STATUS, ProcessVisibility.MINIMAL):
+            with self.subTest(mode=mode):
+                await self.settings(process_visibility=mode, response_delivery=ResponseDelivery.FINAL_NEW)
+                first = True
+
+                async def fail_placeholder(**kwargs):
+                    nonlocal first
+                    if first:
+                        first = False
+                        raise TimedOut()
+                    return await send(**kwargs)
+
+                self.bot.send_message.side_effect = fail_placeholder
+                for question in ('Please answer.', 'And the next question?'):
+                    self.provider.responses.append(ProviderResponse(final_text='The answer is ready.'))
+                    original = await self.runtime.ingest_user_message(session_id=self.session,
+                        incoming_message=ConversationMessage.user_text(question))
+                    await self.app._reply_to_candidate(ReplyCandidate(original.db_id, 'Alex', self.source))
+        self.assertEqual([text for _, text in self.sent if text != r'\.\.\.'], [r'The answer is ready\.'] * 4)
+        self.assertEqual(len(self.provider.requests), 4)
+        self.app._notify_user_error.assert_not_awaited()
+        stored = await (await self.new_store()).list_canonical_messages(self.session)
+        self.assertEqual([row.message.parts[0].text for row in stored if row.message.role == MessageRole.ASSISTANT],
+            ['The answer is ready.'] * 4)
+
+    async def test_optional_progress_edit_failure_keeps_tool_execution_answer_and_next_turn(self):
+        self.app.config = replace(self.config, telegram=replace(self.config.telegram, min_edit_interval_s=0))
+        await self.settings(mode=ChatMode.ASSIST, process_visibility=ProcessVisibility.STATUS, response_delivery=ResponseDelivery.FINAL_NEW)
+        send = self.bot.send_message.side_effect
+        failures = []
+        for stage in ('receiving request', 'Executing'):
+            with self.subTest(stage=stage):
+                async def prepare_placeholder(**kwargs):
+                    message = await send(**kwargs)
+
+                    async def edit(**arguments):
+                        if arguments['text'].startswith(f'Status: {stage}'):
+                            failures.append(stage)
+                            raise TimedOut()
+                        return message
+
+                    message.edit_text.side_effect = edit
+                    return message
+
+                self.bot.send_message.side_effect = prepare_placeholder
+                self.provider.responses.extend([
+                    ProviderResponse(tool_calls=[ToolCall(name='shell_exec', call_id=f'call-{stage}', arguments={'command': 'printf done'})]),
+                    ProviderResponse(final_text='The tool finished.'), ProviderResponse(final_text='The next answer.')])
+                for question in ('Run the requested tool.', 'Next question.'):
+                    original = await self.runtime.ingest_user_message(session_id=self.session,
+                        incoming_message=ConversationMessage.user_text(question))
+                    await self.app._reply_to_candidate(ReplyCandidate(original.db_id, 'Alex', self.source))
+        self.assertIn('receiving request', failures)
+        self.assertIn('Executing', failures)
+        self.assertEqual(self.tools.runner.run.await_count, 2)
+        self.assertEqual(len(self.provider.requests), 6)
+        self.app._notify_user_error.assert_not_awaited()
+        stored = await (await self.new_store()).list_canonical_messages(self.session)
+        self.assertEqual([row.message.parts[0].text for row in stored if row.message.role == MessageRole.ASSISTANT],
+            ['The tool finished.', 'The next answer.'] * 2)
+        self.assertEqual([text for _, text in self.sent if text != r'\.\.\.'],
+            [r'The tool finished\.', r'The next answer\.'] * 2)
+
+    async def test_optional_progress_cancellation_still_stops_processing(self):
+        placeholder = self.message(2001)
+        placeholder.edit_text.side_effect = asyncio.CancelledError()
+        renderer = self.renderer(placeholder)
+        with self.assertRaises(asyncio.CancelledError):
+            await renderer.begin()
+        with self.assertRaises(asyncio.CancelledError):
+            await renderer.emit(RuntimeEvent(kind='phase', title='Executing', detail=''))
+        await self.settings(process_visibility=ProcessVisibility.MINIMAL)
+        original = await self.runtime.ingest_user_message(session_id=self.session,
+            incoming_message=ConversationMessage.user_text('A cancelled request.'))
+        self.bot.send_message.side_effect = asyncio.CancelledError()
+        with self.assertRaises(asyncio.CancelledError):
+            await self.app._reply_to_candidate(ReplyCandidate(original.db_id, 'Alex', self.source))
+        self.assertEqual(self.provider.requests, [])
+
+    async def test_status_visibility_does_not_hide_rejected_final_answer(self):
+        await self.settings(process_visibility=ProcessVisibility.STATUS, response_delivery=ResponseDelivery.FINAL_NEW)
+        send = self.bot.send_message.side_effect
+
+        async def fail_answer(**kwargs):
+            if kwargs['text'] != r'\.\.\.':
+                raise TimedOut()
+            return await send(**kwargs)
+
+        self.bot.send_message.side_effect = fail_answer
+        self.provider.responses = [ProviderResponse(final_text='The answer was not delivered.')]
+        incoming = ConversationMessage.user_text('Please answer.', metadata={
+            'source': 'telegram', 'source_chat_id': '100', 'source_message_id': '10',
+            'actor_id': 'telegram:user:7', 'actor_name': 'Alex', 'actor_kind': 'user'})
+        original = await self.runtime.ingest_user_message(session_id=self.session, incoming_message=incoming)
+        await self.app._reply_to_candidate(ReplyCandidate(original.db_id, 'Alex', self.source))
+        self.assertEqual(len(self.provider.requests), 1)
+        self.app._notify_user_error.assert_awaited_once()
+        stored = await (await self.new_store()).list_canonical_messages(self.session)
+        self.assertEqual([row.message.parts[0].text for row in stored if row.message.role == MessageRole.ASSISTANT],
+            [])
+        self.assertTrue(any(row.db_id == original.db_id for row in stored))
 
     async def test_partial_text_delivery_failure_does_not_commit_complete_answer_or_aliases(self):
         self.runtime.run_turn_from_stored = AsyncMock(return_value=TurnResult('Long answer. ' * 700))

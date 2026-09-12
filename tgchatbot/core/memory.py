@@ -176,7 +176,7 @@ class MemoryService:
             while True:
                 item = message_evidence({**stored.message.metadata, 'parts': evidence_part_spans(stored.message)}, message_id=message_id,
                     role=stored.message.role, fragments=[{'offset': 0, 'text': shown}],
-                    total_characters=len(text), images=images[message_id], timezone=timezone)
+                    total_characters=len(text), images=images[message_id], timezone=timezone, original=stored.message)
                 size = len(json.dumps(item, ensure_ascii=False, default=str)) + (2 if result else 0)
                 if size <= remaining or not shown:
                     break
@@ -212,7 +212,7 @@ class MemoryService:
             excerpt = text[offset:end]
             record = message_evidence({**item.message.metadata, 'parts': evidence_part_spans(item.message)}, message_id=item.db_id,
                 role=item.message.role, fragments=[{'offset': offset, 'text': excerpt}],
-                total_characters=len(text), timezone=timezone)
+                total_characters=len(text), timezone=timezone, original=item.message)
             if end < len(text):
                 record['next_offset'] = end
             results.append(record)

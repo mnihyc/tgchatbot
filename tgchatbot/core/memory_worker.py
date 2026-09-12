@@ -600,7 +600,7 @@ class MemoryWorker:
             actors.add(actor)
             evidence.append(message_evidence(row.message.metadata, message_id=row.db_id,
                 role=row.message.role, fragments=[{'offset': span['start'], 'text': body[span['start']:span['end']]}],
-                total_characters=len(body), timezone=self.config.default_metadata_timezone))
+                total_characters=len(body), timezone=self.config.default_metadata_timezone, original=row.message))
         snapshot = await self.store.fetch_profile_snapshot(job['session_id'], sorted(actors | {'agent'}),
             max_bytes=self.config.memory.profile_bytes, for_learning=True)
         existing = snapshot['facts']

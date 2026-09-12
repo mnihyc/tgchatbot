@@ -131,10 +131,62 @@ def present_image_evidence(part: MessagePart, timezone: str | None = None) -> Me
         ensure_ascii=False, default=str) + ']')
 
 
+def _quoted_fragments(source: Mapping[str, Any], fragments: list[dict],
+                      original: ConversationMessage | None) -> list[dict]:
+    metadata = original.metadata if original is not None else source.get('metadata') or source
+    entities = [entity for entity in metadata.get('entities', [])
+        if isinstance(entity, dict) and entity.get('type') in {'blockquote', 'expandable_blockquote'}]
+    if not entities or not fragments:
+        return []
+    if original is not None:
+        body = '\n'.join(part.text for part in original.parts if part.text is not None)
+        parts = evidence_part_spans(original)
+    else:
+        body = source.get('text')
+        parts = source.get('parts') or []
+    if not isinstance(body, str):
+        return []
+    # Telegram entities belong to the incoming text/caption, not generated
+    # notes or later independent text parts in the canonical body.
+    anchor = next((part['text_span'] for part in parts if part.get('text_span') is not None
+        and part.get('kind') == 'text' and part.get('origin') in (None, '')), None)
+    if anchor is None:
+        return []
+    encoded = body[anchor[0]:anchor[1]].encode('utf-16-le')
+    ranges = []
+    for entity in entities:
+        offset, length = entity.get('offset'), entity.get('length')
+        if not isinstance(offset, int) or not isinstance(length, int) or offset < 0 or length <= 0:
+            continue
+        if 2 * (offset + length) > len(encoded):
+            continue
+        try:
+            start = anchor[0] + len(encoded[:2 * offset].decode('utf-16-le'))
+            end = anchor[0] + len(encoded[:2 * (offset + length)].decode('utf-16-le'))
+        except UnicodeDecodeError:
+            continue  # An invalid boundary must not mark a different character.
+        ranges.append((start, end))
+    merged = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    quoted = []
+    for fragment in fragments:
+        offset, text = fragment['offset'], fragment['text']
+        for start, end in merged:
+            start, end = max(start, offset), min(end, offset + len(text))
+            if start < end:
+                quoted.append({'offset': start, 'text': text[start - offset:end - offset]})
+    return quoted
+
+
 def message_evidence(source: Mapping[str, Any], *, message_id: int | None,
                      role: str | MessageRole | None, fragments: list[dict],
                      total_characters: int, images: list[dict] | None = None,
-                     timezone: str | None = None) -> dict[str, Any]:
+                     timezone: str | None = None,
+                     original: ConversationMessage | None = None) -> dict[str, Any]:
     """Project an original's supplied slices; selection, bounds and persistence belong to callers."""
     metadata = source.get('metadata') or {}
 
@@ -210,6 +262,9 @@ def message_evidence(source: Mapping[str, Any], *, message_id: int | None,
         record['fragments'] = originals
         if annotations:
             record['annotations'] = annotations
+    quoted = _quoted_fragments(source, record['fragments'], original)
+    if quoted:
+        record['quoted_fragments'] = quoted
     for key in ('topic_id', 'direct_messages_topic_id', 'reply_to_source_id',
                 'reply_to_source_chat_id', 'reply_to_actor', 'forward_origin',
                 'external_reply', 'quote'):
@@ -234,8 +289,9 @@ def attributed_message(message: ConversationMessage, *, message_id: int | None =
     # tool observation. Source labels inside tool evidence remain untouched.
     if message.role in {MessageRole.ASSISTANT, MessageRole.TOOL} or not message.metadata.get('source'):
         return message
+    body = '\n'.join(part.text for part in message.parts if part.text is not None)
     identity = message_evidence(message.metadata, message_id=message_id, role=message.role,
-        fragments=[], total_characters=0, timezone=timezone)
+        fragments=[{'offset': 0, 'text': body}], total_characters=len(body), timezone=timezone, original=message)
     identity.pop('fragments')
     label = json.dumps(identity, ensure_ascii=False, default=str)
     return replace(message, parts=[MessagePart(kind=PartKind.TEXT,

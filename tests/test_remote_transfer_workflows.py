@@ -14,6 +14,8 @@ from telegram.error import BadRequest, TimedOut
 
 from tgchatbot.config import load_config
 from tgchatbot.domain.models import OutboundArtifact
+from tgchatbot.tools.base import ToolContext
+from tgchatbot.tools.file_send import FileSendTool
 from tgchatbot.tools.remote_workspace import RemoteSessionPaths, RemoteWorkspaceClient
 from tgchatbot.transports.artifact_delivery import deliver_artifact
 
@@ -33,6 +35,7 @@ class RemoteTransferWorkflows(unittest.IsolatedAsyncioTestCase):
     async def test_same_name_files_and_repeated_fetches_keep_distinct_original_bytes(self):
         originals = {self.paths.outputs + '/a/report.txt': b'first report',
                      self.paths.outputs + '/b/report.txt': b'second report'}
+        self.remote._resolve_remote_paths = AsyncMock(side_effect=lambda paths, selected: selected)
 
         async def scp(*arguments, **kwargs):
             remote_path = arguments[-2].split(':', 1)[1]
@@ -51,6 +54,7 @@ class RemoteTransferWorkflows(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(list(self.config.artifact_dir.rglob('fetch-*')))
 
     async def test_interrupted_fetch_releases_partial_copies_and_subprocess(self):
+        self.remote._resolve_remote_paths = AsyncMock(side_effect=lambda paths, selected: selected)
         process = SimpleNamespace(returncode=None, kill=lambda: None,
             communicate=AsyncMock(side_effect=[asyncio.CancelledError(), (b'', b'')]))
         process.kill = unittest.mock.Mock()
@@ -58,6 +62,73 @@ class RemoteTransferWorkflows(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await self.remote.fetch_files(session_id='telegram:1', remote_paths=['report.txt'])
         process.kill.assert_called_once()
+        self.assertFalse(list(self.config.artifact_dir.rglob('fetch-*')))
+
+    def process_workspace(self):
+        root = self.root / 'workspace'
+        paths = RemoteSessionPaths(str(root), str(root / 'inputs'), str(root / 'outputs'))
+        Path(paths.inputs).mkdir(parents=True)
+        Path(paths.outputs).mkdir()
+        self.remote.ensure_session_dirs.return_value = paths
+        self.remote.ensure_master = AsyncMock()
+        self.remote._ssh_base_args = lambda: ['sh', '-c']
+        self.remote._scp_base_args = lambda: [sys.executable, '-c',
+            'import shutil,sys; shutil.copyfile(sys.argv[1].split(":",1)[1],sys.argv[2])']
+        return paths
+
+    async def test_file_send_rejects_symlink_to_a_different_workspace_before_fetching_bytes(self):
+        paths = self.process_workspace()
+        outside = self.root / 'other-session.txt'
+        outside.write_bytes(b'Unrelated session document')
+        Path(paths.outputs, 'selected.txt').symlink_to(outside)
+        transfer = unittest.mock.Mock(wraps=self.remote._scp_base_args)
+        self.remote._scp_base_args = transfer
+        result = await FileSendTool(self.config, self.remote).run(
+            {'scope': 'outputs', 'paths': ['selected.txt']}, ToolContext('telegram:1', 'Participant'))
+        try:
+            self.assertFalse(result.output['ok'], 'File selection must retain its session-workspace ownership')
+            self.assertEqual(result.artifacts, [])
+            transfer.assert_not_called()
+            self.assertEqual(outside.read_bytes(), b'Unrelated session document')
+            self.assertFalse(list(self.config.artifact_dir.rglob('fetch-*')))
+        finally:
+            for artifact in result.artifacts:
+                artifact.discard()
+
+    async def test_file_send_follows_an_in_workspace_alias_and_retains_the_requested_name(self):
+        paths = self.process_workspace()
+        # Shell display truncation does not own the internal path-selection protocol.
+        self.remote.ssh = replace(self.remote.ssh, max_stdout_chars=1)
+        original = Path(paths.inputs, 'source.txt')
+        original.write_bytes(b'Selected document')
+        Path(paths.outputs, 'chosen.txt').symlink_to(original)
+        result = await FileSendTool(self.config, self.remote).run(
+            {'scope': 'outputs', 'paths': ['chosen.txt']}, ToolContext('telegram:1', 'Participant'))
+        try:
+            self.assertTrue(result.output['ok'], result.output)
+            self.assertEqual(result.output['prepared_files'], ['chosen.txt'])
+            self.assertEqual([artifact.path.read_bytes() for artifact in result.artifacts], [b'Selected document'])
+            self.assertEqual(original.read_bytes(), b'Selected document')
+        finally:
+            for artifact in result.artifacts:
+                artifact.discard()
+
+    async def test_file_send_skips_a_missing_file_without_losing_available_files(self):
+        paths = self.process_workspace()
+        original = Path(paths.outputs, 'available.txt')
+        original.write_bytes(b'Available requested output')
+        result = await FileSendTool(self.config, self.remote).run(
+            {'scope': 'outputs', 'paths': ['missing.txt', 'available.txt']},
+            ToolContext('telegram:1', 'Participant'))
+        try:
+            self.assertTrue(result.output['ok'], result.output)
+            self.assertEqual(result.output['requested_paths'], 2)
+            self.assertEqual(result.output['prepared_files'], ['available.txt'])
+            self.assertEqual([artifact.path.read_bytes() for artifact in result.artifacts], [original.read_bytes()])
+            self.assertEqual(list(self.config.artifact_dir.rglob('fetch-*')), [result.artifacts[0].path])
+        finally:
+            for artifact in result.artifacts:
+                artifact.discard()
         self.assertFalse(list(self.config.artifact_dir.rglob('fetch-*')))
 
     async def test_python_source_with_shell_delimiter_executes_unchanged(self):
@@ -169,6 +240,12 @@ class RemoteTransferWorkflows(unittest.IsolatedAsyncioTestCase):
         self.remote._prune_and_list_input_paths.assert_not_awaited()
         self.assertEqual(self.remote._synced_stats.get('telegram:1'), {})
         self.assertEqual(path.read_bytes(), b'original attachment')
+
+    async def test_cancelled_remote_path_resolution_leaves_no_transfer_copies(self):
+        self.remote.ensure_master = AsyncMock()
+        await self.assert_cancelled_child_is_reaped(
+            lambda: self.remote.fetch_files(session_id='telegram:1', remote_paths=['report.txt']))
+        self.assertFalse(list(self.config.artifact_dir.rglob('fetch-*')))
 
     async def test_cancelled_master_start_reaps_local_starter(self):
         self.remote._check_master_alive = AsyncMock(return_value=False)

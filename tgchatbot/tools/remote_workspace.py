@@ -376,12 +376,13 @@ class RemoteWorkspaceClient:
         selected = selected[:max_files]
         if not selected:
             return []
+        resolved = await self._resolve_remote_paths(paths, selected)
         local_dir = self.config.artifact_dir / session_id / 'remote_fetch'
         local_dir.mkdir(parents=True, exist_ok=True)
         artifacts: list[OutboundArtifact] = []
         try:
-            for remote_path in selected:
-                filename = os.path.basename(remote_path)
+            for requested_path, remote_path in zip(selected, resolved, strict=True):
+                filename = posixpath.basename(requested_path)
                 descriptor, temporary = tempfile.mkstemp(prefix='fetch-', suffix='-' + filename, dir=local_dir)
                 os.close(descriptor)
                 local_path = Path(temporary)
@@ -417,6 +418,26 @@ class RemoteWorkspaceClient:
             raise
         return artifacts
 
+    async def _resolve_remote_paths(self, paths: RemoteSessionPaths, selected: list[str]) -> list[str]:
+        # Lexical prefix checks cannot see remote symlinks. Resolve once before
+        # any transfer, preserving the requested alias only as its upload name.
+        program = (
+            'import json\nfrom pathlib import Path\n'
+            f'root = Path({paths.root!r}).resolve()\n'
+            'resolved = []\n'
+            f'for value in {selected!r}:\n'
+            '    path = Path(value).resolve()\n'
+            '    if not path.is_relative_to(root):\n'
+            '        raise ValueError("Requested remote path is outside the session workspace")\n'
+            '    resolved.append(str(path))\n'
+            'print(json.dumps(resolved, ensure_ascii=False))\n'
+        )
+        result = await self._run_ssh_command(f'python3 -c {shq(program)}',
+            timeout_s=self.ssh.default_timeout_s, full_stdout=True)
+        if not result['ok']:
+            raise RuntimeError(result['stderr'] or 'Could not resolve selected workspace files')
+        return json.loads(result['stdout'])
+
     async def inspect_file(self, *, session_id: str, scope: str, path: str,
                            format: str, start: int | None, end: int | None,
                            limits: dict[str, Any]) -> dict[str, Any]:
@@ -441,7 +462,7 @@ class RemoteWorkspaceClient:
             raise RuntimeError('Remote reader did not return a complete result') from exc
 
     async def _run_ssh_command(self, command: str, *, timeout_s: int,
-                               stdout_limit: int | None = None) -> dict[str, Any]:
+                               stdout_limit: int | None = None, full_stdout: bool = False) -> dict[str, Any]:
         await self.ensure_master()
         cmd = self._ssh_base_args() + [command]
         proc = await asyncio.create_subprocess_exec(
@@ -452,7 +473,8 @@ class RemoteWorkspaceClient:
         )
         try:
             stdout, stderr, _ = await asyncio.wait_for(asyncio.gather(
-                self._read_output(proc.stdout, self.ssh.max_stdout_chars if stdout_limit is None else stdout_limit),
+                self._read_output(proc.stdout, None if full_stdout else
+                    self.ssh.max_stdout_chars if stdout_limit is None else stdout_limit),
                 self._read_output(proc.stderr, self.ssh.max_stderr_chars),
                 proc.wait()), timeout=timeout_s + self.ssh.connect_timeout_s)
         except asyncio.CancelledError:
@@ -477,16 +499,20 @@ class RemoteWorkspaceClient:
         return result
 
     @staticmethod
-    async def _read_output(stream: asyncio.StreamReader, limit: int) -> str:
+    async def _read_output(stream: asyncio.StreamReader, limit: int | None) -> str:
         decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
         kept: list[str] = []
-        remaining = max(0, limit)
+        remaining = None if limit is None else max(0, limit)
         while chunk := await stream.read(64 * 1024):
-            if remaining:
+            if remaining is None:
+                kept.append(decoder.decode(chunk))
+            elif remaining:
                 text = decoder.decode(chunk)[:remaining]
                 kept.append(text)
                 remaining -= len(text)
-        if remaining:
+        if remaining is None:
+            kept.append(decoder.decode(b'', final=True))
+        elif remaining:
             kept.append(decoder.decode(b'', final=True)[:remaining])
         return ''.join(kept)
 

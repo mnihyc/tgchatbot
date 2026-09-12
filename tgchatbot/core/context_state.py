@@ -103,7 +103,6 @@ class LiveConversationState:
     database_version: int = -1
     provider_history_cache: list[ConversationMessage] = field(default_factory=list)
     provider_history_cache_key: tuple[str, str, str, tuple[int, ...], int] | None = None
-    provider_history_token_cache: dict[tuple[str, str, str, tuple[int, ...], int], int] = field(default_factory=dict)
     provider_history_dirty: bool = True
 
     @staticmethod
@@ -152,7 +151,6 @@ class LiveConversationState:
             max((block.end_message_id or 0 for block in self.blocks), default=0))
         self.provider_history_dirty = True
         self.provider_history_cache_key = None
-        self.provider_history_token_cache.clear()
         return self.estimated_tokens
 
 

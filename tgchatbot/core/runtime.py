@@ -1175,7 +1175,6 @@ class AgentRuntime:
         state.estimated_images += stored_message.image_count
         state.provider_history_dirty = True
         state.provider_history_cache_key = None
-        state.provider_history_token_cache.clear()
 
     @staticmethod
     def _clone_message(message: ConversationMessage, *, metadata: dict[str, Any] | None = None) -> ConversationMessage:
@@ -1268,31 +1267,6 @@ class AgentRuntime:
             model=settings.model,
             tool_history_mode=settings.tool_history_mode,
         )
-
-    def _estimate_raw_history_tokens(self, state: LiveConversationState, *, settings: SessionSettings, provider: ModelProvider) -> int:
-        latest_id = state.raw_messages[-1].db_id if state.raw_messages else 0
-        cache_key = self._history_cache_key(
-            provider_name=provider.name,
-            model=settings.model,
-            tool_history_mode=settings.tool_history_mode,
-            selected_block_ids=(),
-            latest_id=latest_id,
-        )
-        cached = state.provider_history_token_cache.get(cache_key)
-        if cached is not None:
-            return int(cached)
-        raw_messages: list[ConversationMessage] = []
-        for item in state.raw_messages:
-            for mapped in self._history_messages_for_provider(settings=settings, provider_name=provider.name, message=item.message):
-                raw_messages.append(attributed_message(mapped, message_id=item.db_id, timezone=self.config.default_metadata_timezone))
-        estimate = provider.estimate_request_tokens(
-            settings=settings,
-            messages=raw_messages,
-            instructions='',
-            tools=[],
-        )
-        state.provider_history_token_cache[cache_key] = int(estimate.history_tokens)
-        return int(estimate.history_tokens)
 
     def _estimate_stored_messages_prompt_tokens(
         self,
@@ -1666,17 +1640,9 @@ class AgentRuntime:
         if not blocks:
             return []
         target_tokens = self._effective_compact_target_tokens(settings)
-        provider = self._require_provider(settings.provider)
-        raw_tokens = self._estimate_raw_history_tokens(state, settings=settings, provider=provider)
-        if raw_tokens > target_tokens * 0.75:
-            budget_fraction = 0.08
-        elif raw_tokens > target_tokens * 0.5:
-            budget_fraction = 0.12
-        elif raw_tokens > target_tokens * 0.25:
-            budget_fraction = 0.16
-        else:
-            budget_fraction = 0.22
-        budget = int(target_tokens * budget_fraction)
+        # Sealed summaries and configuration own this selection. Growing raw
+        # history must not remove an earlier prefix before compaction happens.
+        budget = int(target_tokens * 0.22)
         context = self.config.context
         budget_floor = max(context.summary_context_min_tokens,
             min(context.summary_context_floor_tokens, int(target_tokens * 0.05)))
@@ -1700,7 +1666,7 @@ class AgentRuntime:
             if len(selected) >= 2 and used_tokens >= int(budget * 0.6):
                 break
 
-        recent_episode_allowance = 1 if state.raw_messages else 2
+        recent_episode_allowance = 2
         for block in sorted(episodes, key=lambda item: item.sequence_no, reverse=True)[:recent_episode_allowance]:
             if block.block_id in selected_ids or block.block_id in covered_parent_ids:
                 continue
@@ -3139,7 +3105,7 @@ class AgentRuntime:
             evidence = message_evidence({**source, 'parts': evidence_part_spans(original)},
                 message_id=metadata.get('compaction_source_message_id'), role=message.role,
                 fragments=[{'offset': 0, 'text': body}], total_characters=len(body),
-                timezone=self.config.default_metadata_timezone)
+                timezone=self.config.default_metadata_timezone, original=original)
             annotation_parts = [part for part in message.parts
                 if (part.origin or '').strip().lower() != 'provenance'
                 and (part.kind != PartKind.TEXT
@@ -3250,13 +3216,13 @@ class AgentRuntime:
         name = call_message.name or result_message.name or 'tool'
         visible_text = self._provider_native_visible_text(call_message)
         action = self._describe_tool_call(name, call_payload)
-        outcome = self._describe_tool_result(name, result_payload)
+        outcome = self._describe_compaction_tool_result(name, result_payload, result_message.parts)
         summary = ''
         if action and outcome:
             summary = f'{action}. Result: {outcome}'
         else:
             summary = action or outcome
-        if visible_text and summary and visible_text not in summary:
+        if visible_text and summary:
             return f'{visible_text}\n\n{summary}'
         return visible_text or summary
 
@@ -3269,17 +3235,29 @@ class AgentRuntime:
         if phase == 'call':
             text = self._describe_tool_call(name, payload)
         elif phase == 'result':
-            text = self._describe_tool_result(name, payload)
+            text = self._describe_compaction_tool_result(name, payload, message.parts)
         elif phase == 'delivery':
             text = self._describe_tool_delivery(name, payload)
         else:
             text = self._normalize_regular_message_text(message)
-        if visible_text and text and visible_text not in text:
+        if visible_text and text:
             text = f'{visible_text}\n\n{text}'
         elif visible_text and not text:
             text = visible_text
         return ConversationMessage.assistant_text('Agent-side tool event:\n' + text,
             metadata={'source_role': 'tool'}) if text else None
+
+    def _describe_compaction_tool_result(self, name: str, payload: dict[str, Any], parts: list[MessagePart]) -> str:
+        summary = self._describe_tool_result(name, payload)
+        if name != 'read_doc':
+            return summary
+        # File contents belong to the emitted evidence parts, not the status
+        # object. Read only their current presentation: retired pixels stay out.
+        evidence = [part.text or '' if part.kind == PartKind.TEXT else self._describe_attachment_part(part)
+            for part in parts if part.origin in {'file_read', 'image_compacted'}]
+        if evidence:
+            summary += '\nDocument evidence:\n' + '\n'.join(evidence)
+        return summary
 
     def _describe_tool_call(self, name: str, payload: dict[str, Any]) -> str:
         arguments = payload.get('arguments') if isinstance(payload.get('arguments'), dict) else {}
@@ -3311,6 +3289,10 @@ class AgentRuntime:
 
     def _describe_tool_result(self, name: str, payload: dict[str, Any], *, timezone: str | None = None) -> str:
         output = payload.get('output') if isinstance(payload.get('output'), dict) else {}
+        if name == 'read_doc':
+            # Scope, path, format and returned range identify the observation;
+            # parsed text/images are separate ordered evidence parts.
+            return 'Tool read_doc result:\n' + json.dumps(output, ensure_ascii=False, default=str)
         if name in {'memory_search', 'memory_read', 'user_profile_fetch'}:
             output = present_tool_output(name, output, timezone or self.config.default_metadata_timezone)
             # Retrieval owns result bounds. Preserve the evidence, identities,

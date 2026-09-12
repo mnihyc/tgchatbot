@@ -1648,13 +1648,14 @@ class TelegramBotApp:
         session_id = self._session_id(chat)
         settings = await self.store.get_or_create_session(session_id, self._default_settings())
         logger.info('tg.reply.prepare chat=%s msg=%s delivery=%s process=%s', self._chat_log_id(chat.id), candidate.stored_message_id, settings.response_delivery.value, settings.process_visibility.value)
-        await message.get_bot().send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
-
         placeholder: Message | None = None
         should_show_status = settings.process_visibility in {ProcessVisibility.STATUS, ProcessVisibility.VERBOSE, ProcessVisibility.FULL}
         should_send_minimal_ack = settings.process_visibility == ProcessVisibility.MINIMAL
         if should_show_status or should_send_minimal_ack:
-            placeholder = await self._send_text_message(message, '...')
+            try:
+                placeholder = await self._send_text_message(message, '...')
+            except Exception:
+                logger.debug('tg.progress.placeholder.failed', exc_info=True)
 
         renderer = TelegramMessageRenderer(
             placeholder if should_show_status else None,

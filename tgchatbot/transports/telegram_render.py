@@ -277,7 +277,10 @@ class TelegramMessageRenderer:
             return
         if self._is_minimal():
             return
-        await self._edit_text('Status: receiving request', force=True)
+        try:
+            await self._edit_text('Status: receiving request', force=True)
+        except Exception:
+            logger.debug('tg.progress.begin.failed', exc_info=True)
 
     async def emit(self, event: RuntimeEvent) -> None:
         if self._is_none() or self._is_minimal():
@@ -285,18 +288,20 @@ class TelegramMessageRenderer:
         lines = [f'Status: {event.title}']
         if event.detail.strip():
             lines.append(event.detail)
-        if self._is_full():
-            block = '\n'.join(line for line in lines if line.strip()).strip()
-            if not block:
-                return
-            if self.state.blocks and self.state.blocks[-1] == block:
-                return
-            self.state.blocks.append(block)
-            await self._append_full_block(block)
-            return
-        else:
-            self.state.lines = lines
-        await self._flush()
+        try:
+            if self._is_full():
+                block = '\n'.join(line for line in lines if line.strip()).strip()
+                if not block:
+                    return
+                if self.state.blocks and self.state.blocks[-1] == block:
+                    return
+                self.state.blocks.append(block)
+                await self._append_full_block(block)
+            else:
+                self.state.lines = lines
+                await self._flush()
+        except Exception:
+            logger.debug('tg.progress.emit.failed', exc_info=True)
 
     async def abort(self) -> None:
         if self.message is None:

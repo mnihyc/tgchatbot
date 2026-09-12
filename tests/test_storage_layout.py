@@ -138,6 +138,7 @@ class StorageLayoutTests(BusinessTestCase):
         remote = RemoteWorkspaceClient(config)
         paths = remote.session_paths(self.session)
         remote.ensure_session_dirs = AsyncMock(return_value=paths)
+        remote._resolve_remote_paths = AsyncMock(side_effect=lambda paths, selected: selected)
 
         async def scp(*arguments, **kwargs):
             # Only the process boundary is mocked: fetch path construction and
