@@ -108,14 +108,17 @@ class StorageLayoutTests(BusinessTestCase):
             config = self.layout_config(APP_TEMP_DIR=temporary, SSH_EXEC_HOST='remote.invalid')
             local = ArtifactStore(config.artifact_dir).save_bytes(chat_id=self.session, filename='report.txt', data=b'report')
             remote = RemoteWorkspaceClient(config)
-            remote_path = remote.session_paths(self.session).inputs + '/' + local.name
+            remote_path = remote.session_paths(self.session).root + '/2026-04-30/report_0123456789abcdef.txt'
             uploaded = {}
 
-            async def sync_inputs(session_id, paths):
+            async def sync_inputs(session_id, paths, *, sent_at=None, filenames=None):
+                paths_by_source = {}
                 for path in paths:
-                    destination = remote.session_paths(session_id).inputs + '/' + path.name
+                    self.assertEqual(filenames[str(path.resolve())], 'report.txt')
+                    destination = remote_path
                     uploaded[destination] = path.read_bytes()
-                return RemoteSyncResult(list(uploaded), [])
+                    paths_by_source[str(path.resolve())] = destination
+                return RemoteSyncResult(paths_by_source)
 
             remote.sync_inputs = sync_inputs
             app = TelegramBotApp.__new__(TelegramBotApp)
@@ -130,7 +133,8 @@ class StorageLayoutTests(BusinessTestCase):
         attachment = next(part for part in stored.parts if part.kind == PartKind.FILE)
         self.assertEqual(attachment.artifact_path, remote_path)
         self.assertTrue(attachment.remote_sync)
-        self.assertIn(remote_path, stored.parts[0].text)
+        self.assertIn('paths relative to workspace', stored.parts[0].text)
+        self.assertIn('2026-04-30/report_0123456789abcdef.txt', stored.parts[0].text)
         self.assertEqual(RemoteWorkspaceClient(config).session_paths(self.session), remote.session_paths(self.session))
 
     async def test_remote_fetch_stages_in_temp_artifacts(self):
@@ -153,7 +157,7 @@ class StorageLayoutTests(BusinessTestCase):
         self.assertTrue(artifacts[0].path.name.endswith('-report.txt'))
         self.assertTrue(artifacts[0].temporary)
         self.assertEqual(artifacts[0].path.read_bytes(), b'fetched report')
-        self.assertIn('remote.invalid:' + paths.outputs + '/report.txt', execute.call_args.args)
+        self.assertIn('remote.invalid:' + paths.root + '/report.txt', execute.call_args.args)
         self.assertFalse((config.data_dir / 'artifacts').exists())
 
     async def test_unavailable_upload_retains_searchable_descriptor_without_original_bytes(self):

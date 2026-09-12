@@ -12,11 +12,13 @@ import tempfile
 import re
 from importlib.resources import files
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from tgchatbot.config import AppConfig
 from tgchatbot.domain.models import OutboundArtifact
+from tgchatbot.domain.timestamps import format_timestamp
 from tgchatbot.logging_config import clip_for_log
 
 logger = logging.getLogger(__name__)
@@ -25,14 +27,11 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class RemoteSessionPaths:
     root: str
-    inputs: str
-    outputs: str
 
 
 @dataclass(frozen=True)
 class RemoteSyncResult:
-    kept_paths: list[str]
-    rotated_paths: list[str]
+    paths_by_source: dict[str, str]
 
 
 class RemoteWorkspaceClient:
@@ -47,7 +46,6 @@ class RemoteWorkspaceClient:
         with contextlib.suppress(PermissionError, FileNotFoundError):
             self._control_dir.chmod(0o700)
         self._control_path = self._control_dir / f'mux-{digest}'
-        self._synced_stats: dict[str, dict[str, tuple[int, int, str]]] = {}
 
     @property
     def enabled(self) -> bool:
@@ -69,7 +67,7 @@ class RemoteWorkspaceClient:
     def session_paths(self, session_id: str) -> RemoteSessionPaths:
         session_dir = self._safe_session_dir(session_id)
         root = f"{self.ssh.workdir.rstrip('/')}/{session_dir}"
-        return RemoteSessionPaths(root=root, inputs=f'{root}/inputs', outputs=f'{root}/outputs')
+        return RemoteSessionPaths(root=root)
 
     async def ensure_master(self) -> None:
         if not self.enabled:
@@ -81,6 +79,9 @@ class RemoteWorkspaceClient:
                 self._master_started = True
                 logger.info('remote.master.reuse host=%s port=%s', self.ssh.host, self.ssh.port)
                 return
+            # An interrupted container can leave its dead multiplexing socket.
+            if self._control_path.is_socket():
+                self._control_path.unlink(missing_ok=True)
             cmd = [
                 'ssh',
                 '-MNf',
@@ -196,18 +197,22 @@ class RemoteWorkspaceClient:
     async def ensure_session_dirs(self, session_id: str) -> RemoteSessionPaths:
         await self.ensure_master()
         paths = self.session_paths(session_id)
-        mkdir_cmd = f"mkdir -p {shq(paths.root)} {shq(paths.inputs)} {shq(paths.outputs)}"
+        mkdir_cmd = f"mkdir -p {shq(paths.root)}"
         result = await self._run_ssh_command(mkdir_cmd, timeout_s=self.ssh.connect_timeout_s + 10)
         if result['returncode'] != 0:
             raise RuntimeError(result['stderr'] or 'Failed to create remote session directories')
         logger.debug('remote.session.ready sid=%s root=%s', clip_for_log(session_id, limit=48), paths.root)
         return paths
 
-    async def sync_inputs(self, session_id: str, local_paths: tuple[Path, ...] | list[Path]) -> RemoteSyncResult:
-        await self.ensure_master()
+    async def sync_inputs(self, session_id: str, local_paths: tuple[Path, ...] | list[Path], *,
+                          sent_at: datetime | str | None = None,
+                          filenames: dict[str, str] | None = None) -> RemoteSyncResult:
         paths = await self.ensure_session_dirs(session_id)
-        requested_remote_paths: list[str] = []
-        per_session = self._synced_stats.setdefault(session_id, {})
+        # Intake owns the original UTC timestamp and filename. The workspace
+        # owns their remote location and reports each successful overwrite.
+        day = format_timestamp(sent_at if sent_at is not None else datetime.now(timezone.utc),
+            self.config.default_metadata_timezone).split('T', 1)[0]
+        upload_dir = f"{paths.root.rstrip('/')}/{day}"
         to_upload: list[tuple[Path, str]] = []
         skipped_oversize = 0
         for path in local_paths:
@@ -218,18 +223,19 @@ class RemoteWorkspaceClient:
                 skipped_oversize += 1
                 logger.warning('remote.sync.skip_oversize sid=%s file=%s size=%s limit=%s', clip_for_log(session_id, limit=48), path.name, stat.st_size, self.ssh.max_input_file_bytes)
                 continue
-            remote_path = f"{paths.inputs.rstrip('/')}/{Path(path).name}"
-            requested_remote_paths.append(remote_path)
             key = str(path.resolve())
-            stamp = (stat.st_size, int(stat.st_mtime_ns), remote_path)
-            if per_session.get(key) == stamp:
-                logger.debug('remote.sync.skip sid=%s file=%s', clip_for_log(session_id, limit=48), path.name)
-                continue
-            to_upload.append((path, remote_path))
+            filename = await asyncio.to_thread(self._upload_filename, path,
+                (filenames or {}).get(key) or path.name)
+            to_upload.append((path, f'{upload_dir}/{filename}'))
         if to_upload:
+            result = await self._run_ssh_command(f"mkdir -p {shq(upload_dir)}",
+                timeout_s=self.ssh.connect_timeout_s + 10)
+            if result['returncode'] != 0:
+                raise RuntimeError(result['stderr'] or 'Failed to create remote upload directory')
+        paths_by_source: dict[str, str] = {}
+        for path, remote_path in to_upload:
             scp_cmd = self._scp_base_args()
-            scp_cmd.extend([str(path) for path, _remote in to_upload])
-            scp_cmd.append(f"{self.ssh.host}:{paths.inputs.rstrip('/')}/")
+            scp_cmd.extend([str(path), f"{self.ssh.host}:{remote_path}"])
             proc = await asyncio.create_subprocess_exec(
                 *scp_cmd,
                 stdin=asyncio.subprocess.DEVNULL,
@@ -244,74 +250,25 @@ class RemoteWorkspaceClient:
                 raise
             if proc.returncode != 0:
                 raise RuntimeError(f'Failed to sync input files: {stderr.decode("utf-8", errors="replace")[:400]}')
-            for path, remote_path in to_upload:
-                stat = path.stat()
-                per_session[str(path.resolve())] = (stat.st_size, int(stat.st_mtime_ns), remote_path)
-        prune_result = await self._prune_and_list_input_paths(paths)
-        surviving = prune_result['kept']
-        rotated = prune_result['rotated']
-        surviving_set = set(surviving)
-        stale_keys = [key for key, stamp in per_session.items() if stamp[2] not in surviving_set]
-        for key in stale_keys:
-            per_session.pop(key, None)
-        requested_surviving = [remote_path for remote_path in requested_remote_paths if remote_path in surviving_set]
-        logger.info('remote.sync.done sid=%s uploaded=%s kept=%s rotated=%s skipped_oversize=%s', clip_for_log(session_id, limit=48), len(to_upload), len(requested_surviving), len(rotated), skipped_oversize)
-        return RemoteSyncResult(kept_paths=requested_surviving, rotated_paths=rotated)
+            paths_by_source[str(path.resolve())] = remote_path
+        logger.info('remote.sync.done sid=%s uploaded=%s skipped_oversize=%s',
+            clip_for_log(session_id, limit=48), len(paths_by_source), skipped_oversize)
+        return RemoteSyncResult(paths_by_source=paths_by_source)
 
-    async def _prune_and_list_input_paths(self, paths: RemoteSessionPaths) -> dict[str, list[str]]:
-        py = (
-            "import json, os\n"
-            f"base={paths.inputs!r}\n"
-            f"limit={int(self.ssh.max_input_files)}\n"
-            "rows=[]\n"
-            "rotated=[]\n"
-            "if os.path.isdir(base):\n"
-            "    for name in os.listdir(base):\n"
-            "        p=os.path.join(base,name)\n"
-            "        if os.path.isfile(p):\n"
-            "            st=os.stat(p)\n"
-            "            rows.append((st.st_mtime_ns, name, p))\n"
-            "rows.sort()\n"
-            "if limit <= 0:\n"
-            "    for _mtime, _name, p in rows:\n"
-            "        rotated.append(p)\n"
-            "        try:\n"
-            "            os.remove(p)\n"
-            "        except FileNotFoundError:\n"
-            "            pass\n"
-            "    rows = []\n"
-            "elif len(rows) > limit:\n"
-            "    for _mtime, _name, p in rows[:-limit]:\n"
-            "        rotated.append(p)\n"
-            "        try:\n"
-            "            os.remove(p)\n"
-            "        except FileNotFoundError:\n"
-            "            pass\n"
-            "    rows = rows[-limit:]\n"
-            "print(json.dumps({'kept': [p for _mtime, _name, p in rows], 'rotated': rotated}, ensure_ascii=False))\n"
-        )
-        result = await self._run_ssh_command(f"python3 - <<'PY'\n{py}PY",
-            timeout_s=max(5, self.ssh.connect_timeout_s + 10), full_stdout=True)
-        if result['returncode'] != 0:
-            raise RuntimeError(result['stderr'] or 'Failed to prune remote input files')
-        try:
-            data = json.loads(result['stdout'].strip() or '{"kept": [], "rotated": []}')
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f'Invalid remote input listing: {exc}') from exc
-        if not isinstance(data, dict):
-            raise RuntimeError('Invalid remote input listing payload')
-        kept = [str(item) for item in data.get('kept', []) if isinstance(item, str)]
-        rotated = [str(item) for item in data.get('rotated', []) if isinstance(item, str)]
-        return {'kept': kept, 'rotated': rotated}
+    @staticmethod
+    def _upload_filename(path: Path, original_name: str) -> str:
+        filename = Path(original_name).name
+        if filename in {'', '.', '..'}:
+            filename = path.name
+        with path.open('rb') as stream:
+            file_id = hashlib.file_digest(stream, 'sha256').hexdigest()[:16]
+        named = Path(filename)
+        return f'{named.stem}_{file_id}{named.suffix}'
 
     async def run_shell(self, *, session_id: str, command: str, timeout_s: int, cwd_subdir: str | None = None) -> dict[str, Any]:
         paths = await self.ensure_session_dirs(session_id)
         cwd = paths.root if not cwd_subdir else f"{paths.root.rstrip('/')}/{cwd_subdir.lstrip('/')}"
-        env = (
-            f"TGCHATBOT_SESSION_DIR={shq(paths.root)} "
-            f"TGCHATBOT_INPUT_DIR={shq(paths.inputs)} "
-            f"TGCHATBOT_OUTPUT_DIR={shq(paths.outputs)} "
-        )
+        env = f"TGCHATBOT_SESSION_DIR={shq(paths.root)} "
         wrapped = f"set -e; cd {shq(cwd)}; {env} sh -lc {shq(command)}"
         logger.info('remote.shell sid=%s cwd=%s timeout_s=%s cmd=%s', clip_for_log(session_id, limit=48), clip_for_log(cwd_subdir or '.', limit=32), timeout_s, clip_for_log(command, limit=140))
         return await self._run_ssh_command(wrapped, timeout_s=timeout_s)
@@ -324,53 +281,24 @@ class RemoteWorkspaceClient:
         timeout_s: int,
     ) -> dict[str, Any]:
         paths = await self.ensure_session_dirs(session_id)
-        remote_script = f'{paths.root}/run.py'
         wrapped = (
-            f"set -e; printf %s {shq(code)} > {shq(remote_script)}; "
-            f"cd {shq(paths.root)}; "
-            f"TGCHATBOT_SESSION_DIR={shq(paths.root)} "
-            f"TGCHATBOT_INPUT_DIR={shq(paths.inputs)} "
-            f"TGCHATBOT_OUTPUT_DIR={shq(paths.outputs)} python3 {shq(remote_script)}"
+            f"set -e; cd {shq(paths.root)}; "
+            f"TGCHATBOT_SESSION_DIR={shq(paths.root)} python3 -c {shq(code)}"
         )
         logger.info('remote.python sid=%s timeout_s=%s code=%s', clip_for_log(session_id, limit=48), timeout_s, clip_for_log(code, limit=140))
         return await self._run_ssh_command(wrapped, timeout_s=timeout_s)
-
-    async def list_files(self, *, session_id: str, scope: str = 'outputs', max_files: int = 20) -> list[dict[str, Any]]:
-        paths = await self.ensure_session_dirs(session_id)
-        base = self._scope_to_path(paths, scope)
-        py = (
-            "import json, os\n"
-            f"base={base!r}\n"
-            f"limit={int(max_files)}\n"
-            "rows=[]\n"
-            "if os.path.isdir(base):\n"
-            "    for name in sorted(os.listdir(base))[:limit]:\n"
-            "        p=os.path.join(base,name)\n"
-            "        if os.path.isfile(p):\n"
-            "            rows.append({'name': name, 'size_bytes': os.path.getsize(p), 'path': p})\n"
-            "print(json.dumps(rows, ensure_ascii=False))\n"
-        )
-        result = await self._run_ssh_command(f"python3 - <<'PY'\n{py}PY", timeout_s=20, full_stdout=True)
-        if result['returncode'] != 0:
-            raise RuntimeError(result['stderr'] or 'Failed to list remote files')
-        try:
-            data = json.loads(result['stdout'].strip() or '[]')
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f'Invalid remote file listing: {exc}') from exc
-        return data if isinstance(data, list) else []
 
     async def fetch_files(
         self,
         *,
         session_id: str,
         remote_paths: list[str] | None = None,
-        scope: str = 'outputs',
         max_files: int | None = None,
     ) -> list[OutboundArtifact]:
         paths = await self.ensure_session_dirs(session_id)
         max_files = self.ssh.max_output_files if max_files is None else max_files
         if remote_paths:
-            remote_paths = [self._scope_to_path(paths, scope.rstrip('/')) + '/' + path.lstrip('/') if not os.path.isabs(path) else path for path in remote_paths]
+            remote_paths = [paths.root.rstrip('/') + '/' + path if not posixpath.isabs(path) else path for path in remote_paths]
             selected = [self._validate_remote_path(paths, value) for value in remote_paths]
         else:
             raise RuntimeError('At least one remote path must be specified for fetching')
@@ -408,7 +336,8 @@ class RemoteWorkspaceClient:
                         continue
                     if not local_path.is_file() or local_path.stat().st_size > self.ssh.max_output_file_bytes:
                         continue
-                    artifacts.append(OutboundArtifact(path=local_path, filename=filename, temporary=True))
+                    artifacts.append(OutboundArtifact(path=local_path, filename=filename, temporary=True,
+                        workspace_path=posixpath.relpath(requested_path, paths.root)))
                     retained = True
                 finally:
                     if not retained:
@@ -439,11 +368,11 @@ class RemoteWorkspaceClient:
             raise RuntimeError(result['stderr'] or 'Could not resolve selected workspace files')
         return json.loads(result['stdout'])
 
-    async def inspect_file(self, *, session_id: str, scope: str, path: str,
+    async def inspect_file(self, *, session_id: str, path: str,
                            format: str, start: int | None, end: int | None,
                            limits: dict[str, Any]) -> dict[str, Any]:
         paths = await self.ensure_session_dirs(session_id)
-        selected = path if posixpath.isabs(path) else self._scope_to_path(paths, scope) + '/' + path
+        selected = path if posixpath.isabs(path) else paths.root.rstrip('/') + '/' + path
         selected = self._validate_remote_path(paths, selected)
         request = {'root': paths.root, 'path': selected, 'format': format,
                    'start': start, 'end': end, 'limits': limits}
@@ -567,25 +496,12 @@ class RemoteWorkspaceClient:
         return args
 
     @staticmethod
-    def _scope_to_path(paths: RemoteSessionPaths, scope: str) -> str:
-        if scope == 'inputs':
-            return paths.inputs
-        if scope == 'workspace':
-            return paths.root
-        return paths.outputs
-
-    @staticmethod
     def _validate_remote_path(paths: RemoteSessionPaths, remote_path: str) -> str:
         normalized = posixpath.normpath(remote_path.strip())
-        allowed_roots = (
-            posixpath.normpath(paths.root),
-            posixpath.normpath(paths.inputs),
-            posixpath.normpath(paths.outputs),
-        )
-        if normalized in allowed_roots:
+        root = posixpath.normpath(paths.root)
+        if normalized == root:
             return normalized
-        allowed_prefixes = tuple(root.rstrip('/') + '/' for root in allowed_roots)
-        if not normalized.startswith(allowed_prefixes):
+        if not normalized.startswith(root.rstrip('/') + '/'):
             raise RuntimeError('Requested remote path is outside the session workspace')
         return normalized
 

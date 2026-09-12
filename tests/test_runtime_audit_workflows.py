@@ -40,7 +40,7 @@ class RuntimeAuditWorkflows(BusinessTestCase):
         reader = ReadDocTool(self.config, remote)
         self.tools.spec = reader.spec
         self.tools.list_tools.return_value = [reader.spec]
-        arguments = {'scope': 'inputs', 'path': 'arrival.pdf' if retire_images else 'arrival.txt',
+        arguments = {'path': 'arrival.pdf' if retire_images else 'arrival.txt',
             'format': 'pdf' if retire_images else 'text'}
         calls = [ToolCall('read_doc', call_id, arguments)
             for call_id in (('arrival', 'verification') if parallel else ('arrival',))]

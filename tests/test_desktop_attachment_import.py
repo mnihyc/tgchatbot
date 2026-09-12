@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,12 +10,13 @@ from unittest.mock import AsyncMock, patch
 
 from tests.business_helpers import BusinessTestCase
 from tests.test_desktop_import import export, record
-from tgchatbot.domain.models import PartKind
+from tgchatbot.domain.models import ConversationMessage, PartKind, ProviderResponse
 from tgchatbot.media.attachments import sync_attachment_parts
 from tgchatbot.media.ingest import extract_message_parts
 from tgchatbot.storage.artifacts import ArtifactStore
 from tgchatbot.storage.postgres_store import StaleScopeError, message_body
 from tgchatbot.tools.import_desktop import import_file
+from tgchatbot.tools.remote_workspace import RemoteSyncResult
 
 
 class DesktopAttachmentImportTests(BusinessTestCase):
@@ -27,20 +29,24 @@ class DesktopAttachmentImportTests(BusinessTestCase):
         self.remote_files = {}
         self.staged = []
 
-        async def sync(session, paths):
+        async def sync(session, paths, *, sent_at=None, filenames=None):
             self.assertEqual(session, self.session)
             # Import must have committed source identity before remote work.
             self.assertTrue(await self.store.list_canonical_messages(self.session))
+            receipts = {}
             for path in paths:
                 self.assertFalse(path.is_relative_to(self.bundle))
                 self.assertTrue(path.is_relative_to(self.artifacts.root))
                 self.staged.append(path)
-                self.remote_files[f'/remote/inputs/{path.name}'] = path.read_bytes()
-            return SimpleNamespace(kept_paths=[f'/remote/inputs/{path.name}' for path in paths], rotated_paths=[])
+                original = Path(filenames[str(path.resolve())])
+                destination = f'/remote/2025-01-01/{original.stem}_0123456789abcdef{original.suffix}'
+                self.remote_files[destination] = path.read_bytes()
+                receipts[str(path.resolve())] = destination
+            return RemoteSyncResult(receipts)
 
         self.sync = sync
         self.remote = SimpleNamespace(enabled=True,
-            session_paths=lambda session: SimpleNamespace(inputs='/remote/inputs'),
+            session_paths=lambda session: SimpleNamespace(root='/remote'),
             sync_inputs=AsyncMock(side_effect=sync))
 
     async def ingest(self, records, **settings):
@@ -83,6 +89,8 @@ class DesktopAttachmentImportTests(BusinessTestCase):
                     self.assertTrue(part.remote_sync)
                     self.assertIsNone(part.data_b64)
                 self.assertNotIn(raw.decode(), message_body(item.message))
+                revisions = await self.store.list_message_revisions(self.session, item.db_id)
+                self.assertIn(f'export_reference="{filename}"', revisions[-1]['body'])
                 self.assertNotIn(raw.decode(), '\n'.join(part.text or '' for part in live))
                 self.assertEqual((self.bundle / filename).read_bytes(), raw)
                 self.assertEqual(item.message.metadata['actor_id'], f"telegram:user:{int(item.message.metadata['source_message_id']) + 10}")
@@ -121,6 +129,68 @@ class DesktopAttachmentImportTests(BusinessTestCase):
         self.assertEqual((self.bundle / 'notes.txt').read_bytes(), b'File content remains out of prompt')
         self.assertTrue(all(not path.exists() for path in self.staged))
 
+    async def test_import_uses_original_dates_and_retains_remote_receipts_across_reimport(self):
+        await self.settings()
+        # These UTC instants straddle midnight in the configured UTC+8 zone.
+        # Import runs much later; neither that time nor edit time owns placement.
+        dates = {'2026-04-30T15:59:00+00:00': '2026-04-30',
+                 '2026-04-30T16:01:00+00:00': '2026-05-01'}
+        expected_paths = {}
+        seen = []
+        async def sync(session, paths, *, sent_at=None, filenames=None):
+            self.assertEqual(session, self.session)
+            day = dates[sent_at]
+            receipts = {}
+            for path in paths:
+                self.staged.append(path)
+                original = Path(filenames[str(path.resolve())])
+                destination = f'/remote/{day}/{original.stem}_0123456789abcdef{original.suffix}'
+                self.remote_files[destination] = path.read_bytes()
+                receipts[str(path.resolve())] = destination
+                expected_paths[sent_at] = destination
+            seen.append(sent_at)
+            return RemoteSyncResult(receipts)
+        self.remote.sync_inputs.side_effect = sync
+        records = []
+        for number, sent_at in enumerate(dates, 1):
+            filename = f'Original report {number}.txt'
+            (self.bundle / filename).write_bytes(f'Unparsed original {number}'.encode())
+            records.append(record(number, f'Caption {number}', file=filename,
+                file_name=filename, media_type='document', from_id=f'user{10 + number}',
+                date_unixtime=str(int(datetime.fromisoformat(sent_at).timestamp())),
+                edited_unixtime=str(int(datetime(2026, 5, 2, tzinfo=timezone.utc).timestamp()))))
+        await self.ingest(records)
+        first = await self.store.list_canonical_messages(self.session)
+        await self.ingest(records)
+        reopened = await self.new_store()
+        restored = await reopened.list_canonical_messages(self.session)
+        self.assertEqual(restored, first)
+        self.assertEqual(seen, list(dates) * 2)
+        self.assertEqual(len(self.remote_files), 2)
+        for row, number in zip(restored, (1, 2)):
+            message = row.message
+            attachment = next(part for part in message.parts if part.kind == PartKind.FILE)
+            self.assertEqual(attachment.artifact_path, expected_paths[message.metadata['sent_at']])
+            self.assertEqual(attachment.filename, f'Original report {number}.txt')
+            self.assertEqual(message.metadata['actor_id'], f'telegram:user:{10 + number}')
+            self.assertEqual(message.metadata['source_message_id'], str(number))
+            self.assertEqual(Path(attachment.artifact_path).name, f'Original report {number}_0123456789abcdef.txt')
+            self.assertIn(f"{dates[message.metadata['sent_at']]}/{Path(attachment.artifact_path).name}",
+                message_body(message))
+            self.assertIn('paths relative to workspace', message_body(message))
+            self.assertEqual(self.remote_files[attachment.artifact_path], f'Unparsed original {number}'.encode())
+        self.assertTrue(all(not path.exists() for path in self.staged))
+        self.assertEqual(self.provider.requests, [])
+
+        self.provider.responses.append(ProviderResponse(final_text='I can inspect the selected report.'))
+        await self.runtime.run_turn(session_id=self.session, user_display_name='Alex',
+            incoming_message=ConversationMessage.user_text('Read the first report.'))
+        presented = '\n'.join(part.text or '' for message in self.provider.requests[-1]['messages']
+            for part in message.parts if part.origin == 'auto_note')
+        for remote_path in expected_paths.values():
+            self.assertIn(remote_path.removeprefix('/remote/'), presented)
+        self.assertIn('paths relative to workspace', presented)
+
     async def test_disabled_remote_and_limits_preserve_sources_without_transfer_or_interpretation(self):
         (self.bundle / 'notes.txt').write_bytes(b'Undisclosed contents')
         records = [record(1, 'Use later', file='notes.txt', media_type='document', mime_type='text/plain')]
@@ -153,13 +223,13 @@ class DesktopAttachmentImportTests(BusinessTestCase):
         self.assertEqual([part.preview_ref for part in after.message.parts if part.preview_ref], original_refs)
         self.assertTrue(next(part for part in after.message.parts if part.kind == PartKind.FILE).remote_sync)
         self.assertEqual(before.db_id, after.db_id)
-        self.remote.sync_inputs.side_effect = lambda *_: SimpleNamespace(kept_paths=[], rotated_paths=[])
+        self.remote.sync_inputs.side_effect = lambda *_, **__: RemoteSyncResult({})
         await self.ingest(records, max_photo_bytes=1)
         unavailable = (await self.store.list_canonical_messages(self.session))[0]
         self.assertEqual([part.preview_ref for part in unavailable.message.parts if part.preview_ref], original_refs)
         self.assertFalse(next(part for part in unavailable.message.parts if part.kind == PartKind.FILE).remote_sync)
 
-    async def test_copy_failure_or_rotation_reports_actual_unavailability_and_continues(self):
+    async def test_copy_failure_or_unconfirmed_upload_reports_unavailability_and_continues(self):
         (self.bundle / 'notes.txt').write_bytes(b'Original remains intact')
         records = [record(1, 'Remember the attachment', file='notes.txt', media_type='document'),
                    record(2, 'Subsequent message')]
@@ -171,21 +241,21 @@ class DesktopAttachmentImportTests(BusinessTestCase):
         self.remote.sync_inputs.assert_not_awaited()
         await self.ingest(records)
         success = await self.store.list_canonical_messages(self.session)
-        previous_path = next(p.artifact_path for p in success[0].message.parts if p.kind == PartKind.FILE)
-        self.remote.sync_inputs.side_effect = lambda *_: SimpleNamespace(kept_paths=[], rotated_paths=[previous_path])
+        self.assertTrue(next(p for p in success[0].message.parts if p.kind == PartKind.FILE).remote_sync)
+        self.remote.sync_inputs.side_effect = lambda *_, **__: RemoteSyncResult({})
         await self.ingest(records)
-        rotated = await self.store.list_canonical_messages(self.session)
-        current = next(p for p in rotated[0].message.parts if p.kind == PartKind.FILE)
+        unconfirmed = await self.store.list_canonical_messages(self.session)
+        current = next(p for p in unconfirmed[0].message.parts if p.kind == PartKind.FILE)
         self.assertFalse(current.remote_sync)
         self.assertIsNone(current.artifact_path)
-        self.assertIn('rotated', current.detail)
-        self.assertEqual([r.db_id for r in rotated], [r.db_id for r in failed])
+        self.assertIn('upload failed', current.detail)
+        self.assertEqual([r.db_id for r in unconfirmed], [r.db_id for r in failed])
         self.assertEqual((self.bundle / 'notes.txt').read_bytes(), b'Original remains intact')
 
     async def test_full_reset_during_upload_does_not_reintroduce_old_generation_message(self):
         (self.bundle / 'notes.txt').write_bytes(b'A retained export original')
-        async def reset_then_sync(session, paths):
-            result = await self.sync(session, paths)
+        async def reset_then_sync(session, paths, *, sent_at=None, filenames=None):
+            result = await self.sync(session, paths, sent_at=sent_at, filenames=filenames)
             await self.store.reset_full(self.session, self.config.default_session_settings())
             return result
         self.remote.sync_inputs.side_effect = reset_then_sync

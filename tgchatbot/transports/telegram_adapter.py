@@ -1422,7 +1422,8 @@ class TelegramBotApp:
             if intake_scope is not None:
                 await self.store.assert_scope(session_id, {key: intake_scope[key] for key in ('generation', 'context_id')})
             if parts:
-                parts = await self._sync_parts_to_remote(session_id, parts)
+                parts = await self._sync_parts_to_remote(session_id, parts,
+                    sent_at=canonical_metadata.get('sent_at'))
             if attachment_parts and not any(part.kind != PartKind.TEXT for part in parts):
                 # Download failure or disabled processing must still leave a
                 # searchable attachment reference in the current revision.
@@ -1580,8 +1581,9 @@ class TelegramBotApp:
             return parts
 
 
-    async def _sync_parts_to_remote(self, session_id: str, parts: list[MessagePart]) -> list[MessagePart]:
-        return await sync_attachment_parts(session_id, parts, self.remote_workspace)
+    async def _sync_parts_to_remote(self, session_id: str, parts: list[MessagePart], *,
+                                    sent_at: datetime | str | None = None) -> list[MessagePart]:
+        return await sync_attachment_parts(session_id, parts, self.remote_workspace, sent_at=sent_at)
 
     async def _promote_candidate_after_delay(self, chat_id: int, token: int, candidate: ReplyCandidate, delay_s: float) -> None:
         await asyncio.sleep(delay_s)

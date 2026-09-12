@@ -86,17 +86,18 @@ class ReadDocWorkflows(BusinessTestCase):
         self.remote = ProcessWorkspace(self.config)
         self.remote.fetch_files = AsyncMock(side_effect=AssertionError('Do not download original files to inspect them'))
         self.paths = await self.remote.ensure_session_dirs(self.session)
-        self.inputs = Path(self.paths.inputs)
-        self.outputs = Path(self.paths.outputs)
-        self.inputs.joinpath('notes.txt').write_text('\ufeffFirst line.\n第二行：带上蓝色车票。\nLast line.\n', encoding='utf-8')
-        self.outputs.joinpath('notes.txt').write_text('Different output file.\n', encoding='utf-8')
-        self.inputs.joinpath('odd \' $ name.txt').write_text('Literal filename selected.\n', encoding='utf-8')
+        self.workspace = Path(self.paths.root)
+        self.generated = self.workspace / 'custom'
+        self.generated.mkdir()
+        self.workspace.joinpath('notes.txt').write_text('\ufeffFirst line.\n第二行：带上蓝色车票。\nLast line.\n', encoding='utf-8')
+        self.generated.joinpath('notes.txt').write_text('Different output file.\n', encoding='utf-8')
+        self.workspace.joinpath('odd \' $ name.txt').write_text('Literal filename selected.\n', encoding='utf-8')
         with Image.new('RGB', (32, 16), 'red') as image:
-            image.save(self.inputs / 'picture.png')
+            image.save(self.workspace / 'picture.png')
         with Image.new('RGB', (8, 8), 'red') as first, Image.new('RGB', (8, 8), 'blue') as second:
-            first.save(self.inputs / 'animated.gif', save_all=True, append_images=[second], duration=100, loop=0)
-        self.inputs.joinpath('empty.txt').write_text('', encoding='utf-8')
-        write_pdf(self.inputs / 'schedule.pdf')
+            first.save(self.workspace / 'animated.gif', save_all=True, append_images=[second], duration=100, loop=0)
+        self.workspace.joinpath('empty.txt').write_text('', encoding='utf-8')
+        write_pdf(self.workspace / 'schedule.pdf')
         self.tool = ReadDocTool(self.config, self.remote)
         self.catalog = SimpleNamespace(stats=lambda: {'stickers': 0}, aensure_loaded=AsyncMock(), config=StickerConfig())
         self.registry = ToolRegistry(self.config, self.remote, self.catalog)
@@ -104,7 +105,7 @@ class ReadDocWorkflows(BusinessTestCase):
         self.wire = []
 
     async def read(self, path, format, **selection):
-        return await self.tool.run({'scope': 'inputs', 'path': path, 'format': format, **selection},
+        return await self.tool.run({'path': path, 'format': format, **selection},
             ToolContext(self.session, 'Participant', evidence_tokens=20000, evidence_images=4))
 
     async def gemini_runtime(self, scripts):
@@ -126,7 +127,7 @@ class ReadDocWorkflows(BusinessTestCase):
     @staticmethod
     def call(path, format, call_id, **selection):
         return {'functionCall': {'name': 'read_doc', 'id': call_id,
-            'args': {'scope': 'inputs', 'path': path, 'format': format, **selection}},
+            'args': {'path': path, 'format': format, **selection}},
             'thoughtSignature': base64.b64encode(b'synthetic signature').decode()}
 
     def results(self, wire):
@@ -168,9 +169,9 @@ class ReadDocWorkflows(BusinessTestCase):
         self.assertIn('First line.', (await self.read('notes.txt', 'text')).evidence_parts[0].text)
         odd = await self.read('odd \' $ name.txt', 'text')
         self.assertEqual(odd.evidence_parts[0].text, 'Literal filename selected.\n')
-        for scope, name, expected in [('outputs', 'notes.txt', 'Different output file.\n'),
-                                     ('workspace', 'inputs/notes.txt', 'First line.')]:
-            result = await self.tool.run({'scope': scope, 'path': name, 'format': 'text'},
+        for name, expected in [('custom/notes.txt', 'Different output file.\n'),
+                               (str(self.workspace / 'notes.txt'), 'First line.')]:
+            result = await self.tool.run({'path': name, 'format': 'text'},
                 ToolContext(self.session, 'Participant'))
             self.assertTrue(result.output['ok'], result.output)
             self.assertIn(expected, result.evidence_parts[0].text)
@@ -180,9 +181,9 @@ class ReadDocWorkflows(BusinessTestCase):
     async def test_missing_corrupt_outside_and_oversized_selections_return_no_partial_evidence(self):
         outside = self.path / 'other-session.txt'
         outside.write_text('Outside session secret.', encoding='utf-8')
-        self.inputs.joinpath('escape.txt').symlink_to(outside)
-        self.inputs.joinpath('corrupt.pdf').write_bytes(b'not a PDF')
-        self.inputs.joinpath('huge.txt').write_text('Unselected prefix\n' + 'x' * 100000 + '\n', encoding='utf-8')
+        self.workspace.joinpath('escape.txt').symlink_to(outside)
+        self.workspace.joinpath('corrupt.pdf').write_bytes(b'not a PDF')
+        self.workspace.joinpath('huge.txt').write_text('Unselected prefix\n' + 'x' * 100000 + '\n', encoding='utf-8')
         for path, fmt, selection in [
             ('missing.txt', 'text', {}), ('escape.txt', 'text', {}),
             (str(outside), 'text', {}), ('../../other-session.txt', 'text', {}),
@@ -203,7 +204,7 @@ class ReadDocWorkflows(BusinessTestCase):
         before = len(self.remote.commands)
         for fmt, images in [('audio', True), ('video', True), ('image', False), ('pdf', False)]:
             with self.subTest(format=fmt):
-                result = await self.tool.run({'scope': 'inputs', 'path': 'anything', 'format': fmt},
+                result = await self.tool.run({'path': 'anything', 'format': fmt},
                     ToolContext(self.session, 'Participant', tool_images=images))
                 self.assertFalse(result.output['ok'])
                 self.assertEqual(result.evidence_parts, [])
@@ -241,8 +242,8 @@ class ReadDocWorkflows(BusinessTestCase):
         self.assertEqual(len(pixels), 1)
         self.assertIn('Second page: bring the blue ticket.', json.dumps(responses))
         self.assertIn('第二行：带上蓝色车票。', json.dumps(responses, ensure_ascii=False))
-        self.inputs.joinpath('notes.txt').write_text('Changed after inspection.', encoding='utf-8')
-        self.inputs.joinpath('schedule.pdf').rename(self.path / 'no-longer-at-original-path.pdf')
+        self.workspace.joinpath('notes.txt').write_text('Changed after inspection.', encoding='utf-8')
+        self.workspace.joinpath('schedule.pdf').rename(self.path / 'no-longer-at-original-path.pdf')
 
         settings = await self.settings()
         live = await runtime._get_live_state(self.session)
@@ -299,7 +300,7 @@ class ReadDocWorkflows(BusinessTestCase):
 
         await self.store.reset_context(self.session)
         self.wire.clear()
-        self.inputs.joinpath('long.txt').write_text('a' * 20000, encoding='utf-8')
+        self.workspace.joinpath('long.txt').write_text('a' * 20000, encoding='utf-8')
         runtime, _ = await self.gemini_runtime([[
             self.call('long.txt', 'text', 'first'), self.call('long.txt', 'text', 'second')],
             [{'text': 'One complete selection fit this request.'}]])
@@ -318,7 +319,7 @@ class ReadDocWorkflows(BusinessTestCase):
         source = await self.store.append_message(self.session, ConversationMessage(MessageRole.USER,
             [MessagePart(PartKind.TEXT, text='The previously shared red ticket.'),
              MessagePart(PartKind.IMAGE, mime_type='image/png',
-                data_b64=base64.b64encode(self.inputs.joinpath('picture.png').read_bytes()).decode())],
+                data_b64=base64.b64encode(self.workspace.joinpath('picture.png').read_bytes()).decode())],
             metadata={'actor_id': 'telegram:user:11', 'actor_kind': 'user'}))
         descriptions = await self.store.describe_message_images(self.session, [source.db_id])
         image_id = descriptions[source.db_id][0]['image_id']

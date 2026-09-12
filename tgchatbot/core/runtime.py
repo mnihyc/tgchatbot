@@ -3271,7 +3271,7 @@ class AgentRuntime:
     def _describe_tool_result(self, name: str, payload: dict[str, Any], *, timezone: str | None = None) -> str:
         output = payload.get('output') if isinstance(payload.get('output'), dict) else {}
         if name == 'read_doc':
-            # Scope, path, format and returned range identify the observation;
+            # Path, format and returned range identify the observation;
             # parsed text/images are separate ordered evidence parts.
             return 'Tool read_doc result:\n' + json.dumps(output, ensure_ascii=False, default=str)
         if name in {'memory_search', 'memory_read', 'user_profile_fetch'}:

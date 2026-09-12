@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -13,6 +14,7 @@ from tests.business_helpers import BusinessTestCase
 from tgchatbot.domain.models import PartKind
 from tgchatbot.storage.artifacts import ArtifactStore
 from tgchatbot.tools.memory import audit_records
+from tgchatbot.tools.remote_workspace import RemoteSyncResult
 from tgchatbot.transports.telegram_adapter import TelegramBotApp
 
 
@@ -57,12 +59,16 @@ class TelegramIntakeTests(BusinessTestCase):
         self.app._register_handlers()
         transferred = []
 
-        async def sync(_session, paths):
+        async def sync(_session, paths, *, sent_at=None, filenames=None):
             transferred.extend((path.name, path.read_bytes()) for path in paths)
-            return SimpleNamespace(kept_paths=[f'/remote/inputs/{path.name}' for path in paths], rotated_paths=[])
+            receipts = {}
+            for path in paths:
+                original = Path(filenames[str(path.resolve())])
+                receipts[str(path.resolve())] = f'/remote/2026-01-01/{original.stem}_0123456789abcdef{original.suffix}'
+            return RemoteSyncResult(receipts)
 
         self.app.remote_workspace = SimpleNamespace(enabled=True,
-            session_paths=lambda _session: SimpleNamespace(inputs='/remote/inputs'),
+            session_paths=lambda _session: SimpleNamespace(root='/remote'),
             sync_inputs=AsyncMock(side_effect=sync))
         raw = b'Original media bytes; no automatic interpretation.'
         async def download(buffer):
@@ -97,7 +103,9 @@ class TelegramIntakeTests(BusinessTestCase):
         for original in originals:
             files = [part for part in original.message.parts if part.kind == PartKind.FILE]
             self.assertEqual(len(files), 1)
-            self.assertTrue(files[0].artifact_path.startswith('/remote/inputs/'))
+            self.assertTrue(files[0].artifact_path.startswith('/remote/2026-01-01/'))
+            filename = Path(files[0].filename)
+            self.assertEqual(Path(files[0].artifact_path).name, f'{filename.stem}_0123456789abcdef{filename.suffix}')
             self.assertFalse(any(part.kind == PartKind.IMAGE for part in original.message.parts))
             self.assertEqual(original.message.metadata['actor_id'], 'telegram:user:7')
             self.assertEqual(original.message.metadata['telegram_intake_stage'], 'complete')
@@ -241,12 +249,13 @@ class TelegramIntakeTests(BusinessTestCase):
         document = SimpleNamespace(file_id='synthetic-document', file_unique_id='unique-document',
             file_name='notes.txt', mime_type='text/plain', file_size=24, get_file=AsyncMock(return_value=file))
         uploaded = []
-        async def sync(session, paths):
+        async def sync(session, paths, *, sent_at=None, filenames=None):
             uploaded.extend(paths)
             self.assertTrue(all(path.exists() for path in paths))
-            return SimpleNamespace(kept_paths=[f'/remote/inputs/{path.name}' for path in paths], rotated_paths=[])
+            self.assertEqual(list(filenames.values()), ['notes.txt'])
+            return RemoteSyncResult({str(path.resolve()): '/remote/2026-01-01/notes_0123456789abcdef.txt' for path in paths})
         self.app.remote_workspace = SimpleNamespace(enabled=True,
-            session_paths=lambda session: SimpleNamespace(inputs='/remote/inputs'), sync_inputs=AsyncMock(side_effect=sync))
+            session_paths=lambda session: SimpleNamespace(root='/remote'), sync_inputs=AsyncMock(side_effect=sync))
         update = self.update(None, caption='Read these notes.', document=document)
         await self.ingest(update)
         await self.ingest(update)
@@ -259,7 +268,7 @@ class TelegramIntakeTests(BusinessTestCase):
         current = (await self.store.list_canonical_messages(self.session))[0]
         remote_parts = [part for part in current.message.parts if part.kind == PartKind.FILE]
         self.assertEqual(len(remote_parts), 1)
-        self.assertTrue(remote_parts[0].artifact_path.startswith('/remote/inputs/'))
+        self.assertEqual(remote_parts[0].artifact_path, '/remote/2026-01-01/notes_0123456789abcdef.txt')
         self.assertEqual(rows[1]['metadata']['telegram_attachments'][0]['file_id'], 'synthetic-document')
         self.app.remote_workspace.sync_inputs.assert_awaited_once()
         self.assertTrue(uploaded and all(not path.exists() for path in uploaded), 'Temporary downloads keep their existing cleanup behavior')
@@ -290,6 +299,63 @@ class TelegramIntakeTests(BusinessTestCase):
         self.assertEqual(len(await self.store.list_canonical_messages(self.session)), 1)
         self.app._promote_candidate_after_delay.assert_awaited_once()
         self.assertEqual(self.app._intake_inflight, {})
+
+    async def test_delayed_document_and_edit_keep_original_date_and_exact_remote_reference(self):
+        dates = {'2026-04-30T15:59:00+00:00': '2026-04-30',
+                 '2026-04-30T16:01:00+00:00': '2026-05-01'}
+        uploaded, observed = {}, []
+        async def sync(session, paths, *, sent_at=None, filenames=None):
+            self.assertEqual(session, self.session)
+            observed.append(sent_at)
+            receipts = {}
+            for path in paths:
+                self.assertEqual(filenames[str(path.resolve())], 'My report.txt')
+                identifier = '1111111111111111' if path.read_bytes() == b'Original file content' else '2222222222222222'
+                destination = f'/remote/{dates[sent_at]}/My report_{identifier}.txt'
+                uploaded[destination] = path.read_bytes()
+                receipts[str(path.resolve())] = destination
+            return RemoteSyncResult(receipts)
+        self.app.remote_workspace = SimpleNamespace(enabled=True, sync_inputs=AsyncMock(side_effect=sync),
+            session_paths=lambda session: SimpleNamespace(root='/remote'))
+        raw = b'Original file content'
+        async def download(buffer):
+            buffer.write(raw)
+        document = SimpleNamespace(file_id='dated-document', file_unique_id='dated-file',
+            file_name='My report.txt', mime_type='text/plain', file_size=21,
+            get_file=AsyncMock(return_value=SimpleNamespace(download_to_memory=AsyncMock(side_effect=download))))
+        for number, sent_at in enumerate(dates, 1):
+            update = self.update(None, source_id=number, actor=number + 10,
+                caption=f'Read report {number}.', document=document)
+            update.effective_message.date = datetime.fromisoformat(sent_at)
+            await self.ingest(update, reply=False)
+        edited = self.update(None, source_id=1, actor=11,
+            caption='Corrected report caption.', document=document, edited=True)
+        edited.effective_message.date = datetime.fromisoformat(next(iter(dates)))
+        edited.effective_message.edit_date = datetime(2026, 5, 2, tzinfo=timezone.utc)
+        raw = b'Updated file content'
+        await self.ingest(edited, reply=False, edit=True)
+        await self.ingest(edited, reply=False, edit=True)
+        reopened = await self.new_store()
+        restored = await reopened.list_canonical_messages(self.session)
+        self.assertEqual(len(restored), 2)
+        self.assertEqual(observed, [*dates, next(iter(dates))])
+        self.assertEqual(len(uploaded), 3)
+        self.assertEqual(uploaded['/remote/2026-04-30/My report_1111111111111111.txt'], b'Original file content')
+        for row in restored:
+            message = row.message
+            number = int(message.metadata['source_message_id'])
+            attachment = next(part for part in message.parts if part.kind == PartKind.FILE)
+            identifier = '2222222222222222' if number == 1 else '1111111111111111'
+            expected = f"/remote/{dates[message.metadata['sent_at']]}/My report_{identifier}.txt"
+            self.assertEqual(attachment.artifact_path, expected)
+            self.assertEqual(attachment.filename, 'My report.txt')
+            self.assertEqual(message.metadata['actor_id'], f'telegram:user:{number + 10}')
+            note = next(part.text for part in message.parts if part.origin == 'auto_note')
+            self.assertIn('paths relative to workspace', note)
+            self.assertIn(expected.removeprefix('/remote/'), note)
+            self.assertEqual(uploaded[expected], b'Updated file content' if number == 1 else b'Original file content')
+        self.assertFalse([path for path in self.artifact_store.root.rglob('*') if path.is_file()])
+        self.assertFalse(self.provider.requests)
 
     async def test_changed_attachment_caption_is_a_new_revision_not_a_cached_redelivery(self):
         async def download(buffer):

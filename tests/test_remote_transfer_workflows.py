@@ -17,6 +17,7 @@ from tgchatbot.config import load_config
 from tgchatbot.domain.models import OutboundArtifact
 from tgchatbot.tools.base import ToolContext
 from tgchatbot.tools.file_send import FileSendTool
+from tgchatbot.tools.read_doc import ReadDocTool
 from tgchatbot.tools.remote_workspace import RemoteSessionPaths, RemoteWorkspaceClient
 from tgchatbot.transports.artifact_delivery import deliver_artifact
 
@@ -34,8 +35,8 @@ class RemoteTransferWorkflows(unittest.IsolatedAsyncioTestCase):
         self.remote.ensure_session_dirs = AsyncMock(return_value=self.paths)
 
     async def test_same_name_files_and_repeated_fetches_keep_distinct_original_bytes(self):
-        originals = {self.paths.outputs + '/a/report.txt': b'first report',
-                     self.paths.outputs + '/b/report.txt': b'second report'}
+        originals = {self.paths.root + '/a/report.txt': b'first report',
+                     self.paths.root + '/b/report.txt': b'second report'}
         self.remote._resolve_remote_paths = AsyncMock(side_effect=lambda paths, selected: selected)
 
         async def scp(*arguments, **kwargs):
@@ -67,9 +68,8 @@ class RemoteTransferWorkflows(unittest.IsolatedAsyncioTestCase):
 
     def process_workspace(self):
         root = self.root / 'workspace'
-        paths = RemoteSessionPaths(str(root), str(root / 'inputs'), str(root / 'outputs'))
-        Path(paths.inputs).mkdir(parents=True)
-        Path(paths.outputs).mkdir()
+        paths = RemoteSessionPaths(str(root))
+        Path(paths.root).mkdir(parents=True)
         self.remote.ensure_session_dirs.return_value = paths
         self.remote.ensure_master = AsyncMock()
         self.remote._ssh_base_args = lambda: ['sh', '-c']
@@ -81,11 +81,11 @@ class RemoteTransferWorkflows(unittest.IsolatedAsyncioTestCase):
         paths = self.process_workspace()
         outside = self.root / 'other-session.txt'
         outside.write_bytes(b'Unrelated session document')
-        Path(paths.outputs, 'selected.txt').symlink_to(outside)
+        Path(paths.root, 'selected.txt').symlink_to(outside)
         transfer = unittest.mock.Mock(wraps=self.remote._scp_base_args)
         self.remote._scp_base_args = transfer
         result = await FileSendTool(self.config, self.remote).run(
-            {'scope': 'outputs', 'paths': ['selected.txt']}, ToolContext('telegram:1', 'Participant'))
+            {'paths': ['selected.txt']}, ToolContext('telegram:1', 'Participant'))
         try:
             self.assertFalse(result.output['ok'], 'File selection must retain its session-workspace ownership')
             self.assertEqual(result.artifacts, [])
@@ -100,63 +100,160 @@ class RemoteTransferWorkflows(unittest.IsolatedAsyncioTestCase):
         paths = self.process_workspace()
         # Shell display truncation does not own the internal path-selection protocol.
         self.remote.ssh = replace(self.remote.ssh, max_stdout_chars=1)
-        original = Path(paths.inputs, 'source.txt')
+        original = Path(paths.root, 'source.txt')
         original.write_bytes(b'Selected document')
-        Path(paths.outputs, 'chosen.txt').symlink_to(original)
+        Path(paths.root, 'chosen.txt').symlink_to(original)
         result = await FileSendTool(self.config, self.remote).run(
-            {'scope': 'outputs', 'paths': ['chosen.txt']}, ToolContext('telegram:1', 'Participant'))
+            {'paths': ['chosen.txt']}, ToolContext('telegram:1', 'Participant'))
         try:
             self.assertTrue(result.output['ok'], result.output)
-            self.assertEqual(result.output['prepared_files'], ['chosen.txt'])
+            self.assertEqual(result.output['prepared_files'], [{'filename': 'chosen.txt', 'workspace_path': 'chosen.txt'}])
             self.assertEqual([artifact.path.read_bytes() for artifact in result.artifacts], [b'Selected document'])
             self.assertEqual(original.read_bytes(), b'Selected document')
         finally:
             for artifact in result.artifacts:
                 artifact.discard()
 
-    async def test_large_input_inventory_preserves_upload_and_rotation_receipts(self):
+    async def test_sync_preserves_existing_and_generated_files_and_shell_display_bounds(self):
         paths = self.process_workspace()
-        self.remote.ssh = replace(self.remote.ssh, max_stdout_chars=16000, max_input_files=180)
-        originals = []
-        for number in range(180):
-            original = Path(paths.inputs, f'{number:03d}-' + '历史附件' * 12 + '.txt')
-            original.write_bytes(b'previous attachment')
-            os.utime(original, ns=(number + 1, number + 1))
-            originals.append(str(original))
+        self.remote.ssh = replace(self.remote.ssh, max_stdout_chars=7)
+        originals = {}
+        for relative in ('legacy.txt', '2026-04-29/old.txt', 'custom/generated.txt'):
+            original = Path(paths.root, relative)
+            original.parent.mkdir(parents=True, exist_ok=True)
+            original.write_text(relative)
+            originals[original] = original.read_bytes()
+        empty = Path(paths.root, 'chosen-empty-directory')
+        empty.mkdir()
         incoming = self.root / '新的附件.txt'
         incoming.write_bytes(b'new attachment')
-        expected = str(Path(paths.inputs, incoming.name))
-        # The retained files fit the operator's inventory policy, while their
-        # JSON receipt exceeds the independent shell-display allowance.
-        self.assertGreater(len(json.dumps({'kept': originals[1:] + [expected],
-            'rotated': originals[:1]}, ensure_ascii=False)), self.remote.ssh.max_stdout_chars)
-        self.remote._scp_base_args = unittest.mock.Mock(return_value=[sys.executable, '-c',
-            'import shutil,sys; shutil.copy(sys.argv[1],sys.argv[2].split(":",1)[1])'])
-        result = await self.remote.sync_inputs('telegram:1', [incoming])
-        self.assertEqual(result.kept_paths, [expected])
-        self.assertEqual(result.rotated_paths, originals[:1])
-        self.assertEqual(Path(expected).read_bytes(), incoming.read_bytes())
-        self.assertFalse(Path(originals[0]).exists())
-        self.assertTrue(all(Path(path).is_file() for path in originals[1:]))
-        repeated = await self.remote.sync_inputs('telegram:1', [incoming])
-        self.assertEqual(repeated.kept_paths, [expected])
-        self.assertEqual(repeated.rotated_paths, [])
-        self.remote._scp_base_args.assert_called_once()
+        self.remote._scp_base_args = lambda: [sys.executable, '-c',
+            'import shutil,sys; shutil.copyfile(sys.argv[1],sys.argv[2].split(":",1)[1])']
+        result = await self.remote.sync_inputs('telegram:1', [incoming], sent_at='2026-04-30T00:00:00+00:00')
+        expected = Path(result.paths_by_source[str(incoming.resolve())])
+        self.assertEqual(expected.parent, Path(paths.root, '2026-04-30'))
+        self.assertRegex(expected.name, r'新的附件_[0-9a-f]+\.txt')
+        self.assertEqual(expected.read_bytes(), incoming.read_bytes())
+        self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+        self.assertTrue(empty.is_dir())
         displayed = await self.remote.run_shell(session_id='telegram:1',
             command='python3 -c "print(chr(22909) * 20000)"', timeout_s=10)
         self.assertEqual(displayed['stdout'], '好' * self.remote.ssh.max_stdout_chars)
 
+    async def test_input_dates_follow_original_messages_in_configured_timezone_and_paths_remain_readable(self):
+        paths = self.process_workspace()
+        self.remote._scp_base_args = unittest.mock.Mock(side_effect=lambda: [sys.executable, '-c',
+            'import shutil,sys; shutil.copyfile(sys.argv[1],sys.argv[2].split(":",1)[1])'])
+        for zone, before, after in (
+            ('Asia/Shanghai', '2026-04-29T15:59:59+00:00', '2026-04-29T16:00:00+00:00'),
+            ('America/Los_Angeles', '2026-04-30T06:59:59+00:00', '2026-04-30T07:00:00+00:00'),
+        ):
+            self.remote.config = replace(self.config, default_metadata_timezone=zone)
+            for number, sent_at in enumerate((before, after), start=29):
+                with self.subTest(zone=zone, sent_at=sent_at):
+                    incoming = self.root / f'{zone.rsplit("/", 1)[-1]}-{number}-一份\'报告.txt'
+                    incoming.write_text(f'Document from {sent_at}', encoding='utf-8')
+                    # An export copied today has an unrelated filesystem date.
+                    os.utime(incoming, ns=(1, 1))
+                    result = await self.remote.sync_inputs('telegram:1', [incoming], sent_at=sent_at)
+                    expected = Path(result.paths_by_source[str(incoming.resolve())])
+                    self.assertEqual(expected.parent, Path(paths.root, f'2026-04-{number}'))
+                    self.assertTrue(expected.stem.startswith(incoming.stem + '_'))
+                    self.assertEqual(expected.suffix, incoming.suffix)
+                    self.assertEqual(expected.read_bytes(), incoming.read_bytes())
+                    self.remote._scp_base_args.reset_mock()
+                    repeated = await self.remote.sync_inputs('telegram:1', [incoming], sent_at=sent_at)
+                    self.assertEqual(repeated.paths_by_source, result.paths_by_source)
+                    self.remote._scp_base_args.assert_called_once()
+                    relative = expected.relative_to(paths.root).as_posix()
+                    read = await ReadDocTool(self.config, self.remote).run(
+                        {'path': relative, 'format': 'text'},
+                        ToolContext('telegram:1', 'Participant'))
+                    self.assertTrue(read.output['ok'], read.output)
+                    self.assertEqual(read.evidence_parts[0].text, incoming.read_text())
+        retained = list(Path(paths.root).rglob('*.txt'))
+        self.assertEqual(len(retained), 4)
+        self.assertTrue(all(path.relative_to(paths.root).parts[0] in {'2026-04-29', '2026-04-30'} for path in retained))
+
+    async def test_same_basename_bytes_get_distinct_paths_and_replays_keep_the_original_path(self):
+        paths = self.process_workspace()
+        first = self.root / 'staged-first.bin'
+        second = self.root / 'staged-second.bin'
+        first.write_bytes(b'First original')
+        second.write_bytes(b'Second original')
+        self.remote._scp_base_args = lambda: [sys.executable, '-c',
+            'import shutil,sys; shutil.copyfile(sys.argv[1],sys.argv[2].split(":",1)[1])']
+        selected_paths = []
+        for selected in (first, second, first):
+            result = await self.remote.sync_inputs('telegram:1', [selected],
+                sent_at='2026-04-30T00:00:00+00:00',
+                filenames={str(selected.resolve()): '报告.txt'})
+            remote_path = Path(result.paths_by_source[str(selected.resolve())])
+            self.assertEqual(remote_path.parent, Path(paths.root, '2026-04-30'))
+            self.assertRegex(remote_path.name, r'报告_[0-9a-f]+\.txt')
+            self.assertEqual(remote_path.read_bytes(), selected.read_bytes())
+            selected_paths.append(remote_path)
+        self.assertNotEqual(selected_paths[0], selected_paths[1])
+        self.assertEqual(selected_paths[0], selected_paths[2])
+        self.assertEqual({path: path.read_bytes() for path in Path(paths.root).rglob('*.txt')},
+            {selected_paths[0]: first.read_bytes(), selected_paths[1]: second.read_bytes()})
+        # A new local staging name must not produce another remote identity.
+        restaged = self.root / 'restaged.bin'
+        restaged.write_bytes(first.read_bytes())
+        selected_paths[0].write_bytes(b'Changed remotely before replay')
+        replay = await self.remote.sync_inputs('telegram:1', [restaged],
+            sent_at='2026-04-30T00:00:00+00:00', filenames={str(restaged.resolve()): '报告.txt'})
+        self.assertEqual(Path(replay.paths_by_source[str(restaged.resolve())]), selected_paths[0])
+        self.assertEqual(selected_paths[0].read_bytes(), first.read_bytes())
+        # A different date remains a distinct user-addressable original.
+        later = await self.remote.sync_inputs('telegram:1', [second],
+            sent_at='2026-05-01T00:00:00+00:00', filenames={str(second.resolve()): '报告.txt'})
+        later_path = Path(later.paths_by_source[str(second.resolve())])
+        self.assertNotEqual(later_path, selected_paths[1])
+        self.assertEqual(later_path.read_bytes(), second.read_bytes())
+        self.assertEqual(selected_paths[0].read_bytes(), first.read_bytes())
+
+    async def test_workspace_environment_stays_stable_and_nested_paths_can_be_read_and_sent(self):
+        paths = self.process_workspace()
+        script = ('import json,os; from pathlib import Path; '
+            'root=Path(os.environ["TGCHATBOT_SESSION_DIR"]); '
+            'target=root/"custom"/"report.txt"; target.parent.mkdir(parents=True,exist_ok=True); '
+            'target.write_text("A persistent report"); '
+            'print(json.dumps({"root":str(root),"cwd":os.getcwd()}))')
+        result = await self.remote.run_python(session_id='telegram:1', code=script, timeout_s=10)
+        expected_environment = {'root': paths.root, 'cwd': paths.root}
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(json.loads(result['stdout']), expected_environment)
+        later = await self.remote.run_shell(session_id='telegram:1',
+            command='python3 -c \'import json,os; print(json.dumps({"root":os.environ["TGCHATBOT_SESSION_DIR"],"cwd":os.getcwd()}))\'', timeout_s=10)
+        self.assertEqual(json.loads(later['stdout']), expected_environment)
+        read = await ReadDocTool(self.config, self.remote).run(
+            {'path': 'custom/report.txt', 'format': 'text'},
+            ToolContext('telegram:1', 'Participant'))
+        self.assertTrue(read.output['ok'], read.output)
+        self.assertEqual(read.evidence_parts[0].text, 'A persistent report')
+        sent = await FileSendTool(self.config, self.remote).run(
+            {'paths': ['custom/report.txt']}, ToolContext('telegram:1', 'Participant'))
+        try:
+            self.assertTrue(sent.output['ok'], sent.output)
+            self.assertEqual([(item.filename, item.workspace_path, item.path.read_bytes()) for item in sent.artifacts],
+                [('report.txt', 'custom/report.txt', b'A persistent report')])
+            self.assertEqual(Path(paths.root, 'custom/report.txt').read_text(), 'A persistent report')
+        finally:
+            for artifact in sent.artifacts:
+                artifact.discard()
+
     async def test_file_send_skips_a_missing_file_without_losing_available_files(self):
         paths = self.process_workspace()
-        original = Path(paths.outputs, 'available.txt')
+        original = Path(paths.root, 'available.txt')
         original.write_bytes(b'Available requested output')
         result = await FileSendTool(self.config, self.remote).run(
-            {'scope': 'outputs', 'paths': ['missing.txt', 'available.txt']},
+            {'paths': ['missing.txt', 'available.txt']},
             ToolContext('telegram:1', 'Participant'))
         try:
             self.assertTrue(result.output['ok'], result.output)
             self.assertEqual(result.output['requested_paths'], 2)
-            self.assertEqual(result.output['prepared_files'], ['available.txt'])
+            self.assertEqual(result.output['prepared_files'], [{'filename': 'available.txt', 'workspace_path': 'available.txt'}])
             self.assertEqual([artifact.path.read_bytes() for artifact in result.artifacts], [original.read_bytes()])
             self.assertEqual(list(self.config.artifact_dir.rglob('fetch-*')), [result.artifacts[0].path])
         finally:
@@ -164,19 +261,38 @@ class RemoteTransferWorkflows(unittest.IsolatedAsyncioTestCase):
                 artifact.discard()
         self.assertFalse(list(self.config.artifact_dir.rglob('fetch-*')))
 
-    async def test_file_inventory_respects_file_selection_independently_of_shell_display(self):
+    async def test_partial_send_of_same_basename_dates_reports_each_workspace_path(self):
         paths = self.process_workspace()
-        self.remote.ssh = replace(self.remote.ssh, max_stdout_chars=1)
-        for name in ('一份报告.txt', '另一份报告.txt'):
-            Path(paths.outputs, name).write_bytes(b'report')
-        selected = await self.remote.list_files(session_id='telegram:1', max_files=1)
-        self.assertEqual(selected, [{'name': '一份报告.txt', 'size_bytes': 6,
-                                    'path': str(Path(paths.outputs, '一份报告.txt'))}])
-        self.assertEqual(len(list(Path(paths.outputs).iterdir())), 2)
+        originals = {'2026-04-29/report.txt': b'Earlier report', '2026-04-30/report.txt': b'Later report'}
+        for relative, content in originals.items():
+            path = Path(paths.root, relative)
+            path.parent.mkdir(parents=True)
+            path.write_bytes(content)
+        result = await FileSendTool(self.config, self.remote).run(
+            {'paths': ['missing/report.txt', *originals]}, ToolContext('telegram:1', 'Participant'))
+        try:
+            self.assertTrue(result.output['ok'], result.output)
+            self.assertEqual(result.output['requested_paths'], 3)
+            self.assertEqual(result.output['prepared_files'], [
+                {'filename': 'report.txt', 'workspace_path': relative} for relative in originals])
+            self.assertEqual([artifact.path.read_bytes() for artifact in result.artifacts], list(originals.values()))
+            bot = SimpleNamespace(send_document=AsyncMock(side_effect=[SimpleNamespace(message_id=42), BadRequest('rejected')]))
+            first = await deliver_artifact(bot, chat_id=1, artifact=result.artifacts[0])
+            with self.assertLogs('tgchatbot.transports.artifact_delivery', level='ERROR'):
+                second = await deliver_artifact(bot, chat_id=1, artifact=result.artifacts[1])
+            self.assertTrue(first['sent'])
+            self.assertFalse(second['sent'])
+            self.assertEqual([first['workspace_path'], second['workspace_path']], list(originals))
+            self.assertTrue(all(Path(paths.root, relative).read_bytes() == content for relative, content in originals.items()))
+        finally:
+            for artifact in result.artifacts:
+                artifact.discard()
 
     async def test_python_source_with_shell_delimiter_executes_unchanged(self):
-        paths = RemoteSessionPaths(str(self.root), str(self.root / 'inputs'), str(self.root / 'outputs'))
+        paths = RemoteSessionPaths(str(self.root))
         self.remote.ensure_session_dirs.return_value = paths
+        existing_script = self.root / 'run.py'
+        existing_script.write_text('print("My saved script")\n')
 
         async def local_process(command, *, timeout_s):
             # Execute the real transport's generated shell locally, in this
@@ -192,7 +308,7 @@ class RemoteTransferWorkflows(unittest.IsolatedAsyncioTestCase):
         result = await self.remote.run_python(session_id='telegram:1', code=code, timeout_s=10)
         self.assertTrue(result['ok'], result['stderr'])
         self.assertEqual(result['stdout'], 'first\nPYCODE\nlast\n')
-        self.assertEqual((self.root / 'run.py').read_text(), code)
+        self.assertEqual(existing_script.read_text(), 'print("My saved script")\n')
 
     async def test_delivery_receipt_follows_ack_and_only_transfer_copy_is_deleted(self):
         original = self.root / 'original.txt'
@@ -273,15 +389,12 @@ class RemoteTransferWorkflows(unittest.IsolatedAsyncioTestCase):
                         process.kill()
                         await process.wait()
 
-    async def test_cancelled_input_upload_stops_child_before_reporting_or_caching_success(self):
+    async def test_cancelled_input_upload_stops_child_before_reporting_success(self):
         path = self.root / 'input.txt'
         path.write_bytes(b'original attachment')
         self.remote.ensure_master = AsyncMock()
-        self.remote._prune_and_list_input_paths = AsyncMock()
         await self.assert_cancelled_child_is_reaped(
             lambda: self.remote.sync_inputs('telegram:1', [path]))
-        self.remote._prune_and_list_input_paths.assert_not_awaited()
-        self.assertEqual(self.remote._synced_stats.get('telegram:1'), {})
         self.assertEqual(path.read_bytes(), b'original attachment')
 
     async def test_cancelled_remote_path_resolution_leaves_no_transfer_copies(self):

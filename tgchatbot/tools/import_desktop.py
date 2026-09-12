@@ -207,7 +207,7 @@ def _attachment_hint(record: dict[str, Any], kind: str, filename: str, *, availa
     state = 'image available' if available else 'media unavailable in bot workspace'
     if thumbnail:
         state += '; export thumbnail only (one still image; animation unavailable)'
-    return f'[Imported attachment: {kind}{emoji_hint}; reference={json.dumps(filename, ensure_ascii=False)}; {state}]'
+    return f'[Imported attachment: {kind}{emoji_hint}; export_reference={json.dumps(filename, ensure_ascii=False)}; {state}]'
 
 
 def _import_visual(message: ConversationMessage, record: dict[str, Any], export_root: Path,
@@ -287,7 +287,7 @@ def _same_import_source(original: ConversationMessage, incoming: ConversationMes
 
 async def _sync_import_attachment(message: ConversationMessage, record: dict[str, Any], *,
         session_id: str, export_root: Path, config: TelegramConfig,
-        remote_workspace, artifact_store: ArtifactStore | None, previous=None) -> None:
+        remote_workspace, artifact_store: ArtifactStore | None) -> None:
     attachment = _attachment(record)
     if attachment is None or record.get('photo') or attachment[0] == 'sticker':
         return
@@ -300,10 +300,6 @@ async def _sync_import_attachment(message: ConversationMessage, record: dict[str
     descriptor = MessagePart(PartKind.FILE, filename=Path(filename).name,
         mime_type=mime or 'application/octet-stream', size_bytes=size_bytes, remote_sync=False,
         origin='attachment_reference')
-    previous_file = None
-    if previous is not None and _same_import_source(previous.message, message):
-        previous_file = next((part for part in previous.message.parts
-            if part.kind == PartKind.FILE and part.artifact_path and part.remote_sync), None)
     if source is None:
         descriptor.detail = 'remote copy unavailable: file was not included in this export'
     elif config.max_document_bytes <= 0:
@@ -315,22 +311,19 @@ async def _sync_import_attachment(message: ConversationMessage, record: dict[str
     else:
         if artifact_store is None:
             raise ValueError('Remote import needs the configured artifact store for temporary copies')
-        # Only copies under the shared transfer store reach the sync/cleanup
-        # owner. A prior successful reference supplies its existing basename so
-        # reimport updates that remote file rather than creating another copy.
+        # Only disposable copies reach the shared sync/cleanup owner. Remote
+        # placement uses the source timestamp and original attachment filename.
         try:
             with tempfile.TemporaryDirectory(prefix='import-', dir=artifact_store.root) as temporary:
                 staging = ArtifactStore(Path(temporary))
-                if previous_file is not None:
-                    staged = staging.root / Path(previous_file.artifact_path).name
-                else:
-                    staged = staging.save_bytes(chat_id=session_id, filename=filename, data=b'')
+                staged = staging.save_bytes(chat_id=session_id, filename=filename, data=b'')
                 await asyncio.to_thread(shutil.copyfile, source, staged)
                 pending = replace(descriptor, artifact_path=str(staged), remote_sync=True,
                     size_bytes=staged.stat().st_size)
-                synced = await sync_attachment_parts(session_id, [pending], remote_workspace)
+                synced = await sync_attachment_parts(session_id, [pending], remote_workspace,
+                    sent_at=message.metadata.get('sent_at'))
             descriptor = next(part for part in synced if part.kind == PartKind.FILE)
-            # Keep the shared live workflow's account of upload and rotation.
+            # Keep the shared live workflow's account of the upload.
             message.parts.extend(part for part in synced if part.kind == PartKind.TEXT)
         except OSError:
             descriptor.detail = 'remote copy unavailable: exported file could not be read'
@@ -515,12 +508,12 @@ async def import_file(store: PostgresStore, path: Path, *, chat_id: int,
                     if remote_workspace and remote_workspace.enabled and (previous is None
                             or not _same_import_source(previous.message, message)):
                         # Commit source identity/text before any remote transfer.
-                        previous = await store.append_message(session_id, message,
+                        await store.append_message(session_id, message,
                             expected_scope=scope, generation_only=True)
                 await asyncio.to_thread(_import_visual, message, record, export_root, telegram_config)
                 await _sync_import_attachment(message, record, session_id=session_id, export_root=export_root,
                     config=telegram_config, remote_workspace=remote_workspace,
-                    artifact_store=artifact_store, previous=previous)
+                    artifact_store=artifact_store)
             stored = await _retained_import(store, session_id, message, scope)
             if stored is None:
                 stored = await store.append_message(session_id, message, expected_scope=scope, generation_only=True)

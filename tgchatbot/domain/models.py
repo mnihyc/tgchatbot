@@ -170,6 +170,7 @@ class OutboundArtifact:
     mime_type: str | None = None
     caption: str | None = None
     temporary: bool = False
+    workspace_path: str | None = None
 
     def discard(self) -> None:
         """Release an owned transfer copy, never the original workspace file."""

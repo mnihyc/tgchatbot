@@ -10,9 +10,6 @@ from tgchatbot.tools.remote_workspace import RemoteWorkspaceClient
 
 logger = logging.getLogger(__name__)
 
-_ALLOWED_SCOPES = {'outputs', 'inputs', 'workspace'}
-
-
 class FileSendTool:
     def __init__(self, config: AppConfig, remote: RemoteWorkspaceClient) -> None:
         self.config = config
@@ -21,18 +18,18 @@ class FileSendTool:
             name='file_send',
             description=(
                 'Prepare selected workspace files for delivery to this chat. '
-                'Paths resolve within the requested inputs, outputs or workspace scope; known workspace absolute paths are accepted. '
+                'Paths are relative to the session directory; absolute paths within it are also accepted. '
+                'Returned workspace_path values are relative to that directory. '
                 'This returns file and delivery status, not file contents for analysis. '
                 'Wait for a confirmed delivery result before saying the files were sent.'
             ),
             parameters_schema={
                 'type': 'object',
                 'properties': {
-                    'scope': {'type': 'string', 'enum': ['outputs', 'inputs', 'workspace']},
                     'paths': {'type': 'array', 'items': {'type': 'string'}, 'minItems': 1,
                               'maxItems': config.ssh_exec.max_output_files},
                 },
-                'required': ['scope', 'paths'],
+                'required': ['paths'],
                 'additionalProperties': False,
             },
             runner=self,
@@ -40,18 +37,17 @@ class FileSendTool:
 
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         try:
-            scope = self._normalize_scope(args.get('scope'))
             paths = self._normalize_paths(args.get('paths'))
             artifacts = await self.remote.fetch_files(
                 session_id=ctx.session_id,
                 remote_paths=paths,
-                scope=scope,
             )
             output = {
                 'ok': bool(artifacts),
-                'scope': scope,
                 'requested_paths': len(paths),
-                'prepared_files': [artifact.filename for artifact in artifacts],
+                'prepared_files': [dict(filename=artifact.filename,
+                    **({'workspace_path': artifact.workspace_path} if artifact.workspace_path else {}))
+                    for artifact in artifacts],
                 'delivery_state': 'pending' if artifacts else 'unavailable',
                 'count': len(artifacts),
             }
@@ -60,15 +56,8 @@ class FileSendTool:
                 output['error'] = 'No matching files were available to send'
             return ToolResult(call_id='', name=self.spec.name, output=output, artifacts=artifacts)
         except Exception as exc:
-            logger.exception('file_send failed scope=%s', args.get('scope', 'outputs'))
+            logger.exception('file_send failed')
             return ToolResult(call_id='', name=self.spec.name, output={'ok': False, 'error': f'{exc.__class__.__name__}: {exc}'})
-
-    @staticmethod
-    def _normalize_scope(value: Any) -> str:
-        scope = str(value or 'outputs').strip().lower()
-        if scope not in _ALLOWED_SCOPES:
-            raise RuntimeError(f'Unsupported file scope: {scope}')
-        return scope
 
     @staticmethod
     def _normalize_paths(value: Any) -> list[str]:

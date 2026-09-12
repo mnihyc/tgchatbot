@@ -16,6 +16,8 @@ async def deliver_artifact(bot, *, chat_id: int, artifact: OutboundArtifact,
                            message_thread_id: int | None = None,
                            direct_messages_topic_id: int | None = None) -> dict:
     receipt = {'filename': artifact.filename, 'sent': False, 'delivery_state': 'failed'}
+    if artifact.workspace_path:
+        receipt['workspace_path'] = artifact.workspace_path
     submitted = False
     destination = {'chat_id': chat_id, 'reply_to_message_id': reply_to_message_id}
     if message_thread_id is not None:

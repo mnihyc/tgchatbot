@@ -137,7 +137,6 @@ class SSHExecConfig:
     max_tool_timeout_s: int
     max_stdout_chars: int
     max_stderr_chars: int
-    max_input_files: int
     max_input_file_bytes: int
     max_output_files: int
     max_output_file_bytes: int
@@ -427,7 +426,6 @@ def load_config(*, require_telegram: bool = True) -> AppConfig:
             max_tool_timeout_s=int(os.getenv('SSH_EXEC_MAX_TOOL_TIMEOUT_S', '120')),
             max_stdout_chars=int(os.getenv("SSH_EXEC_MAX_STDOUT_CHARS", "16000")),
             max_stderr_chars=int(os.getenv("SSH_EXEC_MAX_STDERR_CHARS", "8000")),
-            max_input_files=int(os.getenv("SSH_EXEC_MAX_INPUT_FILES", "6")),
             max_input_file_bytes=int(os.getenv("SSH_EXEC_MAX_INPUT_FILE_BYTES", str(8 * 1024 * 1024))),
             max_output_files=int(os.getenv("SSH_EXEC_MAX_OUTPUT_FILES", "5")),
             max_output_file_bytes=int(os.getenv("SSH_EXEC_MAX_OUTPUT_FILE_BYTES", str(8 * 1024 * 1024))),

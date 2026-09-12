@@ -10,23 +10,22 @@ class ReadDocTool:
     def __init__(self, config, remote):
         self.config, self.remote = config, remote
         self.spec = ToolSpec(name='read_doc',
-            description='Read one workspace file in the requested format. Optionally select text lines or PDF pages. Returns contents for inspection.',
+            description='Read one file in this chat\'s remote workspace in the requested format. Optionally select text lines or PDF pages. Returns contents for inspection.',
             parameters_schema={'type': 'object', 'properties': {
-                'scope': {'type': 'string', 'enum': ['inputs', 'outputs', 'workspace']},
-                'path': {'type': 'string'},
+                'path': {'type': 'string', 'description': 'Path relative to the session directory, or an absolute path within it.'},
                 'format': {'type': 'string', 'enum': ['text', 'image', 'pdf']},
                 'start': {'type': 'integer', 'description': 'First line (text) or page (PDF), one-based and inclusive.'},
                 'end': {'type': 'integer', 'description': 'Last line or page, inclusive. Omit the range to read the complete file.'},
-            }, 'required': ['scope', 'path', 'format'], 'additionalProperties': False}, runner=self)
+            }, 'required': ['path', 'format'], 'additionalProperties': False}, runner=self)
 
     async def run(self, args: dict, ctx: ToolContext) -> ToolResult:
         output, parts = {}, []
         try:
             if not self.remote.enabled:
                 raise ValueError('Remote workspace is not configured')
-            scope, path, fmt = args.get('scope'), str(args.get('path') or '').strip(), args.get('format')
-            if scope not in {'inputs', 'outputs', 'workspace'} or not path:
-                raise ValueError('Specify a workspace scope and file path')
+            path, fmt = str(args.get('path') or '').strip(), args.get('format')
+            if not path:
+                raise ValueError('Specify a workspace file path')
             if fmt not in {'text', 'image', 'pdf', 'audio', 'video'}:
                 raise ValueError('Unsupported file format')
             if fmt in {'audio', 'video'}:
@@ -39,10 +38,10 @@ class ReadDocTool:
                 'chars_per_token': TokenEstimator.TEXT_CHARS_PER_TOKEN,
                 'image_tokens': TokenEstimator.IMAGE_TOKENS, 'part_overhead': TokenEstimator.PART_OVERHEAD,
                 'pdf_scale': self.config.read_doc.pdf_scale, 'max_image_pixels': self.config.read_doc.max_image_pixels}
-            result = await self.remote.inspect_file(session_id=ctx.session_id, scope=scope, path=path,
+            result = await self.remote.inspect_file(session_id=ctx.session_id, path=path,
                 format=fmt, start=args.get('start'), end=args.get('end'), limits=limits)
             output = {key: value for key, value in result.items() if key != 'parts'}
-            output.update(scope=scope, path=path, format=fmt)
+            output.update(path=path, format=fmt)
             if result.get('ok'):
                 parts = [MessagePart(kind=PartKind(part['kind']), text=part.get('text'),
                     filename=part.get('filename'), mime_type=part.get('mime_type'),

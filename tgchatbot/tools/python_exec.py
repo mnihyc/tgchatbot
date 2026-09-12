@@ -19,8 +19,8 @@ class PythonExecTool:
             name='python_exec',
             description=(
                 'Run Python 3 code in this chat\'s persistent remote workspace for structured analysis and file transformations. '
-                'Use the supplied TGCHATBOT_INPUT_DIR, TGCHATBOT_OUTPUT_DIR and TGCHATBOT_SESSION_DIR environment paths. '
-                'Only successfully mirrored uploads are available there; files may change after edits. '
+                'The working directory is TGCHATBOT_SESSION_DIR; synced files are referenced relative to it under YYYY-MM-DD/. '
+                'Use dated or custom subfolders for new files. Files may be overwritten. '
                 'Print useful results. Producing a file does not send it; use file_send when needed.'
             ),
             parameters_schema={
