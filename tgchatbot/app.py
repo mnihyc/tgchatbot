@@ -51,7 +51,7 @@ def _build_providers(config) -> dict[str, object]:
 def main() -> None:
     load_dotenv()
     config = load_config()
-    configure_logging(config.log_level)
+    configure_logging(config.log_level, timezone_name=config.default_metadata_timezone)
     # Container recreation may reuse a PID while retaining /tmp. Readiness
     # belongs to this startup, not a recent marker from the previous process.
     marker = health_path()

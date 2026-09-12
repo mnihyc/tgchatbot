@@ -10,9 +10,10 @@ PromptInjectionMode.EXACT.
 
 from tgchatbot.stickers.guidance import STICKER_GUIDANCE
 from tgchatbot.domain.models import ChatMode, PromptInjectionMode, SessionSettings, StickerMode
+from tgchatbot.domain.timestamps import resolve_timezone
 
 
-def build_system_prompt(settings: SessionSettings) -> str:
+def build_system_prompt(settings: SessionSettings, *, timezone: str | None = None) -> str:
     custom = settings.system_prompt.strip()
     if settings.prompt_injection_mode == PromptInjectionMode.EXACT:
         return custom or SessionSettings().system_prompt
@@ -46,7 +47,7 @@ def build_system_prompt(settings: SessionSettings) -> str:
         'a queued or unknown outcome is not success. Include operational details only when they help the request.'
     )
     sticker_guidance = STICKER_GUIDANCE if settings.sticker_mode == StickerMode.AUTO and settings.mode != ChatMode.CHAT else ''
-    time_guidance = f'Use {settings.metadata_timezone} for local dates and times.' if settings.metadata_timezone else ''
+    time_guidance = f'Use {resolve_timezone(timezone).key} for local dates and times.'
     return '\n\n'.join(part for part in (
         custom, mode_guidance, time_guidance, conversation_guidance, memory_guidance, reply_guidance, sticker_guidance,
     ) if part.strip())

@@ -8,6 +8,8 @@ from typing import Any
 from collections.abc import Mapping
 
 from tgchatbot.domain.models import ConversationMessage, MessagePart, MessageRole, PartKind
+from tgchatbot.domain.profiles import present_profile
+from tgchatbot.domain.timestamps import format_timestamp_fields, resolve_timezone
 
 
 def utc_time(value: Any) -> str | None:
@@ -75,7 +77,8 @@ def telegram_metadata(message: Any, *, is_edit: bool = False) -> dict[str, Any]:
     return metadata
 
 
-def attribution(message: ConversationMessage, *, message_id: int | None = None) -> dict[str, Any]:
+def attribution(message: ConversationMessage, *, message_id: int | None = None,
+                timezone: str | None = 'UTC') -> dict[str, Any]:
     source = message.metadata or {}
     result = {key: source[key] for key in (
         'actor_id', 'actor_kind', 'actor_name', 'actor_username', 'sent_at', 'edited_at', 'source', 'source_chat_id',
@@ -83,12 +86,55 @@ def attribution(message: ConversationMessage, *, message_id: int | None = None) 
     ) if source.get(key) is not None}
     if message_id is not None:
         result['message_id'] = message_id
+    return present_attribution(result, timezone)
+
+
+def present_attribution(record: Mapping[str, Any], timezone: str | None = None) -> dict[str, Any]:
+    result = format_timestamp_fields(record, ('sent_at', 'edited_at'), timezone)
+    if isinstance(result.get('forward_origin'), Mapping):
+        result['forward_origin'] = format_timestamp_fields(result['forward_origin'], ('date', 'forwarded_date'), timezone)
+    if isinstance(result.get('external_reply'), Mapping):
+        external = dict(result['external_reply'])
+        if isinstance(external.get('origin'), Mapping):
+            external['origin'] = format_timestamp_fields(external['origin'], ('date',), timezone)
+        result['external_reply'] = external
     return result
+
+
+def present_tool_output(name: str, output: Mapping[str, Any], timezone: str | None = None) -> dict[str, Any]:
+    """Project the defined timestamp fields of app-owned memory tool results."""
+    result = dict(output)
+    if name in {'memory_search', 'memory_read'} and 'messages' in output:
+        result['messages'] = [present_attribution(record, timezone) for record in output['messages']]
+    elif name == 'user_profile_fetch':
+        result = format_timestamp_fields(output, ('as_of', 'fetched_at'), timezone)
+        if 'profiles' in output:
+            result['profiles'] = [present_profile(profile, timezone) for profile in output['profiles']]
+        if 'timezone' in output:
+            result['timezone'] = resolve_timezone(timezone).key
+    return result
+
+
+def present_image_evidence(part: MessagePart, timezone: str | None = None) -> MessagePart:
+    """Project the app-owned image label; literal document/user text stays untouched."""
+    prefix = '[Original image evidence: '
+    if (part.kind != PartKind.TEXT or not (part.origin or '').startswith('memory_image:')
+            or not (part.text or '').startswith(prefix) or not part.text.endswith(']')):
+        return part
+    try:
+        record = json.loads(part.text[len(prefix):-1])
+    except json.JSONDecodeError:
+        return part
+    if not isinstance(record, dict):
+        return part
+    return replace(part, text=prefix + json.dumps(present_attribution(record, timezone),
+        ensure_ascii=False, default=str) + ']')
 
 
 def message_evidence(source: Mapping[str, Any], *, message_id: int | None,
                      role: str | MessageRole | None, fragments: list[dict],
-                     total_characters: int, images: list[dict] | None = None) -> dict[str, Any]:
+                     total_characters: int, images: list[dict] | None = None,
+                     timezone: str | None = None) -> dict[str, Any]:
     """Project an original's supplied slices; selection, bounds and persistence belong to callers."""
     metadata = source.get('metadata') or {}
 
@@ -107,9 +153,9 @@ def message_evidence(source: Mapping[str, Any], *, message_id: int | None,
         record['message_id'] = message_id
     record['speaker'] = speaker
     if value('sent_at') is not None:
-        record['sent_at'] = utc_time(value('sent_at'))
+        record['sent_at'] = value('sent_at')
     if value('edited_at') is not None:
-        record['edited_at'] = utc_time(value('edited_at'))
+        record['edited_at'] = value('edited_at')
     role = role.value if isinstance(role, MessageRole) else role
     if role and role != 'user':
         record['role'] = role
@@ -178,17 +224,18 @@ def message_evidence(source: Mapping[str, Any], *, message_id: int | None,
                 record[key] = value(key)
     if images:
         record['images'] = images
-    return record
+    return present_attribution(record, timezone)
 
 
-def attributed_message(message: ConversationMessage, *, message_id: int | None = None) -> ConversationMessage:
+def attributed_message(message: ConversationMessage, *, message_id: int | None = None,
+                       timezone: str | None = None) -> ConversationMessage:
     # The assistant role already identifies our own output. Adding transport
     # labels there teaches an output format the agent should never generate.
     # Incoming peers (including other bots) use USER and retain attribution.
     if message.role == MessageRole.ASSISTANT or not message.metadata.get('source'):
         return message
     identity = message_evidence(message.metadata, message_id=message_id, role=message.role,
-        fragments=[], total_characters=0)
+        fragments=[], total_characters=0, timezone=timezone)
     identity.pop('fragments')
     label = json.dumps(identity, ensure_ascii=False, default=str)
     return replace(message, parts=[MessagePart(kind=PartKind.TEXT,

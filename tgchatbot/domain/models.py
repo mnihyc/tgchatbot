@@ -5,8 +5,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from tgchatbot.settings_schema import DEFAULT_METADATA_TIMEZONE
-
 
 class ChatMode(str, Enum):
     CHAT = "chat"
@@ -155,7 +153,6 @@ class SessionSettings:
     group_spontaneous_reply_delay_s: float | None = None
     reply_delay_s: float | None = None
     metadata_injection_mode: str = "on"
-    metadata_timezone: str = DEFAULT_METADATA_TIMEZONE
     system_prompt: str = field(default_factory=default_system_prompt)
 
 

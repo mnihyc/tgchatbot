@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import json
+from contextlib import redirect_stdout
+from datetime import timedelta
 import os
 from types import SimpleNamespace
 import unittest
@@ -12,7 +16,7 @@ from psycopg.types.json import Jsonb
 from tests.business_helpers import BusinessTestCase
 from tgchatbot.domain.models import ConversationMessage, MessagePart, MessageRole, PartKind, ProviderResponse
 from tgchatbot.embeddings import EmbeddingConfig
-from tgchatbot.tools.memory import audit_records, audit_state_records, parser, rebuild, retry_failed, status_records, work
+from tgchatbot.tools.memory import audit_records, audit_state_records, emit, parser, rebuild, retry_failed, status_records, work
 
 
 class MemoryOperationsTests(BusinessTestCase):
@@ -28,6 +32,28 @@ class MemoryOperationsTests(BusinessTestCase):
         return await self.store.append_message(session, ConversationMessage.user_text(text, metadata={
             'source': 'telegram', 'source_chat_id': session.split(':')[-1], 'source_message_id': str(source_id),
             'actor_id': 'telegram:user:7', 'actor_name': 'Alex', **metadata}))
+
+    async def test_cli_displays_database_times_in_configured_zone_without_rewriting_original_evidence(self):
+        timestamp = '2026-09-06T16:24:08+00:00'
+        prose = 'Original quoted time: 2026-09-06T16:24:08Z'
+        native = {'timestamp': timestamp, 'text': prose}
+        source = await self.original(prose, 1, sent_at=timestamp,
+            desktop={'date': '2026-09-07T00:24:08'}, raw_provider_evidence=native)
+        records = [row async for row in audit_records(self.store, self.session, message_id=source.db_id)]
+        self.assertEqual(records[0]['sent_at'].utcoffset(), timedelta(0))
+        for zone, expected in [('Asia/Singapore', '2026-09-07T00:24:08+08:00'),
+                               ('America/New_York', '2026-09-06T12:24:08-04:00')]:
+            output = io.StringIO()
+            with patch.dict(os.environ, {'DEFAULT_METADATA_TIMEZONE': zone}), redirect_stdout(output):
+                emit(records[0])
+            shown = json.loads(output.getvalue())
+            self.assertEqual(shown['sent_at'], expected)
+            self.assertEqual(shown['body'], prose)
+            self.assertEqual(shown['metadata']['sent_at'], timestamp)
+            self.assertEqual(shown['metadata']['desktop'], {'date': '2026-09-07T00:24:08'})
+            self.assertEqual(shown['metadata']['raw_provider_evidence'], native)
+        reread = [row async for row in audit_records(self.store, self.session, message_id=source.db_id)]
+        self.assertEqual(reread, records, 'CLI rendering must not modify stored or loaded originals')
 
     async def fail_job(self, job, payload=None):
         async with self.store.pool.connection() as conn:

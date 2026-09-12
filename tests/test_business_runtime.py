@@ -17,6 +17,7 @@ from tgchatbot.domain.models import (
     ChatMode, ConversationMessage, MessagePart, MessageRole, PartKind,
     PromptInjectionMode, ProviderResponse, StickerMode, ToolCall, ToolHistoryMode,
 )
+from tgchatbot.domain.provenance import present_tool_output
 
 
 def text_of(messages):
@@ -112,7 +113,7 @@ class RuntimeWorkflowTests(BusinessTestCase):
         self.assertEqual(recalled[own.db_id]['fragments'], [{'offset': 0, 'text': own_text}])
         self.assertEqual(recalled[own.db_id]['speaker']['id'], 'telegram:user:999')
         self.assertEqual(recalled[own.db_id]['reply_to_source_id'], '81')
-        self.assertEqual(recalled[own.db_id]['sent_at'], '2026-01-02T03:04:05+00:00')
+        self.assertEqual(recalled[own.db_id]['sent_at'], '2026-01-02T11:04:05+08:00')
         self.assertEqual(recalled[own.db_id]['topic_id'], '77')
         self.assertEqual(recalled[peer.db_id]['speaker']['id'], 'telegram:user:888')
 
@@ -523,7 +524,9 @@ class ProfileContextWorkflowTests(BusinessTestCase):
         self.assertIn(self.actor, call.message.metadata["tool_payload"]["arguments"]["actor_ids"])
         sent_pair = [item for item in changed_history if item.metadata.get("synthetic_role") == "profile_refresh"]
         self.assertEqual([item.role for item in sent_pair], [MessageRole.TOOL, MessageRole.TOOL])
-        self.assertEqual(sent_pair[-1].metadata["tool_payload"]["output"], output)
+        self.assertTrue(output['as_of'].endswith('+00:00'))
+        self.assertEqual(sent_pair[-1].metadata["tool_payload"]["output"],
+            present_tool_output('user_profile_fetch', output, self.config.default_metadata_timezone))
         self.assertFalse(any(item.role == MessageRole.USER and self.claim in "\n".join(part.text or "" for part in item.parts)
                              for item in changed_history))
         raw = await self.store.list_uncompacted_messages(self.session)
@@ -554,7 +557,8 @@ class ProfileContextWorkflowTests(BusinessTestCase):
         restored_pair = [item for item in provider.requests[0]["messages"]
                          if item.metadata.get("synthetic_role") == "profile_refresh"]
         self.assertEqual([item.role for item in restored_pair], [MessageRole.TOOL, MessageRole.TOOL])
-        self.assertEqual(restored_pair[-1].metadata["tool_payload"]["output"], output)
+        self.assertEqual(restored_pair[-1].metadata["tool_payload"]["output"],
+            sent_pair[-1].metadata["tool_payload"]["output"])
 
     async def test_noop_or_failed_compaction_does_not_refresh_profiles(self):
         await self.seed_profile()

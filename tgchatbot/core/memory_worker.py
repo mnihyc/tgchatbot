@@ -13,6 +13,7 @@ import os
 from typing import Any
 
 from tgchatbot.domain.models import ChatMode, ConversationMessage, MessageRole
+from tgchatbot.domain.profiles import present_profile
 from tgchatbot.domain.provenance import attribution, utc_time
 from tgchatbot.embeddings import EmbeddingConfig, EmbeddingDocument
 from tgchatbot.operational import from_env
@@ -596,7 +597,8 @@ class MemoryWorker:
             if not 0 <= span['start'] < span['end'] <= len(body):
                 raise StaleScopeError('Profile span no longer matches its original source')
             actors.add(actor)
-            evidence.append({**attribution(row.message, message_id=row.db_id),
+            evidence.append({**attribution(row.message, message_id=row.db_id,
+                timezone=self.config.default_metadata_timezone),
                 'text': body[span['start']:span['end']], 'source_span': span, 'source_characters': len(body)})
         snapshot = await self.store.fetch_profile_snapshot(job['session_id'], sorted(actors | {'agent'}),
             max_bytes=self.config.memory.profile_bytes, for_learning=True)
@@ -609,7 +611,8 @@ class MemoryWorker:
             raise StaleScopeError('Profile source or job lease changed')
         response = await provider.generate(settings=profile_settings,
             messages=[ConversationMessage.user_text(json.dumps({'original_evidence': evidence,
-                'current_profiles': snapshot['profiles']}, ensure_ascii=False, default=str))],
+                'current_profiles': [present_profile(profile, self.config.default_metadata_timezone)
+                    for profile in snapshot['profiles']]}, ensure_ascii=False, default=str))],
             instructions=_PROFILE_INSTRUCTIONS.format(profile_bytes=self.config.memory.profile_bytes),
             tools=[], extra_input_items=None, response_schema=_PATCH_SCHEMA, response_schema_name='profile_patch')
         data = json.loads(response.final_text)

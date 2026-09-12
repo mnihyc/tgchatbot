@@ -190,6 +190,7 @@ class PostgresStore:
 
     async def _configure(self, conn: AsyncConnection) -> None:
         await conn.execute(sql.SQL('SET search_path TO {}, public').format(sql.Identifier(self.schema)))
+        await conn.execute("SET TIME ZONE 'UTC'")
         for name, value in (('statement_timeout', self.config.statement_timeout_s),
                             ('lock_timeout', self.config.lock_timeout_s)):
             if value is not None:
@@ -838,9 +839,11 @@ class PostgresStore:
         return await describe_message_images(self, session_id, _ids(message_ids), expected_scope=expected_scope)
 
     async def resolve_message_images(self, session_id: str, message_ids: Sequence[int], image_ids: Sequence[str], *,
-                                    expected_scope: Mapping[str, Any] | None = None) -> dict[str, Any]:
+                                    expected_scope: Mapping[str, Any] | None = None,
+                                    timezone: str | None = 'UTC') -> dict[str, Any]:
         from tgchatbot.storage.message_images import resolve_message_images
-        return await resolve_message_images(self, session_id, _ids(message_ids), image_ids, expected_scope=expected_scope)
+        return await resolve_message_images(self, session_id, _ids(message_ids), image_ids,
+            expected_scope=expected_scope, timezone=timezone)
 
     async def list_unfinished_tool_calls(self, session_id: str) -> list[StoredConversationMessage]:
         """Recover declared calls without rereading the whole conversation."""

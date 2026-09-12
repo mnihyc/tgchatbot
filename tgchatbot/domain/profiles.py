@@ -4,6 +4,26 @@ from __future__ import annotations
 from datetime import datetime
 import json
 
+from tgchatbot.domain.timestamps import format_timestamp_fields
+
+
+def present_profile(document: dict, timezone: str | None = None) -> dict:
+    """Format profile temporal fields for a reader without changing current membership."""
+    result = dict(document)
+    if document.get('identity'):
+        identity = dict(document['identity'])
+        if identity.get('last_message'):
+            identity['last_message'] = format_timestamp_fields(identity['last_message'], ('sent_at',), timezone)
+        result['identity'] = identity
+    if 'facts' in document:
+        result['facts'] = []
+        for fact in document['facts']:
+            rendered = format_timestamp_fields(fact, ('valid_from', 'valid_to'), timezone)
+            if fact.get('source_dates'):
+                rendered['source_dates'] = format_timestamp_fields(fact['source_dates'], ('first', 'last'), timezone)
+            result['facts'].append(rendered)
+    return result
+
 
 def profile_size(value: dict) -> int:
     return len(json.dumps(value, ensure_ascii=False, default=lambda item: item.isoformat()

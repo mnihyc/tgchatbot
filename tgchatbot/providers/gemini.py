@@ -120,8 +120,8 @@ class GeminiProvider:
 
         tool_config: dict[str, Any] = {}
         if tool_declarations:
-            mode = 'VALIDATED' if server_side_tool_enabled else 'AUTO'
-            tool_config['functionCallingConfig'] = {'mode': mode}
+            # Constrain function syntax while retaining the choice to answer in text.
+            tool_config['functionCallingConfig'] = {'mode': 'VALIDATED'}
         if server_side_tool_enabled:
             tool_config['includeServerSideToolInvocations'] = True
         return request_tools, tool_config, server_side_tool_enabled

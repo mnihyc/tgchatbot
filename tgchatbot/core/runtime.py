@@ -6,8 +6,6 @@ import logging
 import math
 import re
 from uuid import uuid4, uuid5, NAMESPACE_URL
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from weakref import WeakValueDictionary
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
@@ -16,6 +14,7 @@ from typing import Any
 from psycopg.errors import QueryCanceled
 
 from tgchatbot.config import AppConfig
+from tgchatbot.domain.timestamps import format_timestamp
 from tgchatbot.core.context_state import (CompactionWorkingSet, LiveConversationState, MemoryBlock,
     StoredConversationMessage, is_auto_note_message, matching_tool_result)
 from tgchatbot.core.events import RuntimeEvent
@@ -40,7 +39,8 @@ from tgchatbot.domain.models import (
     ToolResult,
 )
 from tgchatbot.logging_config import clip_for_log
-from tgchatbot.domain.provenance import attributed_message, attribution, evidence_part_spans, message_evidence
+from tgchatbot.domain.provenance import (attributed_message, attribution, evidence_part_spans,
+    message_evidence, present_attribution, present_image_evidence, present_tool_output, utc_time)
 from tgchatbot.providers.base import ModelProvider, ProviderOutcomeError, RequestTokenEstimate
 from tgchatbot.settings_schema import (
     COMPACT_KEEP_RECENT_RATIO_MAX,
@@ -191,14 +191,17 @@ class AgentRuntime:
                                   summary_text: str | None = None, provider_name: str | None = None,
                                   metadata_update: dict[str, Any] | None = None,
                                   evidence_parts: list[MessagePart] | None = None) -> ConversationMessage:
-        summary = summary_text or self._tool_observation_summary(name=name, phase=phase, payload=payload)
+        if phase == 'result' and isinstance(payload.get('output'), dict):
+            payload = {**payload, 'output': present_tool_output(name, payload['output'], 'UTC')}
+        summary = summary_text or self._tool_observation_summary(name=name, phase=phase, payload=payload, timezone='UTC')
         metadata = {'tool_phase': phase, 'tool_payload': payload, 'tool_provider': provider_name}
         if metadata_update:
             metadata.update(metadata_update)
         return ConversationMessage(
             role=MessageRole.TOOL,
             name=name,
-            parts=[MessagePart(kind=PartKind.TEXT, text=summary, remote_sync=False, origin='tool_output'), *(evidence_parts or [])],
+            parts=[MessagePart(kind=PartKind.TEXT, text=summary, remote_sync=False, origin='tool_output'),
+                *(present_image_evidence(part, 'UTC') for part in evidence_parts or [])],
             metadata=metadata,
         )
 
@@ -304,7 +307,7 @@ class AgentRuntime:
             try:
                 await self._recover_interrupted_tools(session_id)
                 state = await self.store.load_compaction_window(session_id)
-                instructions = build_system_prompt(settings)
+                instructions = build_system_prompt(settings, timezone=self.config.default_metadata_timezone)
                 compactions = 0
                 active = state.more_raw or state.more_blocks
                 while True:
@@ -380,7 +383,7 @@ class AgentRuntime:
         policy = policy_for_mode(settings.mode)
         max_tool_rounds = self._effective_max_interaction_rounds(settings)
 
-        instructions = build_system_prompt(settings)
+        instructions = build_system_prompt(settings, timezone=self.config.default_metadata_timezone)
         # Publication can turn an empty catalog into a usable one while this
         # process is running. Refresh before the tool registry's availability gate.
         catalog = getattr(self.tool_registry, 'sticker_catalog', None)
@@ -634,7 +637,7 @@ class AgentRuntime:
                                     session_id=session_id,
                                     user_display_name=user_display_name,
                                     scope=_turn_scope.get(),
-                                    timezone=settings.metadata_timezone,
+                                    timezone=self.config.default_metadata_timezone,
                                     evidence_tokens=max(0, self._effective_compact_trigger_tokens(settings) - admitted_tokens),
                                     evidence_images=(max(0, self._effective_max_input_images(provider, settings) - admitted_images)
                                         if self._effective_max_input_images(provider, settings) is not None else None),
@@ -799,7 +802,7 @@ class AgentRuntime:
             allow_python_exec=policy_for_mode(settings.mode).allow_python_exec,
             allow_stickers=(settings.sticker_mode == StickerMode.AUTO),
         )
-        instructions = build_system_prompt(settings)
+        instructions = build_system_prompt(settings, timezone=self.config.default_metadata_timezone)
         sticker_stats = self.tool_registry.sticker_catalog.stats()
         remote = self.tool_registry.remote_workspace
         controls = provider.describe_controls(settings) if hasattr(provider, 'describe_controls') else {}
@@ -893,8 +896,8 @@ class AgentRuntime:
             'group_reply_delay_s_source': 'session' if (settings.group_reply_delay_s is not None or settings.reply_delay_s is not None) else 'default',
             'metadata_injection_mode': settings.metadata_injection_mode or 'on',
             'metadata_injection_mode_source': 'session' if (settings.metadata_injection_mode or 'on') != self.config.default_metadata_injection_mode else 'default',
-            'metadata_timezone': settings.metadata_timezone or self.config.default_metadata_timezone,
-            'metadata_timezone_source': 'session' if (settings.metadata_timezone or self.config.default_metadata_timezone) != self.config.default_metadata_timezone else 'default',
+            'metadata_timezone': self.config.default_metadata_timezone,
+            'metadata_timezone_source': 'environment',
             'system_prompt_chars': len(settings.system_prompt or ''),
             'raw_messages': len(state.raw_messages),
             'tool_history_messages': sum(1 for item in state.raw_messages if item.message.role == MessageRole.TOOL),
@@ -1070,11 +1073,11 @@ class AgentRuntime:
             return marker + text[-rlimit:]
         return text[:limit] + marker + text[-rlimit:]
 
-    def _tool_observation_summary(self, *, name: str, phase: str, payload: dict[str, Any]) -> str:
+    def _tool_observation_summary(self, *, name: str, phase: str, payload: dict[str, Any], timezone: str | None = None) -> str:
         if phase == 'call':
             return self._describe_tool_call(name, payload)
         if phase == 'result':
-            return self._describe_tool_result(name, payload)
+            return self._describe_tool_result(name, payload, timezone=timezone)
         if phase == 'delivery':
             return self._describe_tool_delivery(name, payload)
         payload_text = self._compact_json(payload)
@@ -1282,7 +1285,7 @@ class AgentRuntime:
         for item in state.raw_messages:
             mapped = self._history_message_for_provider(settings=settings, provider_name=provider.name, message=item.message)
             if mapped is not None:
-                raw_messages.append(attributed_message(mapped, message_id=item.db_id))
+                raw_messages.append(attributed_message(mapped, message_id=item.db_id, timezone=self.config.default_metadata_timezone))
         estimate = provider.estimate_request_tokens(
             settings=settings,
             messages=raw_messages,
@@ -1361,7 +1364,7 @@ class AgentRuntime:
             recent = await self.store.list_recent_participant_messages(session_id, expected_scope=_turn_scope.get())
             actor_ids = state.active_participant_ids(recent, trigger_message)
             output = await self.memory.fetch_profiles(session_id, actor_ids,
-                scope=_turn_scope.get(), timezone=settings.metadata_timezone)
+                scope=_turn_scope.get(), timezone=self.config.default_metadata_timezone)
         except QueryCanceled:
             # Automatic enrichment is best effort. Preserve the existing
             # stored-input/answer path when an optional query times out.
@@ -1485,14 +1488,14 @@ class AgentRuntime:
 
     def _continuation_history(self, state, *, settings, provider, native_from_id):
         """Rebase after admission; current native calls survive without stale outputs."""
-        entries = [(self._history_position_for_block(block),block.render_as_message())
+        entries = [(self._history_position_for_block(block),block.render_as_message(timezone=self.config.default_metadata_timezone))
             for block in self._select_blocks_for_prompt(state,settings=settings)]
         native_settings = replace(settings,tool_history_mode=ToolHistoryMode.NATIVE_SAME_PROVIDER)
         for position, stored in self._provider_history_rows(state.raw_messages):
             mapped = self._history_message_for_provider(settings=native_settings if stored.db_id>=native_from_id else settings,
                 provider_name=provider.name,message=stored.message)
             if mapped is not None:
-                entries.append(((position,1),attributed_message(mapped,message_id=stored.db_id)))
+                entries.append(((position,1),attributed_message(mapped, message_id=stored.db_id, timezone=self.config.default_metadata_timezone)))
         history = [message for _,message in sorted(entries,key=lambda item:item[0])]
         return history
 
@@ -1539,6 +1542,11 @@ class AgentRuntime:
     def _history_message_for_provider(self, *, settings: SessionSettings, provider_name: str, message: ConversationMessage) -> ConversationMessage | None:
         metadata = message.metadata if isinstance(message.metadata, dict) else {}
         base_metadata = {key: value for key, value in metadata.items() if key not in {'provider_native', 'provider_native_skip_same_provider'}}
+        if message.role == MessageRole.TOOL and metadata.get('tool_phase') == 'result':
+            payload = metadata.get('tool_payload') or {}
+            if isinstance(payload.get('output'), dict):
+                base_metadata['tool_payload'] = {**payload, 'output': present_tool_output(
+                    message.name, payload['output'], self.config.default_metadata_timezone)}
         provider_native = metadata.get('provider_native') if isinstance(metadata.get('provider_native'), dict) else None
         native_provider = str(provider_native.get('provider') or '').strip().lower() if provider_native else ''
         same_provider_native = (settings.tool_history_mode == ToolHistoryMode.NATIVE_SAME_PROVIDER
@@ -1554,6 +1562,14 @@ class AgentRuntime:
                 and metadata.get('tool_provider') == provider_name and metadata.get('tool_model') != settings.model):
             base_metadata['portable_tool_history'] = True
         prepared = self._clone_message(message, metadata=base_metadata)
+        prepared.parts = [present_image_evidence(part, self.config.default_metadata_timezone) for part in prepared.parts]
+        if metadata.get('synthetic_role') == 'reply_target':
+            target = present_attribution(metadata.get('reply_target') or {}, self.config.default_metadata_timezone)
+            prepared.metadata['reply_target'] = target
+            prefix = '[Application reply target: ' + json.dumps(target, ensure_ascii=False, default=str) + ']'
+            prepared.parts = [replace(part, text=prefix + part.text[part.text.find('\n'):])
+                if part.kind == PartKind.TEXT and part.text and part.text.startswith('[Application reply target: ')
+                and '\n' in part.text else part for part in prepared.parts]
         if message.role != MessageRole.TOOL:
             return prepared
         phase = str(metadata.get('tool_phase') or '').strip().lower()
@@ -1611,11 +1627,11 @@ class AgentRuntime:
             return state.provider_history_cache
         entries: list[tuple[tuple[int, int], ConversationMessage]] = []
         for block in selected_blocks:
-            entries.append((self._history_position_for_block(block), block.render_as_message()))
+            entries.append((self._history_position_for_block(block), block.render_as_message(timezone=self.config.default_metadata_timezone)))
         for position, item in self._provider_history_rows(state.raw_messages):
             mapped = self._history_message_for_provider(settings=settings, provider_name=provider_name, message=item.message)
             if mapped is not None:
-                mapped = attributed_message(mapped, message_id=item.db_id)
+                mapped = attributed_message(mapped, message_id=item.db_id, timezone=self.config.default_metadata_timezone)
                 entries.append(((position, 1), mapped))
         messages = [message for _key, message in sorted(entries, key=lambda item: item[0])]
         state.provider_history_cache = messages
@@ -1688,7 +1704,7 @@ class AgentRuntime:
     @staticmethod
     def _block_time_bounds(blocks: list[MemoryBlock]) -> tuple[str | None, str | None]:
         values = sorted(
-            value
+            utc_time(value)
             for block in blocks
             for value in (block.time_start, block.time_end)
             if value
@@ -2562,7 +2578,7 @@ class AgentRuntime:
                 if entry['kind'] == 'raw':
                     source_messages.extend(item.message for item in entry['messages'])
                 elif entry['block'] is not None:
-                    source_messages.append(entry['block'].render_as_message())
+                    source_messages.append(entry['block'].render_as_message(timezone=self.config.default_metadata_timezone))
             if not source_messages:
                 continue
             start_candidates = [item.db_id for item in raw_messages]
@@ -2691,7 +2707,7 @@ class AgentRuntime:
         source_messages = [self._compaction_source_message(item) for item in raw_messages]
         originals = await self._compaction_originals(session_id, raw_messages)
         normalized = self._normalize_compaction_messages(source_messages, originals=originals)
-        time_start, time_end = self._raw_message_time_bounds(raw_messages, settings.metadata_timezone)
+        time_start, time_end = self._raw_message_time_bounds(raw_messages)
         metadata_message = self._compaction_metadata_message(
             mode='toolspan',
             raw_messages=raw_messages,
@@ -2726,7 +2742,7 @@ class AgentRuntime:
         originals = await self._compaction_originals(session_id, raw_messages)
         normalized = self._normalize_compaction_messages(
             [source_lookup.get(id(message), message) for message in source_messages], originals=originals)
-        raw_start, raw_end = self._raw_message_time_bounds(raw_messages, settings.metadata_timezone)
+        raw_start, raw_end = self._raw_message_time_bounds(raw_messages)
         block_start, block_end = self._block_time_bounds(parent_blocks)
         time_start = min((value for value in (raw_start, block_start) if value), default=None)
         time_end = max((value for value in (raw_end, block_end) if value), default=None)
@@ -2752,7 +2768,7 @@ class AgentRuntime:
         }
 
     async def _make_digest_block_candidate(self, provider: ModelProvider, settings: SessionSettings, blocks: list[MemoryBlock]) -> dict[str, Any] | None:
-        source_messages = [block.render_as_message() for block in blocks]
+        source_messages = [block.render_as_message(timezone=self.config.default_metadata_timezone) for block in blocks]
         time_start, time_end = self._block_time_bounds(blocks)
         metadata_message = self._compaction_metadata_message(
             mode='digest',
@@ -2848,17 +2864,11 @@ class AgentRuntime:
             raise CompactionModelRequestFailed(provider_name=provider.name, mode=mode) from exc
 
     @staticmethod
-    def _raw_message_time_bounds(messages: list[StoredConversationMessage], timezone: str) -> tuple[str | None, str | None]:
+    def _raw_message_time_bounds(messages: list[StoredConversationMessage]) -> tuple[str | None, str | None]:
         values = sorted(item.created_at for item in messages if item.created_at)
         if not values:
             return None, None
-        try:
-            tz = ZoneInfo(timezone or "UTC")
-        except ZoneInfoNotFoundError:
-            tz = ZoneInfo('UTC')
-        start = datetime.fromtimestamp(values[0], tz=tz).isoformat()
-        end = datetime.fromtimestamp(values[-1], tz=tz).isoformat()
-        return start, end
+        return utc_time(values[0]), utc_time(values[-1])
 
     def _compaction_metadata_message(
         self,
@@ -2882,6 +2892,8 @@ class AgentRuntime:
                 if label_text and label_text not in participants:
                     participants.append(label_text)
         lines = ['[Compaction source metadata]']
+        time_start = format_timestamp(time_start, self.config.default_metadata_timezone)
+        time_end = format_timestamp(time_end, self.config.default_metadata_timezone)
         lines.append(f'- mode: {mode}')
         lines.append(f'- raw_message_count: {len(raw_messages)}')
         lines.append(f'- parent_block_count: {len(parent_blocks)}')
@@ -3086,14 +3098,15 @@ class AgentRuntime:
         if synthetic_role == 'reply_target':
             return ConversationMessage.assistant_text(
                 'Application selected this historical reply target: '
-                + json.dumps(metadata.get('reply_target') or {}, ensure_ascii=False, default=str),
+                + json.dumps(present_attribution(metadata.get('reply_target') or {},
+                    self.config.default_metadata_timezone), ensure_ascii=False, default=str),
                 metadata={'source_role': 'transport'})
         is_auto_note = synthetic_role == 'auto_user_note'
         if is_auto_note:
             text = self._normalize_auto_note_message(message)
             return ConversationMessage.assistant_text(text, metadata={'source_role': 'transport'}) if text else None
         original = original or message
-        source = attribution(original, message_id=metadata.get('compaction_source_message_id'))
+        source = attribution(original, message_id=metadata.get('compaction_source_message_id'), timezone=self.config.default_metadata_timezone)
         if message.name and not source.get('actor_name'):
             source['actor_name'] = message.name
         if (source or message.role == MessageRole.USER) and not synthetic_role:
@@ -3103,7 +3116,8 @@ class AgentRuntime:
             body = message_body(original)
             evidence = message_evidence({**source, 'parts': evidence_part_spans(original)},
                 message_id=metadata.get('compaction_source_message_id'), role=message.role,
-                fragments=[{'offset': 0, 'text': body}], total_characters=len(body))
+                fragments=[{'offset': 0, 'text': body}], total_characters=len(body),
+                timezone=self.config.default_metadata_timezone)
             annotation_parts = [part for part in message.parts
                 if (part.origin or '').strip().lower() != 'provenance'
                 and (part.kind != PartKind.TEXT
@@ -3273,9 +3287,10 @@ class AgentRuntime:
         prefix = f'Tool {name}'
         return prefix + (': ' + '; '.join(details) if details else ' invoked')
 
-    def _describe_tool_result(self, name: str, payload: dict[str, Any]) -> str:
+    def _describe_tool_result(self, name: str, payload: dict[str, Any], *, timezone: str | None = None) -> str:
         output = payload.get('output') if isinstance(payload.get('output'), dict) else {}
         if name in {'memory_search', 'memory_read', 'user_profile_fetch'}:
+            output = present_tool_output(name, output, timezone or self.config.default_metadata_timezone)
             # Retrieval owns result bounds. Preserve the evidence, identities,
             # source IDs and coverage status through replay and compaction.
             return (f'Tool {name} result (retrieved evidence; check dates and newer corrections):\n'

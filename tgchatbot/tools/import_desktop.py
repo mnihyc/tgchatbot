@@ -19,7 +19,6 @@ import tempfile
 from types import SimpleNamespace
 from typing import Any, Callable, Iterator
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 import ijson
 from ijson.common import ObjectBuilder
@@ -27,10 +26,10 @@ from ijson.common import ObjectBuilder
 from tgchatbot.domain.models import ConversationMessage, MessagePart, MessageRole, PartKind, SessionSettings
 from tgchatbot.config import TelegramConfig
 from tgchatbot.domain.provenance import telegram_actor, telegram_metadata, utc_time
+from tgchatbot.domain.timestamps import resolve_timezone
 from tgchatbot.media.attachments import sync_attachment_parts
 from tgchatbot.storage.artifacts import ArtifactStore
 from tgchatbot.operational import from_env
-from tgchatbot.settings_schema import DEFAULT_METADATA_TIMEZONE
 from tgchatbot.storage.postgres_store import PostgresStore, StaleScopeError
 
 
@@ -362,7 +361,7 @@ async def _retained_import(store: PostgresStore, session_id: str, message: Conve
 
 def desktop_message(record: dict[str, Any], chat: ExportChat, *, chat_id: int,
                     bot_user_id: int | None = None,
-                    timezone: str = DEFAULT_METADATA_TIMEZONE) -> ConversationMessage:
+                    timezone: str | None = None) -> ConversationMessage:
     try:
         source_id = str(record['id'])
         if not re.fullmatch(r'-?[0-9]+', source_id):
@@ -385,7 +384,7 @@ def desktop_message(record: dict[str, Any], chat: ExportChat, *, chat_id: int,
         if isinstance(value, str) and not value.isdigit():
             value = datetime.fromisoformat(value.replace('Z', '+00:00'))
             if value.tzinfo is None:
-                value = value.replace(tzinfo=ZoneInfo(timezone))
+                value = value.replace(tzinfo=resolve_timezone(timezone))
         return utc_time(value)
 
     message = SimpleNamespace(chat=SimpleNamespace(id=chat_id), message_id=message_id,
@@ -418,7 +417,7 @@ def desktop_message(record: dict[str, Any], chat: ExportChat, *, chat_id: int,
             metadata['forward_origin']['actor_name'] = str(record.get('forwarded_from') or 'Unknown sender')
         for key in ('forwarded_message_id', 'forwarded_date', 'saved_from'):
             if record.get(key) is not None:
-                metadata['forward_origin'][key] = record[key]
+                metadata['forward_origin'][key] = export_time(record[key]) if key == 'forwarded_date' else record[key]
     text = _text(record)
     parts = [MessagePart(PartKind.TEXT, text=text, remote_sync=False)]
     attachment = _attachment(record)
@@ -467,10 +466,12 @@ async def import_file(store: PostgresStore, path: Path, *, chat_id: int,
                       options: ImportConfig | None = None,
                       telegram_config: TelegramConfig | None = None,
                       remote_workspace=None, artifact_store: ArtifactStore | None = None,
+                      timezone: str | None = None,
                       progress: Callable[[ImportResult], None] | None = None) -> ImportResult:
     options = options if options is not None else from_env(ImportConfig, 'IMPORT')
     session_id = f'telegram:{chat_id}'
-    settings = await store.get_or_create_session(session_id, defaults or SessionSettings())
+    await store.get_or_create_session(session_id, defaults or SessionSettings())
+    timezone = resolve_timezone(timezone).key
     scope = await store.get_scope(session_id)
     chat = inspect_export(path, export_chat_id)
     export_root = path.parent.resolve()
@@ -479,7 +480,7 @@ async def import_file(store: PostgresStore, path: Path, *, chat_id: int,
         source_ids = []
         for record in batch:
             message = desktop_message(record, chat, chat_id=chat_id, bot_user_id=bot_user_id,
-                timezone=settings.metadata_timezone or DEFAULT_METADATA_TIMEZONE)
+                timezone=timezone)
             previous = None
             attachment = _attachment(record)
             if attachment is not None:
@@ -533,6 +534,7 @@ async def _run(args: argparse.Namespace) -> None:
             bot_user_id=int(token_id) if token_id.isdigit() else None,
             defaults=config.default_session_settings(),
             telegram_config=config.telegram, remote_workspace=remote_workspace, artifact_store=artifact_store,
+            timezone=config.default_metadata_timezone,
             options=options,
             progress=lambda status: print(f'Processed {status.messages} messages in {status.batches} bounded batches.', flush=True))
     finally:

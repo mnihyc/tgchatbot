@@ -316,7 +316,6 @@ class AppConfig:
             group_spontaneous_reply_delay_s=None,
             reply_delay_s=None,
             metadata_injection_mode=self.default_metadata_injection_mode,
-            metadata_timezone=self.default_metadata_timezone,
             system_prompt=self.default_system_prompt,
         )
 

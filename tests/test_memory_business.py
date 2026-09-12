@@ -54,7 +54,10 @@ class MemoryBusinessTests(BusinessTestCase):
         aware_in_utc = (await tool.runner.run(aware, utc_context)).output
         self.assertTrue(local_result['matches'])
         self.assertEqual(local_result, aware_result)
-        self.assertEqual(local_result, aware_in_utc)
+        self.assertEqual(local_result['matches'], aware_in_utc['matches'])
+        self.assertEqual(local_result['messages'][0]['fragments'], aware_in_utc['messages'][0]['fragments'])
+        self.assertEqual(local_result['messages'][0]['sent_at'], '2026-01-02T11:04:05+08:00')
+        self.assertEqual(aware_in_utc['messages'][0]['sent_at'], '2026-01-02T03:04:05+00:00')
         self.assertEqual((await tool.runner.run(local, utc_context)).output['matches'], [])
         stored = (await self.store.read_messages(self.session, [source.db_id]))[0]
         self.assertEqual(stored.message.metadata['sent_at'], '2026-01-02T03:04:05+00:00')
@@ -175,6 +178,7 @@ class MemoryBusinessTests(BusinessTestCase):
         # A narrow search window exposes duplicated snapshots crowding out the
         # source. Ordinary tool observations still belong to searchable history.
         memory = MemoryService(self.store, self.embeddings, config=replace(self.memory.config, search_results=2))
+        expected_payloads = []
         for number in range(3):
             snapshot = await memory.fetch_profiles(self.session, ['telegram:user:7'])
             call_id = f'profile-refresh-{number}'
@@ -182,6 +186,7 @@ class MemoryBusinessTests(BusinessTestCase):
                 ('call', {'call_id': call_id, 'arguments': {'actor_ids': ['telegram:user:7'], 'include_agent_preferences': True}}),
                 ('result', {'call_id': call_id, 'output': snapshot}),
             ):
+                expected_payloads.append(payload)
                 await self.runtime.record_tool_observation(session_id=self.session, name='user_profile_fetch',
                     phase=phase, payload=payload,
                     metadata_update={'synthetic_role': 'profile_refresh', 'refresh_reason': 'compaction'})
@@ -219,9 +224,9 @@ class MemoryBusinessTests(BusinessTestCase):
                           if message.metadata.get('synthetic_role') == 'profile_refresh']
         self.assertEqual(replayed_pairs, before_restart_pairs)
         self.assertEqual([message.metadata['tool_payload'] for message in replayed_pairs],
-                         [message.metadata['tool_payload'] for message in stored_pairs])
-        self.assertEqual([original_text(message) for message in replayed_pairs],
-                         [original_text(message) for message in stored_pairs])
+                         expected_payloads)
+        self.assertTrue(all(message.metadata['tool_payload']['output']['as_of'].endswith('+00:00')
+            for message in stored_pairs if message.metadata['tool_phase'] == 'result'))
         self.assertEqual(len(replayed_pairs), 6)
         self.assertTrue(all(message.role == MessageRole.TOOL for message in replayed_pairs))
         for call, result in zip(replayed_pairs[::2], replayed_pairs[1::2], strict=True):

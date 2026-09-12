@@ -61,7 +61,7 @@ async def describe_message_images(store, session_id, message_ids, *, expected_sc
             for message_id, items in occurrences.items()}
 
 
-async def resolve_message_images(store, session_id, message_ids, image_ids, *, expected_scope=None):
+async def resolve_message_images(store, session_id, message_ids, image_ids, *, expected_scope=None, timezone='UTC'):
     requested = list(dict.fromkeys(image_ids))
     async with store.pool.connection() as conn:
         rows = await _originals(store, conn, session_id, message_ids, expected_scope)
@@ -89,7 +89,7 @@ async def resolve_message_images(store, session_id, message_ids, image_ids, *, e
                     'reason': 'No retained image bytes are available for this occurrence.'})
                 continue
             label = {'image_id': image_id, 'source_revision': row.message.metadata['source_revision'],
-                **attribution(row.message, message_id=row.db_id)}
+                **attribution(row.message, message_id=row.db_id, timezone=timezone)}
             origin = f'memory_image:{image_id}'
             evidence.extend([
                 MessagePart(PartKind.TEXT, text='[Original image evidence: '

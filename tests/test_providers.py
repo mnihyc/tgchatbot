@@ -46,17 +46,17 @@ class ProviderConfigTests(unittest.TestCase):
     def test_new_session_metadata_defaults_to_utc_plus_eight(self):
         for env in ({}, {'DEFAULT_METADATA_TIMEZONE': '  '}):
             with self.subTest(env=env):
-                settings = self.load(OPENAI_API_KEY='mock', **env).default_session_settings()
-                moment = datetime(2026, 1, 1, tzinfo=timezone.utc).astimezone(ZoneInfo(settings.metadata_timezone))
+                config = self.load(OPENAI_API_KEY='mock', **env)
+                moment = datetime(2026, 1, 1, tzinfo=timezone.utc).astimezone(ZoneInfo(config.default_metadata_timezone))
                 self.assertEqual(moment.utcoffset(), timedelta(hours=8))
                 self.assertEqual(moment.isoformat(), '2026-01-01T08:00:00+08:00')
-                self.assertEqual(SessionSettings().metadata_timezone, settings.metadata_timezone)
+                self.assertFalse(hasattr(config.default_session_settings(), 'metadata_timezone'))
 
     def test_explicit_metadata_timezone_overrides_the_new_default(self):
         for zone in ('UTC', 'Asia/Tokyo', 'Europe/Berlin'):
             with self.subTest(zone=zone):
-                settings = self.load(OPENAI_API_KEY='mock', DEFAULT_METADATA_TIMEZONE=f' {zone} ').default_session_settings()
-                self.assertEqual(settings.metadata_timezone, zone)
+                config = self.load(OPENAI_API_KEY='mock', DEFAULT_METADATA_TIMEZONE=f' {zone} ')
+                self.assertEqual(config.default_metadata_timezone, zone)
 
     def test_mixed_profiles_select_explicit_default_without_cross_provider_model_fallback(self):
         config = self.load(OPENAI_API_KEY='mock', GEMINI_API_KEY='mock', DEEPSEEK_API_KEY='mock', DEFAULT_PROVIDER='deepseek')
@@ -421,11 +421,13 @@ class ChatCompletionsContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_same_provider_native_history_and_cross_provider_translation(self):
         from tgchatbot.core.runtime import AgentRuntime
+        from types import SimpleNamespace
         provider = await self.make_provider(name='deepseek')
         body = self.answer('Visible introduction', reasoning_content='private continuation', tool_calls=[{'id': 'a', 'type': 'function', 'function': {'name': 'lookup', 'arguments': '{}'}}])
         native = provider.persistent_history_items(provider._parse_response(body))
         message = ConversationMessage(role=MessageRole.TOOL, name='lookup', parts=[MessagePart(kind=PartKind.TEXT, text='lookup query')], metadata={'tool_phase': 'call', 'tool_provider': 'deepseek', 'tool_payload': {'call_id': 'a', 'arguments': {}}, 'provider_native': {'provider': 'deepseek', 'model': self.settings(provider).model, 'items': native}})
         runtime = object.__new__(AgentRuntime)
+        runtime.config = SimpleNamespace(default_metadata_timezone='Asia/Singapore')
         settings = replace(self.settings(provider), tool_history_mode=ToolHistoryMode.NATIVE_SAME_PROVIDER)
         same = runtime._history_message_for_provider(settings=settings, provider_name='deepseek', message=message)
         self.assertEqual(provider._message_to_input_items(same), native)
@@ -443,6 +445,53 @@ class ChatCompletionsContractTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AllAdaptersContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_gemini_profile_tools_allow_text_and_silence_without_forcing_a_function(self):
+        tool = ToolSpec('user_profile_fetch', 'Read the requested participant profile.',
+            {'type': 'object', 'properties': {'actor_ids': {'type': 'array',
+                'items': {'type': 'string'}}}, 'required': ['actor_ids']}, None)
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as directory, patch.dict(
+            os.environ, {'APP_DATA_DIR': directory, 'TGBOT_TOKEN': 'mock',
+                'GEMINI_API_KEY': 'mock', 'GEMINI_MODEL': 'gemini-3.8-flash'}, clear=True
+        ):
+            config = load_config()
+            settings = replace(config.default_session_settings(), native_web_search_mode='off')
+            provider = GeminiProvider(config.gemini)
+            captured = []
+            parts = [{'functionCall': {'name': 'user_profile_fetch',
+                'args': {'actor_ids': ['telegram:user:7']}, 'id': 'profile-1'}}]
+
+            def handler(request):
+                captured.append(json.loads(request.content))
+                return httpx.Response(200, json={'candidates': [{'finishReason': 'STOP',
+                    'content': {'role': 'model', 'parts': parts}}]})
+
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                provider._client = client
+                async def generate(tools, current=settings):
+                    return await provider.generate(settings=current,
+                        messages=[ConversationMessage.user_text('Read my profile.')],
+                        instructions='Use the current participant identity.', tools=tools)
+
+                response = await generate([tool])
+                self.assertEqual([(call.name, call.arguments) for call in response.tool_calls],
+                    [('user_profile_fetch', {'actor_ids': ['telegram:user:7']})])
+                self.assertEqual(captured[-1]['toolConfig']['functionCallingConfig'], {'mode': 'VALIDATED'})
+                self.assertEqual(captured[-1]['tools'], [{'functionDeclarations': [tool.gemini_function_declaration()]}])
+                parts = [{'text': 'Received.'}]
+                self.assertEqual((await generate([tool])).final_text, 'Received.')
+                parts = []
+                silent = await generate([tool])
+                self.assertEqual((silent.final_text, silent.tool_calls), ('', []))
+                await generate([])
+                self.assertNotIn('toolConfig', captured[-1])
+                self.assertNotIn('tools', captured[-1])
+                await generate([], replace(settings, native_web_search_mode='on'))
+                self.assertEqual(captured[-1]['tools'], [{'googleSearch': {}}])
+                self.assertEqual(captured[-1]['toolConfig'], {'includeServerSideToolInvocations': True})
+                await generate([tool], replace(settings, native_web_search_mode='on'))
+                self.assertEqual(captured[-1]['toolConfig'], {'functionCallingConfig': {'mode': 'VALIDATED'},
+                    'includeServerSideToolInvocations': True})
+
     async def test_gemini_invalid_generated_call_uses_existing_request_retry_policy(self):
         from tgchatbot.core.runtime import AgentRuntime
         invalid = {'candidates': [{'content': {}, 'finishReason': 'MALFORMED_FUNCTION_CALL'}]}

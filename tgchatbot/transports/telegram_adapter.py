@@ -9,7 +9,6 @@ import hashlib
 import json
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pathlib import Path
 
 from telegram import Chat, Message, Update
@@ -45,7 +44,7 @@ from tgchatbot.transports.sticker_delivery import send_sticker as deliver_sticke
 from tgchatbot.transports.telegram_routing import topic_arguments
 from tgchatbot.storage.postgres_store import PostgresStore, StaleScopeError
 from tgchatbot.storage.presets import PresetStore
-from tgchatbot.domain.provenance import telegram_metadata, telegram_actor
+from tgchatbot.domain.provenance import utc_time, telegram_metadata, telegram_actor
 from tgchatbot.tools.remote_workspace import RemoteWorkspaceClient
 from tgchatbot.settings_schema import (
     COMPACT_TOOL_RATIO_THRESHOLD_MIN,
@@ -283,7 +282,6 @@ class TelegramBotApp:
             'group_reply_delay_s <nonnegative seconds|default>',
             'provider_retry_count <nonnegative integer|default>',
             'metadata <on|off|default>',
-            'metadata_timezone <IANA TZ like UTC or Asia/Tokyo|default>',
             'tool_history_mode <translated|native_same_provider|default>',
         ])
         return lines
@@ -1116,18 +1114,6 @@ class TelegramBotApp:
                 await update.effective_message.reply_text(f'Invalid metadata. Current effective value: {current}')
                 return
             settings.metadata_injection_mode = self.config.default_metadata_injection_mode if value == 'default' else value
-        elif name == 'metadata_timezone':
-            raw_value = context.args[1].strip()
-            if raw_value.lower() == 'default':
-                settings.metadata_timezone = self.config.default_metadata_timezone
-            else:
-                try:
-                    ZoneInfo(raw_value)
-                except ZoneInfoNotFoundError:
-                    current = settings.metadata_timezone or self.config.default_metadata_timezone
-                    await update.effective_message.reply_text(f'Invalid metadata_timezone. Current effective value: {current}')
-                    return
-                settings.metadata_timezone = raw_value
         elif name == 'tool_history_mode':
             allowed = {'translated', 'native_same_provider', 'default'}
             if value not in allowed:
@@ -1328,16 +1314,12 @@ class TelegramBotApp:
             auto_note_parts: list[MessagePart] = []
             if settings.metadata_injection_mode != 'off':
                 event_time = getattr(message, 'edit_date', None) or getattr(message, 'date', None) or datetime.now(timezone.utc)
-                try:
-                    zone = ZoneInfo(settings.metadata_timezone or self.config.default_metadata_timezone)
-                except ZoneInfoNotFoundError:
-                    zone = ZoneInfo('UTC')
-                local_time = event_time.astimezone(zone).isoformat(timespec='seconds')
+                canonical_time = utc_time(event_time)
                 sender = getattr(message, 'from_user', None)
                 username = f'@{sender.username}' if sender and getattr(sender, 'username', None) else '-'
                 nickname = str(canonical_metadata['actor_name']).replace('"', "'")
                 auto_note_parts.append(MessagePart(kind=PartKind.TEXT,
-                    text=f'[Message metadata: username={username} nickname="{nickname}" time={local_time}]',
+                    text=f'[Message metadata: username={username} nickname="{nickname}" time={canonical_time}]',
                     remote_sync=False, origin='provenance'))
 
             # Persist transport facts before downloads, link fetches or SSH. A
@@ -1537,7 +1519,7 @@ class TelegramBotApp:
         assistant_metadata.update({'source': 'telegram', 'source_chat_id': str(source_message.chat.id),
             'source_message_id': message_ids[0], 'telegram_message_aliases': message_ids[1:],
             'actor_id': f'telegram:user:{actor_id}', 'actor_kind': 'bot', 'actor_name': actor_name,
-            'sent_at': sent_at.isoformat(), 'reply_target': result.reply_target})
+            'sent_at': utc_time(sent_at), 'reply_target': result.reply_target})
         destination = topic_arguments(source_message)
         if 'message_thread_id' in destination:
             assistant_metadata['topic_id'] = str(destination['message_thread_id'])

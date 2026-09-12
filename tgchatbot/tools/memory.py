@@ -9,12 +9,14 @@ import argparse
 import asyncio
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, fields
+from datetime import datetime
 import json
 from pathlib import Path
 from typing import Any, AsyncIterator
 import uuid
 
 from tgchatbot.domain.models import MessageRole
+from tgchatbot.domain.timestamps import format_timestamp
 from tgchatbot.embeddings import EmbeddingClient, EmbeddingConfig
 from tgchatbot.operational import from_env
 from tgchatbot.storage.postgres_store import EMBEDDING_DIMENSIONS, PostgresStore, StaleScopeError
@@ -34,7 +36,11 @@ class OperationsConfig:
 
 
 def emit(record: dict[str, Any]) -> None:
-    print(json.dumps(record, ensure_ascii=False, default=str), flush=True)
+    # SQL datetime objects are presentation fields. Original message prose and
+    # JSON metadata/provider evidence remain their exact stored strings.
+    def present(value):
+        return format_timestamp(value) if isinstance(value, datetime) else str(value)
+    print(json.dumps(record, ensure_ascii=False, default=present), flush=True)
 
 
 async def existing_scope(store: PostgresStore, session_id: str) -> dict[str, int]:

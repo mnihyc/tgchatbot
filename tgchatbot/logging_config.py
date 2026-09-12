@@ -8,6 +8,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from tgchatbot.domain.timestamps import format_timestamp, resolve_timezone
+
 _DEFAULT_LOG_FORMAT = "[%(asctime)s] %(levelname)s %(name)s: %(message)s"
 _NOISY_LOGGERS = ("httpx", "httpcore")
 
@@ -47,13 +49,21 @@ def clip_for_log(value: Any, *, limit: int = 160, rlimit: int = 0) -> str:
     return text[:limit] + '…' + text[-rlimit:]
 
 
-def configure_logging(level: str | None = None) -> int:
+class TimezoneFormatter(logging.Formatter):
+    def __init__(self, fmt: str, timezone_name: str | None = None) -> None:
+        super().__init__(fmt)
+        self.timezone_name = resolve_timezone(timezone_name).key
+
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
+        rendered = format_timestamp(record.created, self.timezone_name)
+        return datetime.fromisoformat(rendered).strftime(datefmt) if datefmt else rendered
+
+
+def configure_logging(level: str | None = None, *, timezone_name: str | None = None) -> int:
     resolved_level = resolve_log_level(level)
-    logging.basicConfig(
-        level=resolved_level,
-        format=_DEFAULT_LOG_FORMAT,
-        force=True,
-    )
+    handler = logging.StreamHandler()
+    handler.setFormatter(TimezoneFormatter(_DEFAULT_LOG_FORMAT, timezone_name))
+    logging.basicConfig(level=resolved_level, handlers=[handler], force=True)
     for name in _NOISY_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
     logging.getLogger(__name__).info('logging.ready level=%s httpx=WARNING', logging.getLevelName(resolved_level))

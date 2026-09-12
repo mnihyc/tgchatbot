@@ -6,14 +6,13 @@ from datetime import datetime, timezone as utc_timezone
 import json
 import logging
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from tgchatbot.domain.models import ToolResult
-from tgchatbot.domain.provenance import evidence_part_spans, message_evidence
+from tgchatbot.domain.provenance import evidence_part_spans, message_evidence, present_tool_output
+from tgchatbot.domain.timestamps import resolve_timezone
 from tgchatbot.tools.base import ToolContext, ToolSpec
 from tgchatbot.storage.postgres_store import message_body
 from tgchatbot.operational import MemoryConfig, from_env
-from tgchatbot.settings_schema import DEFAULT_METADATA_TIMEZONE
 
 logger = logging.getLogger(__name__)
 
@@ -44,14 +43,11 @@ class MemoryService:
         self.tools = [MemorySearchTool(self).spec, MemoryReadTool(self).spec, UserProfileFetchTool(self).spec]
 
     async def fetch_profiles(self, session_id: str, actor_ids: list[str], *, scope=None,
-                             timezone: str = DEFAULT_METADATA_TIMEZONE,
+                             timezone: str | None = None,
                              include_agent_preferences: bool = True) -> dict[str, Any]:
         if not isinstance(actor_ids, list) or any(not isinstance(actor, str) or not actor.strip() for actor in actor_ids):
             raise ValueError('actor_ids must be an array of explicit stable actor IDs; use [] for agent preferences only')
-        try:
-            zone = ZoneInfo(timezone or DEFAULT_METADATA_TIMEZONE)
-        except ZoneInfoNotFoundError as exc:
-            raise ValueError(f'Unknown profile timestamp timezone: {timezone}') from exc
+        zone = resolve_timezone(timezone)
         subjects = list(dict.fromkeys(actor.strip() for actor in actor_ids))
         if include_agent_preferences and 'agent' not in subjects:
             subjects.append('agent')
@@ -74,29 +70,18 @@ class MemoryService:
         if refresh_error:
             result['refresh_error'] = refresh_error
 
-        def encode_dates(value):
-            if isinstance(value, datetime):
-                return value.astimezone(zone).isoformat()
-            if isinstance(value, dict):
-                return {key: encode_dates(item) for key, item in value.items()}
-            if isinstance(value, list):
-                return [encode_dates(item) for item in value]
-            return value
-
-        return encode_dates(result)
+        return present_tool_output('user_profile_fetch', result, zone.key)
 
     async def search(self, session_id: str, query: str, *, scope=None, actor_id=None,
-                     before=None, after=None, limit=None, timezone=DEFAULT_METADATA_TIMEZONE) -> dict[str, Any]:
+                     before=None, after=None, limit=None, timezone=None) -> dict[str, Any]:
+        zone = resolve_timezone(timezone)
         def search_time(value):
             if value is None or isinstance(value, (int, float)) or str(value).isdigit():
                 return value
             parsed = datetime.fromisoformat(value.replace('Z', '+00:00')) if isinstance(value, str) else value
             if parsed.tzinfo is not None:
                 return parsed
-            try:
-                return parsed.replace(tzinfo=ZoneInfo(timezone or DEFAULT_METADATA_TIMEZONE))
-            except ZoneInfoNotFoundError as exc:
-                raise ValueError(f'Unknown search timestamp timezone: {timezone}') from exc
+            return parsed.replace(tzinfo=zone)
 
         before, after = search_time(before), search_time(after)
         if scope is not None:
@@ -150,13 +135,15 @@ class MemoryService:
             remaining -= len(json.dumps(source_images, ensure_ascii=False))
             source = entry['source']
             messages.append(message_evidence(source, message_id=message_id, role=source['role'],
-                fragments=entry['fragments'], total_characters=source['total_characters'], images=source_images))
+                fragments=entry['fragments'], total_characters=source['total_characters'], images=source_images,
+                timezone=zone.key))
         # These originals provide conversational context, not additional ranked
         # matches or extensions of an excerpt's exact source spans.
         related = await self._related_context(session_id, [source_id for source_id in source_ids if source_id in images], source_ids,
-            remaining=remaining, scope=scope)
+            remaining=remaining, scope=scope, timezone=zone.key)
         messages.extend(related)
-        messages.sort(key=lambda item: (item.get('sent_at') or '', item['message_id']))
+        messages.sort(key=lambda item: (datetime.fromisoformat(item['sent_at']).timestamp()
+            if item.get('sent_at') else float('-inf'), item['message_id']))
         if scope is not None:
             await self.store.assert_scope(session_id, scope)
         output = {'ok': True, 'coverage': status, 'matches': matches, 'messages': messages}
@@ -164,7 +151,7 @@ class MemoryService:
             output['related_context'] = [item['message_id'] for item in related]
         return output
 
-    async def _related_context(self, session_id, seeds, ranked_ids, *, remaining, scope):
+    async def _related_context(self, session_id, seeds, ranked_ids, *, remaining, scope, timezone=None):
         if not seeds or remaining <= 2:
             return []
         from tgchatbot.storage.relationships import expand_message_ids
@@ -189,7 +176,7 @@ class MemoryService:
             while True:
                 item = message_evidence({**stored.message.metadata, 'parts': evidence_part_spans(stored.message)}, message_id=message_id,
                     role=stored.message.role, fragments=[{'offset': 0, 'text': shown}],
-                    total_characters=len(text), images=images[message_id])
+                    total_characters=len(text), images=images[message_id], timezone=timezone)
                 size = len(json.dumps(item, ensure_ascii=False, default=str)) + (2 if result else 0)
                 if size <= remaining or not shown:
                     break
@@ -199,7 +186,8 @@ class MemoryService:
                 remaining -= size
         return result
 
-    async def read(self, session_id: str, message_ids: list[int], *, scope=None, offset=0, length=None, include_neighbors=False):
+    async def read(self, session_id: str, message_ids: list[int], *, scope=None, offset=0, length=None,
+                   include_neighbors=False, timezone=None):
         if len(message_ids) > self.config.read_messages or not message_ids or any(int(value) <= 0 for value in message_ids):
             raise ValueError(f'Read 1–{self.config.read_messages} positive message IDs returned by memory_search')
         offset, length = int(offset), self.config.read_chars if length is None else int(length)
@@ -224,7 +212,7 @@ class MemoryService:
             excerpt = text[offset:end]
             record = message_evidence({**item.message.metadata, 'parts': evidence_part_spans(item.message)}, message_id=item.db_id,
                 role=item.message.role, fragments=[{'offset': offset, 'text': excerpt}],
-                total_characters=len(text))
+                total_characters=len(text), timezone=timezone)
             if end < len(text):
                 record['next_offset'] = end
             results.append(record)
@@ -293,7 +281,7 @@ class MemoryReadTool:
         try:
             output = await self.memory.read(ctx.session_id, args.get('message_ids', []), scope=ctx.scope,
                 offset=args.get('offset', 0), length=args.get('length'),
-                include_neighbors=args.get('include_neighbors') is True)
+                include_neighbors=args.get('include_neighbors') is True, timezone=ctx.timezone)
             image_ids = args.get('image_ids')
             if image_ids is None:
                 image_ids = []  # Strict provider schemas express omitted optional fields as null.
@@ -301,7 +289,7 @@ class MemoryReadTool:
                 raise ValueError('image_ids must be an array of image references returned by memory_search or memory_read')
             if image_ids:
                 selected = await self.memory.store.resolve_message_images(ctx.session_id,
-                    args.get('message_ids', []), image_ids, expected_scope=ctx.scope)
+                    args.get('message_ids', []), image_ids, expected_scope=ctx.scope, timezone=ctx.timezone)
                 output['image_results'] = selected['image_results']
                 evidence_parts = selected['evidence_parts']
         except (ValueError, TypeError) as exc:
@@ -327,7 +315,7 @@ class UserProfileFetchTool:
         try:
             include_agent = args.get('include_agent_preferences')
             output = await self.memory.fetch_profiles(ctx.session_id, args.get('actor_ids'), scope=ctx.scope,
-                timezone=getattr(ctx, 'timezone', DEFAULT_METADATA_TIMEZONE),
+                timezone=getattr(ctx, 'timezone', None),
                 include_agent_preferences=True if include_agent is None else include_agent)
         except (ValueError, TypeError) as exc:
             output = {'ok': False, 'error': str(exc)}
