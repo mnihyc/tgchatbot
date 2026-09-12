@@ -157,10 +157,12 @@ class TimezoneEvidenceWorkflows(BusinessTestCase):
         self.provider.responses = [ProviderResponse(final_text='The rendered evidence has the same timing.')]
         await runtime.run_turn(session_id=self.session, user_display_name='Participant',
             incoming_message=ConversationMessage.user_text('Confirm the timestamp again.'))
-        translated = next(message for message in self.provider.requests[-1]['messages']
-            if message.metadata.get('tool_name') == 'memory_search' and message.metadata.get('tool_phase') == 'result')
-        self.assertIn('2026-09-13T00:00:20+08:00', translated.parts[0].text)
-        self.assertIn('2026-09-12T16:00:20Z', translated.parts[0].text)
+        replayed = next(message for message in self.provider.requests[-1]['messages']
+            if message.name == 'memory_search' and message.metadata.get('tool_phase') == 'result')
+        shown_again = next(record for record in replayed.metadata['tool_payload']['output']['messages']
+            if record['message_id'] == source.db_id)
+        self.assertEqual(shown_again['sent_at'], '2026-09-13T00:00:20+08:00')
+        self.assertIn('2026-09-12T16:00:20Z', shown_again['fragments'][0]['text'])
 
     async def test_image_labels_store_utc_and_reproject_after_a_configured_zone_change(self):
         literal = '[Original image evidence: {"sent_at":"2026-09-12T16:00:20Z"}]'

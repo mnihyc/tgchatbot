@@ -88,6 +88,45 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('fit_signals', result.output['candidates'][0])
         self.assertEqual(self.deliveries.recent.await_count, 1)
 
+    async def test_static_candidate_has_identity_without_an_animation_sampling_warning(self):
+        asset = self.asset(caption='抱抱')
+        result = await self.query()
+        labels = [part.text for part in result.evidence_parts if part.kind == PartKind.TEXT]
+        self.assertEqual(len(labels), 1)
+        self.assertIn(asset.asset_id, labels[0])
+        self.assertIn('animated=False', labels[0])
+        self.assertNotIn('sampled frame times', labels[0])
+        self.assertNotIn('intermediate animation events', labels[0])
+        self.assertEqual(sum(part.kind == PartKind.IMAGE for part in result.evidence_parts), 1)
+        self.assertEqual(result.output['candidates'][0]['caption'], '抱抱')
+
+    async def test_animation_warning_survives_sampling_only_one_distinct_frame(self):
+        asset = self.asset(animated=True)
+        path = (self.root / asset.aliases[0].path).with_suffix('.gif')
+        frames = [Image.new('RGB', (16, 16), color) for color in ('red', 'blue', 'red')]
+        try:
+            frames[0].save(path, save_all=True, append_images=frames[1:], duration=100, loop=0)
+        finally:
+            for frame in frames:
+                frame.close()
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        asset = replace(asset, asset_id='sha256:' + digest, content_hash=digest,
+            aliases=(CatalogAlias(path.relative_to(self.root).as_posix(), 'pack-a'),))
+        self.assets[0] = asset
+        # Two timeline endpoints are identical; three samples also reveal blue.
+        # Sampling/deduplication runs normally, without a mocked media decoder.
+        for max_frames, expected_images in ((2, 1), (3, 2)):
+            with self.subTest(max_frames=max_frames):
+                self.catalog.media_config = replace(self.catalog.media_config, max_frames=max_frames)
+                result = await self.query(allow_animation=True)
+                self.assertTrue(result.output['ok'])
+                label = next(part.text for part in result.evidence_parts if part.kind == PartKind.TEXT)
+                self.assertIn(asset.asset_id, label)
+                self.assertIn('animated=True', label)
+                self.assertIn('sampled frame times', label)
+                self.assertIn('intermediate animation events may be omitted', label)
+                self.assertEqual(sum(part.kind == PartKind.IMAGE for part in result.evidence_parts), expected_images)
+
     async def test_model_interpretation_never_echoes_requested_warmth_as_candidate_fact(self):
         self.asset(caption='Go away', action='Pushing the recipient away',
             readings=[{'meaning': 'Dismiss someone', 'context': 'Sender wants distance'}])

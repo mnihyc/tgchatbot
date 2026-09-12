@@ -85,7 +85,7 @@ class RuntimeWorkflowTests(BusinessTestCase):
         self.assertEqual(wire[1]['contents'][:len(wire[0]['contents'])], wire[0]['contents'])
         for payload in wire:
             self.assertEqual([item for item in payload['contents'] if item['role'] == 'model'],
-                [{'role': 'model', 'parts': [{'text': own_text}]}])
+                native)
             peer_turn = next(item for item in payload['contents']
                 if any(part.get('text') == 'The train leaves at eleven.' for part in item['parts']))
             self.assertEqual(peer_turn['role'], 'user')

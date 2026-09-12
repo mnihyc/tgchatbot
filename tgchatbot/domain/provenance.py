@@ -229,10 +229,10 @@ def message_evidence(source: Mapping[str, Any], *, message_id: int | None,
 
 def attributed_message(message: ConversationMessage, *, message_id: int | None = None,
                        timezone: str | None = None) -> ConversationMessage:
-    # The assistant role already identifies our own output. Adding transport
-    # labels there teaches an output format the agent should never generate.
-    # Incoming peers (including other bots) use USER and retain attribution.
-    if message.role == MessageRole.ASSISTANT or not message.metadata.get('source'):
+    # Assistant and tool roles already identify their own output. Participant
+    # labels belong to incoming peers (including other bots), not the outer
+    # tool observation. Source labels inside tool evidence remain untouched.
+    if message.role in {MessageRole.ASSISTANT, MessageRole.TOOL} or not message.metadata.get('source'):
         return message
     identity = message_evidence(message.metadata, message_id=message_id, role=message.role,
         fragments=[], total_characters=0, timezone=timezone)

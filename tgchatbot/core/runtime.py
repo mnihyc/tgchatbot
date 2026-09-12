@@ -1549,7 +1549,16 @@ class AgentRuntime:
                     message.name, payload['output'], self.config.default_metadata_timezone)}
         provider_native = metadata.get('provider_native') if isinstance(metadata.get('provider_native'), dict) else None
         native_provider = str(provider_native.get('provider') or '').strip().lower() if provider_native else ''
-        same_provider_native = (settings.tool_history_mode == ToolHistoryMode.NATIVE_SAME_PROVIDER
+        phase = str(metadata.get('tool_phase') or '').strip().lower()
+        # A generated batch owns its complete model output, including mixed
+        # text, parallel calls and opaque signatures. Translating legacy tool
+        # observations must not rewrite a compatible completed model exchange.
+        model_exchange = (message.role == MessageRole.TOOL and bool(metadata.get('tool_batch_id'))
+            and metadata.get('tool_provider') == provider_name and metadata.get('tool_model') == settings.model)
+        model_output = message.role == MessageRole.ASSISTANT or (message.role == MessageRole.TOOL and phase == 'call')
+        same_provider_native = (model_output
+            and (settings.tool_history_mode == ToolHistoryMode.NATIVE_SAME_PROVIDER
+                 or message.role == MessageRole.ASSISTANT or model_exchange)
             and native_provider == provider_name and provider_native.get('model') == settings.model)
         if same_provider_native and provider_native:
             items = provider_native.get('items') if isinstance(provider_native.get('items'), list) else []
@@ -1572,7 +1581,13 @@ class AgentRuntime:
                 and '\n' in part.text else part for part in prepared.parts]
         if message.role != MessageRole.TOOL:
             return prepared
-        phase = str(metadata.get('tool_phase') or '').strip().lower()
+        if model_exchange and phase in {'call', 'result'}:
+            if phase == 'call' and metadata.get('provider_native_skip_same_provider'):
+                return None
+            # Only the first call carries the original model batch. Results
+            # remain projections of current DB-owned output and image evidence;
+            # a native snapshot must never restore retired pixels or old dates.
+            return prepared
         if (metadata.get('synthetic_role') == 'profile_refresh' or metadata.get('tool_evidence')
                 or base_metadata.get('portable_tool_history')) and phase in {'call', 'result'}:
             if (settings.tool_history_mode == ToolHistoryMode.NATIVE_SAME_PROVIDER

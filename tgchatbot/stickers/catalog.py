@@ -230,9 +230,10 @@ class StickerCatalog:
                 prepared = await asyncio.to_thread(prepare_media, entry.absolute_path, self.media_config)
                 if prepared.content_hash != entry.asset.content_hash:
                     raise ValueError('asset bytes changed')
-                parts.append(MessagePart(kind=PartKind.TEXT, text=f'Candidate {entry.sticker_id}; '
-                    f'animated={entry.animated}; sampled frame times: {prepared.facts["frame_times_s"]} seconds; '
-                    'intermediate animation events may be omitted.', origin=origin, remote_sync=False))
+                label = f'Candidate {entry.sticker_id}; animated={prepared.facts["animated"]}'
+                if prepared.facts['animated']:
+                    label += f'; sampled frame times: {prepared.facts["frame_times_s"]} seconds; intermediate animation events may be omitted.'
+                parts.append(MessagePart(kind=PartKind.TEXT, text=label, origin=origin, remote_sync=False))
                 for frame in prepared.frames:
                     parts.append(MessagePart(kind=PartKind.IMAGE, data_b64=frame.data_b64,
                         mime_type=frame.mime_type, text=f'{entry.sticker_id} at {frame.timestamp_s:g}s',

@@ -223,9 +223,9 @@ class WorkerWorkflowTests(BusinessTestCase):
         self.assertGreater(batches, 1)
         evidence = [piece for request in self.provider.requests
                     for piece in json.loads(request['messages'][0].parts[0].text)['original_evidence']]
-        self.assertEqual({row['source_span']['message_id'] for row in evidence}, {human.db_id})
-        self.assertEqual(''.join(row['text'] for row in evidence), text)
-        self.assertTrue(evidence[-1]['text'].endswith('jasmine tea.'))
+        self.assertEqual({row['message_id'] for row in evidence}, {human.db_id})
+        self.assertEqual(''.join(fragment['text'] for row in evidence for fragment in row['fragments']), text)
+        self.assertTrue(evidence[-1]['fragments'][-1]['text'].endswith('jasmine tea.'))
 
     async def test_invalid_later_profile_claim_cannot_partially_publish_valid_earlier_claim(self):
         source = await self.source('I prefer tea and concise replies.', 1)
@@ -287,7 +287,7 @@ class WorkerWorkflowTests(BusinessTestCase):
             self.assertNotIn('more_available', result)
             self.assertEqual(len(self.provider.requests), before + 1)
             evidence = json.loads(self.provider.requests[-1]['messages'][0].parts[0].text)['original_evidence']
-            chunk = ''.join(item['text'] for item in evidence)
+            chunk = ''.join(fragment['text'] for item in evidence for fragment in item['fragments'])
             self.assertLessEqual(len(chunk.encode('utf-8')), 32)
             seen += chunk
         self.assertEqual(seen, text)
@@ -451,7 +451,7 @@ class WorkerWorkflowTests(BusinessTestCase):
             self.provider.responses = [self.patch_response()]
             await self.worker._profile(jobs)
             evidence = json.loads(self.provider.requests[-1]['messages'][0].parts[0].text)['original_evidence']
-            seen.extend(item['text'] for item in evidence)
+            seen.extend(fragment['text'] for item in evidence for fragment in item['fragments'])
         self.assertEqual(''.join(seen), '喜喜AB')
 
     async def test_generated_service_and_attachment_descriptions_are_not_profile_declarations(self):
@@ -627,7 +627,8 @@ class WorkerWorkflowTests(BusinessTestCase):
         self.assertEqual(len(self.provider.requests), before + 1)
         request = json.loads(self.provider.requests[-1]['messages'][0].parts[0].text)
         self.assertTrue(all(not profile['facts'] for profile in request['current_profiles']))
-        self.assertLessEqual(sum(len(item['text'].encode('utf-8')) for item in request['original_evidence']), 64)
+        self.assertLessEqual(sum(len(fragment['text'].encode('utf-8'))
+            for item in request['original_evidence'] for fragment in item['fragments']), 64)
         self.assertEqual([fact['claim'] for fact in result['profiles'][0]['facts']], ['Prefers option 0'])
         self.assertLessEqual(len(json.dumps(result['profiles'][0], ensure_ascii=False).encode('utf-8')), 4096)
 

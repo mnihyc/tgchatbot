@@ -172,7 +172,7 @@ class OpenAIResponsesProvider:
 
     def make_tool_result_items(self, tool_call: ToolCall, tool_output: dict,
                                evidence_parts: list[MessagePart] | None = None) -> list[dict]:
-        output: str | list[dict[str, Any]] = json.dumps(tool_output, ensure_ascii=False)
+        output: str | list[dict[str, Any]] = json.dumps(tool_output, ensure_ascii=False, sort_keys=True)
         if evidence_parts:
             content: list[dict[str, Any]] = [{'type': 'input_text', 'text': output}]
             for part in evidence_parts:

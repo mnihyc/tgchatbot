@@ -78,7 +78,7 @@ class ProfileSourceChronologyWorkflows(BusinessTestCase):
             self.assertEqual(other['source_dates'], {
                 'first': '2026-09-05T08:00:00+08:00', 'last': '2026-09-05T08:00:00+08:00'})
             self.assertIsNone(alice['valid_from'], 'Supporting dates must not fabricate semantic validity.')
-            self.assertEqual({item['actor_id'] for item in request['original_evidence']},
+            self.assertEqual({item['speaker']['id'] for item in request['original_evidence']},
                 {'telegram:user:11', 'telegram:user:22'})
             self.assertTrue(all(item['sent_at'].startswith('2026-01-')
                 for item in request['original_evidence']))

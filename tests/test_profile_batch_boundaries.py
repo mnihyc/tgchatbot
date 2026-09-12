@@ -37,7 +37,7 @@ class ProfileBatchBoundaries(BusinessTestCase):
                 if profile['actor_id'] == self.actor for fact in profile['facts']}
             additions = []
             for item in payload['original_evidence']:
-                declaration = declarations.get(item['text'])
+                declaration = declarations.get(''.join(fragment['text'] for fragment in item['fragments']))
                 if declaration is None:
                     continue
                 claim, replaces = declaration
@@ -78,7 +78,7 @@ class ProfileBatchBoundaries(BusinessTestCase):
         facts = await self.store.get_profile(self.session, self.actor)
         self.assertEqual([(fact['claim'], fact['source_ids']) for fact in facts],
             [('Prefers quiet evening walks.', [declaration.db_id])])
-        self.assertEqual(self.evidence[-1][0]['text'], text)
+        self.assertEqual(self.evidence[-1][0]['fragments'], [{'offset': 0, 'text': text}])
         await self.memory.fetch_profiles(self.session, [self.actor])
         self.assertEqual(len(self.evidence), before + 1, 'Consumed evidence is not learned again')
         self.assertEqual((await self.store.read_messages(self.session, [declaration.db_id]))[0].message,
@@ -133,12 +133,16 @@ class ProfileBatchBoundaries(BusinessTestCase):
             self.assertLess((await self.pending(original))['pending_bytes'], before)
         fragments = [item for batch in self.evidence for item in batch if item['message_id'] == original.db_id]
         self.assertGreater(len(fragments), 1)
-        self.assertEqual(''.join(item['text'] for item in fragments), text)
-        self.assertTrue(all(sum(len(item['text'].encode()) for item in batch) <= maximum for batch in self.evidence))
+        self.assertEqual(''.join(fragment['text'] for item in fragments for fragment in item['fragments']), text)
+        self.assertTrue(all(sum(len(fragment['text'].encode()) for item in batch
+            for fragment in item['fragments']) <= maximum for batch in self.evidence))
         cursor = 0
         for item in fragments:
-            self.assertEqual(item['source_span']['start'], cursor)
-            cursor = item['source_span']['end']
+            self.assertTrue(item['partial'])
+            self.assertEqual(item['total_characters'], len(text))
+            for fragment in item['fragments']:
+                self.assertEqual(fragment['offset'], cursor)
+                cursor += len(fragment['text'])
         self.assertEqual(cursor, len(text))
         self.assertEqual((await self.store.read_messages(self.session, [original.db_id]))[0].message,
             original.message)

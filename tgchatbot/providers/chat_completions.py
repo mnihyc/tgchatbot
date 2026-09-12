@@ -208,7 +208,7 @@ class ChatCompletionsProvider:
 
     def make_tool_result_items(self, tool_call: ToolCall, tool_output: dict,
                                evidence_parts: list[MessagePart] | None = None) -> list[dict]:
-        content = json.dumps(tool_output, ensure_ascii=False)
+        content = json.dumps(tool_output, ensure_ascii=False, sort_keys=True)
         labels = [evidence_text(part) for part in evidence_parts or []]
         if any(labels):
             content += '\n\nTool evidence:\n' + '\n'.join(text for text in labels if text)
