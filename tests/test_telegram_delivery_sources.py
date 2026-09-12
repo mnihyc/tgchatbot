@@ -84,6 +84,36 @@ class TelegramDeliverySourceTests(BusinessTestCase):
             count = (await (await conn.execute('SELECT count(*) AS n FROM message_source_aliases')).fetchone())['n']
         self.assertEqual(count, 0)
 
+    async def test_text_files_and_stickers_keep_source_topic_without_quoting_source(self):
+        from PIL import Image
+        self.bot.send_document = AsyncMock(return_value=self.message(2001))
+        self.bot.send_sticker = AsyncMock(return_value=self.message(2002))
+        document = self.path / 'report.txt'
+        document.write_text('Report')
+        sticker = self.path / 'reaction.webp'
+        Image.new('RGB', (4, 4), 'red').save(sticker, format='WEBP')
+        for topic in ({'message_thread_id': 7}, {'direct_messages_topic_id': 8}):
+            self.source.message_thread_id = topic.get('message_thread_id')
+            self.source.direct_messages_topic = (SimpleNamespace(topic_id=8)
+                if 'direct_messages_topic_id' in topic else None)
+            for visibility in (ProcessVisibility.OFF, ProcessVisibility.STATUS):
+                with self.subTest(topic=topic, visibility=visibility):
+                    self.bot.send_message.reset_mock()
+                    settings = await self.settings(process_visibility=visibility)
+                    result = TurnResult('Answer', artifacts=[OutboundArtifact(document, 'report.txt')],
+                        stickers=[OutboundSticker(sticker, timing=StickerTiming.AFTER_FINAL)],
+                        scope=await self.store.get_scope(self.session))
+                    delivered = await self.app._deliver_result(self.source, self.renderer(), settings,
+                        result, sent_before_receipts=[])
+                    await self.record('Answer', delivered)
+                    for send in (self.bot.send_message, self.bot.send_document, self.bot.send_sticker):
+                        for key, value in topic.items():
+                            self.assertEqual(send.call_args.kwargs[key], value)
+                        self.assertIsNone(send.call_args.kwargs['reply_to_message_id'])
+                    metadata = (await self.store.list_canonical_messages(self.session))[-1].message.metadata
+                    key = 'topic_id' if 'message_thread_id' in topic else 'direct_messages_topic_id'
+                    self.assertEqual(metadata[key], str(next(iter(topic.values()))))
+
     async def test_final_edit_includes_edited_placeholder_and_actual_continuation_ids(self):
         placeholder = self.message(50)
         renderer = self.renderer(placeholder)

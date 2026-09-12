@@ -64,9 +64,8 @@ def main() -> None:
     try:
         artifact_store = ArtifactStore(config.artifact_dir)
         preset_store = PresetStore(config.preset_dir)
-        replay_store = ArtifactStore(config.temp_dir / 'provider-replay', max_bytes=config.memory.replay_cache_bytes)
-        store = PostgresStore(config.database_url, artifact_store=replay_store)
-        previews = PreviewCache(config.temp_dir, max_bytes=config.memory.preview_cache_bytes)
+        store = PostgresStore(config.database_url)
+        previews = PreviewCache(store, max_bytes=config.memory.preview_cache_bytes)
         embeddings = EmbeddingClient(EmbeddingConfig.from_env())
         if embeddings.config.dimensions != 1536:
             raise ValueError('Conversation memory requires EMBEDDING_DIMENSIONS=1536; rebuild with a compatible schema to change it')

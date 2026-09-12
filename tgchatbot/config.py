@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 import os
+import math
 import json
 import re
 from urllib.parse import quote
@@ -23,27 +24,17 @@ from tgchatbot.domain.models import (
 from tgchatbot.settings_schema import (
     COMPACT_KEEP_RECENT_RATIO_MAX,
     COMPACT_KEEP_RECENT_RATIO_MIN,
-    COMPACT_MIN_MESSAGES_MAX,
     COMPACT_MIN_MESSAGES_MIN,
-    COMPACT_TOKEN_MAX,
     COMPACT_TOKEN_MIN,
-    COMPACT_TOOL_RATIO_THRESHOLD_MAX,
     COMPACT_TOOL_RATIO_THRESHOLD_MIN,
     DEFAULT_METADATA_TIMEZONE,
-    GEMINI_THINKING_BUDGET_MAX,
     GEMINI_THINKING_BUDGET_MIN,
     GEMINI_THINKING_LEVEL_VALUES,
     IMAGE_LIMIT_DISABLED,
-    IMAGE_LIMIT_MAX,
-    MAX_INTERACTION_ROUNDS_MAX,
     MAX_INTERACTION_ROUNDS_MIN,
-    MAX_OUTPUT_TOKENS_MAX,
     MAX_OUTPUT_TOKENS_MIN,
-    MIN_RAW_MESSAGES_RESERVE_MAX,
     MIN_RAW_MESSAGES_RESERVE_MIN,
-    NATIVE_WEB_SEARCH_MAX_MAX,
     NATIVE_WEB_SEARCH_MAX_MIN,
-    PROVIDER_RETRY_COUNT_MAX,
     PROVIDER_RETRY_COUNT_MIN,
     REASONING_EFFORT_VALUES,
     SPONTANEOUS_REPLY_CHANCE_MAX,
@@ -51,7 +42,6 @@ from tgchatbot.settings_schema import (
     TEMPERATURE_MAX,
     TEMPERATURE_MIN,
     TEXT_VERBOSITY_VALUES,
-    TOP_K_MAX,
     TOP_K_MIN,
     TOP_P_MAX,
     TOP_P_MIN,
@@ -170,10 +160,13 @@ class TelegramConfig:
     max_sticker_bytes: int
     max_sticker_frames: int
     max_visual_file_frames: int
+    max_video_keyframe_candidates: int
     max_inline_text_chars: int
     link_prefetch_timeout_s: float
     link_prefetch_max_urls: int
     link_prefetch_max_chars: int
+    link_prefetch_max_bytes: int
+    link_prefetch_max_redirects: int
 
 
 @dataclass(frozen=True)
@@ -186,6 +179,19 @@ class ContextConfig:
     compact_tool_min_tokens: int
     compact_min_messages: int
     min_raw_messages_reserve: int
+    compaction_attempts: int = 24
+    attribution_retries: int = 1
+    summary_context_min_tokens: int = 256
+    summary_context_floor_tokens: int = 1024
+    summary_context_max_tokens: int = 16000
+
+    def __post_init__(self) -> None:
+        if self.compaction_attempts < 1:
+            raise ValueError('CONTEXT_COMPACTION_ATTEMPTS must be positive')
+        if self.attribution_retries < 0:
+            raise ValueError('CONTEXT_ATTRIBUTION_RETRIES must be nonnegative')
+        if not 1 <= self.summary_context_min_tokens <= self.summary_context_floor_tokens <= self.summary_context_max_tokens:
+            raise ValueError('Summary context token allowances must be positive and ordered: min <= floor <= max')
 
 
 @dataclass(frozen=True)
@@ -342,14 +348,14 @@ def load_config(*, require_telegram: bool = True) -> AppConfig:
         default_prompt_injection_mode=_choice(os.getenv("DEFAULT_PROMPT_INJECTION_MODE", "augment"), "augment", {value.value for value in PromptInjectionMode}),
         default_tool_history_mode=_choice(os.getenv("DEFAULT_TOOL_HISTORY_MODE", "translated"), "translated", {value.value for value in ToolHistoryMode}),
         default_link_prefetch_mode=_choice(os.getenv("DEFAULT_LINK_PREFETCH_MODE", "off"), "off", {"off", "title", "snippet"}),
-        default_chat_max_rounds=parse_bounded_int_env(os.getenv("DEFAULT_CHAT_MAX_ROUNDS"), default=1, minimum=MAX_INTERACTION_ROUNDS_MIN, maximum=MAX_INTERACTION_ROUNDS_MAX),
-        default_assist_max_rounds=parse_bounded_int_env(os.getenv("DEFAULT_ASSIST_MAX_ROUNDS"), default=4, minimum=MAX_INTERACTION_ROUNDS_MIN, maximum=MAX_INTERACTION_ROUNDS_MAX),
-        default_agent_max_rounds=parse_bounded_int_env(os.getenv("DEFAULT_AGENT_MAX_ROUNDS"), default=6, minimum=MAX_INTERACTION_ROUNDS_MIN, maximum=MAX_INTERACTION_ROUNDS_MAX),
+        default_chat_max_rounds=parse_bounded_int_env(os.getenv("DEFAULT_CHAT_MAX_ROUNDS"), default=1, minimum=MAX_INTERACTION_ROUNDS_MIN),
+        default_assist_max_rounds=parse_bounded_int_env(os.getenv("DEFAULT_ASSIST_MAX_ROUNDS"), default=4, minimum=MAX_INTERACTION_ROUNDS_MIN),
+        default_agent_max_rounds=parse_bounded_int_env(os.getenv("DEFAULT_AGENT_MAX_ROUNDS"), default=6, minimum=MAX_INTERACTION_ROUNDS_MIN),
         default_group_spontaneous_reply_chance=parse_bounded_int_env(os.getenv("DEFAULT_GROUP_SPONTANEOUS_REPLY_CHANCE"), default=0, minimum=SPONTANEOUS_REPLY_CHANCE_MIN, maximum=SPONTANEOUS_REPLY_CHANCE_MAX),
-        default_group_spontaneous_reply_delay_s=parse_bounded_float_env(os.getenv('DEFAULT_GROUP_SPONTANEOUS_REPLY_DELAY_S', os.getenv('DEFAULT_GROUP_SPONTANEOUS_REPLY_IDLE_S')), default=1200.0, minimum=0.0, maximum=86400.0),
-        default_private_reply_delay_s=parse_bounded_float_env(os.getenv('DEFAULT_PRIVATE_REPLY_DELAY_S'), default=0.0, minimum=0.0, maximum=600.0),
-        default_group_reply_delay_s=parse_bounded_float_env(os.getenv('DEFAULT_GROUP_REPLY_DELAY_S', os.getenv('TGBOT_GROUP_REPLY_DELAY_S')), default=5.0, minimum=0.0, maximum=600.0),
-        default_provider_retry_count=parse_bounded_int_env(os.getenv("DEFAULT_PROVIDER_RETRY_COUNT"), default=1, minimum=PROVIDER_RETRY_COUNT_MIN, maximum=PROVIDER_RETRY_COUNT_MAX),
+        default_group_spontaneous_reply_delay_s=parse_bounded_float_env(os.getenv('DEFAULT_GROUP_SPONTANEOUS_REPLY_DELAY_S', os.getenv('DEFAULT_GROUP_SPONTANEOUS_REPLY_IDLE_S')), default=1200.0, minimum=0.0),
+        default_private_reply_delay_s=parse_bounded_float_env(os.getenv('DEFAULT_PRIVATE_REPLY_DELAY_S'), default=0.0, minimum=0.0),
+        default_group_reply_delay_s=parse_bounded_float_env(os.getenv('DEFAULT_GROUP_REPLY_DELAY_S', os.getenv('TGBOT_GROUP_REPLY_DELAY_S')), default=5.0, minimum=0.0),
+        default_provider_retry_count=parse_bounded_int_env(os.getenv("DEFAULT_PROVIDER_RETRY_COUNT"), default=1, minimum=PROVIDER_RETRY_COUNT_MIN),
         default_metadata_injection_mode=_choice(os.getenv('DEFAULT_METADATA_INJECTION_MODE', 'on'), 'on', {'on', 'off'}),
         default_metadata_timezone=os.getenv('DEFAULT_METADATA_TIMEZONE', '').strip() or DEFAULT_METADATA_TIMEZONE,
         default_system_prompt=default_system_prompt_value,
@@ -366,10 +372,13 @@ def load_config(*, require_telegram: bool = True) -> AppConfig:
             max_sticker_bytes=int(os.getenv("TGBOT_MAX_STICKER_BYTES", str(3 * 1024 * 1024))),
             max_sticker_frames=int(os.getenv("TGBOT_MAX_STICKER_FRAMES", "4")),
             max_visual_file_frames=int(os.getenv("TGBOT_MAX_VISUAL_FILE_FRAMES", "10")),
+            max_video_keyframe_candidates=int(os.getenv("TGBOT_MAX_VIDEO_KEYFRAME_CANDIDATES", "300")),
             max_inline_text_chars=int(os.getenv("TGBOT_MAX_INLINE_TEXT_CHARS", "8000")),
             link_prefetch_timeout_s=float(os.getenv("TGBOT_LINK_PREFETCH_TIMEOUT_S", "4.0")),
             link_prefetch_max_urls=int(os.getenv("TGBOT_LINK_PREFETCH_MAX_URLS", "2")),
             link_prefetch_max_chars=int(os.getenv("TGBOT_LINK_PREFETCH_MAX_CHARS", "1200")),
+            link_prefetch_max_bytes=int(os.getenv("TGBOT_LINK_PREFETCH_MAX_BYTES", str(256 * 1024))),
+            link_prefetch_max_redirects=int(os.getenv("TGBOT_LINK_PREFETCH_MAX_REDIRECTS", "5")),
         ),
         openai=OpenAIConfig(
             api_key=os.getenv("OPENAI_API_KEY", "").strip(),
@@ -378,13 +387,13 @@ def load_config(*, require_telegram: bool = True) -> AppConfig:
             reasoning_effort=normalize_optional_choice(os.getenv("OPENAI_REASONING_EFFORT"), REASONING_EFFORT_VALUES) or "none",
             reasoning_summary=effective_reasoning_summary(os.getenv("OPENAI_REASONING_SUMMARY"), provider="openai", default="off"),
             text_verbosity=normalize_optional_choice(os.getenv("OPENAI_TEXT_VERBOSITY"), TEXT_VERBOSITY_VALUES) or "low",
-            max_output_tokens=parse_bounded_int_env(os.getenv("OPENAI_MAX_OUTPUT_TOKENS"), default=4096, minimum=MAX_OUTPUT_TOKENS_MIN, maximum=MAX_OUTPUT_TOKENS_MAX),
-            max_input_images=parse_optional_disabled_int_env(os.getenv("OPENAI_MAX_INPUT_IMAGES"), default=IMAGE_LIMIT_DISABLED, maximum=IMAGE_LIMIT_MAX),
-            compact_target_images=parse_optional_disabled_int_env(os.getenv("OPENAI_COMPACT_TARGET_IMAGES"), default=IMAGE_LIMIT_DISABLED, maximum=IMAGE_LIMIT_MAX),
+            max_output_tokens=parse_bounded_int_env(os.getenv("OPENAI_MAX_OUTPUT_TOKENS"), default=4096, minimum=MAX_OUTPUT_TOKENS_MIN),
+            max_input_images=parse_optional_disabled_int_env(os.getenv("OPENAI_MAX_INPUT_IMAGES"), default=IMAGE_LIMIT_DISABLED),
+            compact_target_images=parse_optional_disabled_int_env(os.getenv("OPENAI_COMPACT_TARGET_IMAGES"), default=IMAGE_LIMIT_DISABLED),
             enable_native_web_search=_bool(os.getenv("OPENAI_ENABLE_NATIVE_WEB_SEARCH"), False),
-            native_web_search_max=parse_optional_disabled_int_env(os.getenv("OPENAI_NATIVE_WEB_SEARCH_MAX"), default=1, maximum=NATIVE_WEB_SEARCH_MAX_MAX),
-            request_timeout_s=parse_bounded_float_env(os.getenv('OPENAI_REQUEST_TIMEOUT_S'), default=60.0, minimum=0.1, maximum=3600.0),
-            connect_timeout_s=parse_bounded_float_env(os.getenv('OPENAI_CONNECT_TIMEOUT_S'), default=15.0, minimum=0.1, maximum=3600.0),
+            native_web_search_max=parse_optional_disabled_int_env(os.getenv("OPENAI_NATIVE_WEB_SEARCH_MAX"), default=1),
+            request_timeout_s=parse_bounded_float_env(os.getenv('OPENAI_REQUEST_TIMEOUT_S'), default=60.0, minimum=0.1),
+            connect_timeout_s=parse_bounded_float_env(os.getenv('OPENAI_CONNECT_TIMEOUT_S'), default=15.0, minimum=0.1),
         ),
         gemini=GeminiConfig(
             api_key=os.getenv("GEMINI_API_KEY", "").strip(),
@@ -392,16 +401,16 @@ def load_config(*, require_telegram: bool = True) -> AppConfig:
             model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash",
             temperature=parse_bounded_float_env(os.getenv("GEMINI_TEMPERATURE"), default=1.0, minimum=TEMPERATURE_MIN, maximum=TEMPERATURE_MAX),
             top_p=parse_bounded_float_env(os.getenv("GEMINI_TOP_P"), default=0.95, minimum=TOP_P_MIN, maximum=TOP_P_MAX),
-            top_k=parse_bounded_int_env(os.getenv("GEMINI_TOP_K"), default=40, minimum=TOP_K_MIN, maximum=TOP_K_MAX),
+            top_k=parse_bounded_int_env(os.getenv("GEMINI_TOP_K"), default=40, minimum=TOP_K_MIN),
             include_thoughts=_bool(os.getenv("GEMINI_INCLUDE_THOUGHTS"), False),
-            thinking_budget=parse_optional_bounded_int_env(os.getenv("GEMINI_THINKING_BUDGET"), minimum=GEMINI_THINKING_BUDGET_MIN, maximum=GEMINI_THINKING_BUDGET_MAX),
+            thinking_budget=parse_optional_bounded_int_env(os.getenv("GEMINI_THINKING_BUDGET"), minimum=GEMINI_THINKING_BUDGET_MIN),
             thinking_level=normalize_optional_choice(os.getenv("GEMINI_THINKING_LEVEL"), GEMINI_THINKING_LEVEL_VALUES),
             enable_native_web_search=_bool(os.getenv("GEMINI_ENABLE_NATIVE_WEB_SEARCH"), False),
-            max_output_tokens=parse_bounded_int_env(os.getenv("GEMINI_MAX_OUTPUT_TOKENS"), default=8192, minimum=MAX_OUTPUT_TOKENS_MIN, maximum=MAX_OUTPUT_TOKENS_MAX),
-            max_input_images=parse_optional_disabled_int_env(os.getenv("GEMINI_MAX_INPUT_IMAGES"), default=3600, maximum=IMAGE_LIMIT_MAX),
-            compact_target_images=parse_optional_disabled_int_env(os.getenv("GEMINI_COMPACT_TARGET_IMAGES"), default=3000, maximum=IMAGE_LIMIT_MAX),
-            request_timeout_s=parse_bounded_float_env(os.getenv('GEMINI_REQUEST_TIMEOUT_S'), default=60.0, minimum=0.1, maximum=3600.0),
-            connect_timeout_s=parse_bounded_float_env(os.getenv('GEMINI_CONNECT_TIMEOUT_S'), default=15.0, minimum=0.1, maximum=3600.0),
+            max_output_tokens=parse_bounded_int_env(os.getenv("GEMINI_MAX_OUTPUT_TOKENS"), default=8192, minimum=MAX_OUTPUT_TOKENS_MIN),
+            max_input_images=parse_optional_disabled_int_env(os.getenv("GEMINI_MAX_INPUT_IMAGES"), default=3600),
+            compact_target_images=parse_optional_disabled_int_env(os.getenv("GEMINI_COMPACT_TARGET_IMAGES"), default=3000),
+            request_timeout_s=parse_bounded_float_env(os.getenv('GEMINI_REQUEST_TIMEOUT_S'), default=60.0, minimum=0.1),
+            connect_timeout_s=parse_bounded_float_env(os.getenv('GEMINI_CONNECT_TIMEOUT_S'), default=15.0, minimum=0.1),
         ),
         ssh_exec=SSHExecConfig(
             enabled=_bool(os.getenv("SSH_EXEC_ENABLED"), True),
@@ -423,14 +432,19 @@ def load_config(*, require_telegram: bool = True) -> AppConfig:
             control_persist_s=int(os.getenv('SSH_EXEC_CONTROL_PERSIST_S', '600')),
         ),
         context=ContextConfig(
-            compact_trigger_tokens=parse_bounded_int_env(os.getenv("CONTEXT_COMPACT_TRIGGER_TOKENS"), default=300000, minimum=COMPACT_TOKEN_MIN, maximum=COMPACT_TOKEN_MAX),
-            compact_target_tokens=parse_bounded_int_env(os.getenv("CONTEXT_COMPACT_TARGET_TOKENS"), default=100000, minimum=COMPACT_TOKEN_MIN, maximum=COMPACT_TOKEN_MAX),
-            compact_batch_tokens=parse_bounded_int_env(os.getenv("CONTEXT_COMPACT_BATCH_TOKENS"), default=40000, minimum=COMPACT_TOKEN_MIN, maximum=COMPACT_TOKEN_MAX),
+            compact_trigger_tokens=parse_bounded_int_env(os.getenv("CONTEXT_COMPACT_TRIGGER_TOKENS"), default=300000, minimum=COMPACT_TOKEN_MIN),
+            compact_target_tokens=parse_bounded_int_env(os.getenv("CONTEXT_COMPACT_TARGET_TOKENS"), default=100000, minimum=COMPACT_TOKEN_MIN),
+            compact_batch_tokens=parse_bounded_int_env(os.getenv("CONTEXT_COMPACT_BATCH_TOKENS"), default=40000, minimum=COMPACT_TOKEN_MIN),
             compact_keep_recent_ratio=parse_bounded_float_env(os.getenv("CONTEXT_COMPACT_KEEP_RECENT_RAW_TOKEN_RATIO"), default=0.5, minimum=COMPACT_KEEP_RECENT_RATIO_MIN, maximum=COMPACT_KEEP_RECENT_RATIO_MAX),
-            compact_tool_ratio_threshold=parse_bounded_float_env(os.getenv("CONTEXT_COMPACT_TOOL_RATIO_THRESHOLD"), default=10.0, minimum=COMPACT_TOOL_RATIO_THRESHOLD_MIN, maximum=COMPACT_TOOL_RATIO_THRESHOLD_MAX),
-            compact_tool_min_tokens=parse_bounded_int_env(os.getenv("CONTEXT_COMPACT_TOOL_MIN_TOKENS"), default=10000, minimum=COMPACT_TOKEN_MIN, maximum=COMPACT_TOKEN_MAX),
-            compact_min_messages=parse_bounded_int_env(os.getenv("CONTEXT_COMPACT_MIN_MESSAGES"), default=24, minimum=COMPACT_MIN_MESSAGES_MIN, maximum=COMPACT_MIN_MESSAGES_MAX),
-            min_raw_messages_reserve=parse_bounded_int_env(os.getenv("CONTEXT_MIN_RAW_MESSAGES_RESERVE"), default=8, minimum=MIN_RAW_MESSAGES_RESERVE_MIN, maximum=MIN_RAW_MESSAGES_RESERVE_MAX),
+            compact_tool_ratio_threshold=parse_bounded_float_env(os.getenv("CONTEXT_COMPACT_TOOL_RATIO_THRESHOLD"), default=10.0, minimum=COMPACT_TOOL_RATIO_THRESHOLD_MIN),
+            compact_tool_min_tokens=parse_bounded_int_env(os.getenv("CONTEXT_COMPACT_TOOL_MIN_TOKENS"), default=10000, minimum=COMPACT_TOKEN_MIN),
+            compact_min_messages=parse_bounded_int_env(os.getenv("CONTEXT_COMPACT_MIN_MESSAGES"), default=24, minimum=COMPACT_MIN_MESSAGES_MIN),
+            min_raw_messages_reserve=parse_bounded_int_env(os.getenv("CONTEXT_MIN_RAW_MESSAGES_RESERVE"), default=8, minimum=MIN_RAW_MESSAGES_RESERVE_MIN),
+            compaction_attempts=int(os.getenv('CONTEXT_COMPACTION_ATTEMPTS', '').strip() or 24),
+            attribution_retries=int(os.getenv('CONTEXT_ATTRIBUTION_RETRIES', '').strip() or 1),
+            summary_context_min_tokens=int(os.getenv('CONTEXT_SUMMARY_MIN_TOKENS', '').strip() or 256),
+            summary_context_floor_tokens=int(os.getenv('CONTEXT_SUMMARY_FLOOR_TOKENS', '').strip() or 1024),
+            summary_context_max_tokens=int(os.getenv('CONTEXT_SUMMARY_MAX_TOKENS', '').strip() or 16000),
         ),
     )
 
@@ -511,11 +525,11 @@ def _chat_completions_profile(value: Any) -> ChatCompletionsConfig:
         if key in values and not isinstance(values[key], bool):
             raise ValueError(f'Provider {name}: {key} must be a JSON boolean')
     bounds = {
-        'max_output_tokens': (int, MAX_OUTPUT_TOKENS_MIN, MAX_OUTPUT_TOKENS_MAX),
-        'max_input_images': (int, 0, IMAGE_LIMIT_MAX),
-        'compact_target_images': (int, 0, IMAGE_LIMIT_MAX),
-        'request_timeout_s': (float, 0.1, 3600),
-        'connect_timeout_s': (float, 0.1, 3600),
+        'max_output_tokens': (int, MAX_OUTPUT_TOKENS_MIN, None),
+        'max_input_images': (int, 0, None),
+        'compact_target_images': (int, 0, None),
+        'request_timeout_s': (float, 0.1, None),
+        'connect_timeout_s': (float, 0.1, None),
         'temperature': (float, TEMPERATURE_MIN, TEMPERATURE_MAX),
         'top_p': (float, TOP_P_MIN, TOP_P_MAX),
     }
@@ -527,8 +541,9 @@ def _chat_completions_profile(value: Any) -> ChatCompletionsConfig:
                 values[key] = cast(values[key])
             except (TypeError, ValueError) as exc:
                 raise ValueError(f'Provider {name}: invalid {key}') from exc
-            if not minimum <= values[key] <= maximum:
-                raise ValueError(f'Provider {name}: {key} must be between {minimum} and {maximum}')
+            if (not math.isfinite(values[key]) or values[key] < minimum
+                    or (maximum is not None and values[key] > maximum)):
+                raise ValueError(f'Provider {name}: invalid {key} range')
     if values.get('structured_output', 'json_object') not in {'json_schema', 'json_object', 'prompt'}:
         raise ValueError(f'Provider {name}: structured_output must be json_schema, json_object or prompt')
     if values.get('token_limit_parameter', 'max_tokens') not in {'max_tokens', 'max_completion_tokens'}:

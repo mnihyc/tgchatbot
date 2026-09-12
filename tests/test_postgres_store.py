@@ -19,9 +19,7 @@ from psycopg.conninfo import make_conninfo
 from psycopg.errors import QueryCanceled
 
 from tgchatbot.domain.models import ConversationMessage, MessagePart, MessageRole, PartKind, SessionSettings
-from tgchatbot.storage.artifacts import ArtifactStore
 from tgchatbot.storage.postgres_store import DatabaseConfig, PostgresStore, StaleScopeError, message_body
-from tgchatbot.storage.previews import PreviewCache
 
 
 def original(number: int, text: str, *, actor: str | None = 'telegram:user:1',
@@ -45,8 +43,7 @@ class PostgresConversationWorkflows(unittest.IsolatedAsyncioTestCase):
         self.schema = 'test_conversation_' + uuid.uuid4().hex
         self.temp = tempfile.TemporaryDirectory(prefix='pg-fixture-', dir=Path(__file__).parent)
         self.addCleanup(self.temp.cleanup)
-        self.artifacts = ArtifactStore(Path(self.temp.name) / 'replay', max_bytes=1024 * 1024)
-        self.store = PostgresStore(os.environ['TEST_DATABASE_URL'], schema=self.schema, artifact_store=self.artifacts)
+        self.store = PostgresStore(os.environ['TEST_DATABASE_URL'], schema=self.schema)
         await self.store.initialize()
         self.session = 'telegram:-100'
         self.defaults = SessionSettings(provider='deepseek', model='chat')
@@ -70,7 +67,7 @@ class PostgresConversationWorkflows(unittest.IsolatedAsyncioTestCase):
         second = await self.append(2, 'I prefer coffee. 我不喝龙井。', actor='telegram:user:2', at='2025-02-01T12:00:00Z')
         unknown = await self.append(3, '龙井很好', actor=None)
         await self.store.close()
-        self.store = PostgresStore(os.environ['TEST_DATABASE_URL'], schema=self.schema, artifact_store=self.artifacts)
+        self.store = PostgresStore(os.environ['TEST_DATABASE_URL'], schema=self.schema)
         await self.store.initialize()
         rows = await self.store.search_messages(self.session, '龙井', actor_id='telegram:user:1')
         self.assertEqual([row['id'] for row in rows], [first.db_id])
@@ -168,7 +165,8 @@ class PostgresConversationWorkflows(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row['claim'] for row in await self.store.get_profile(self.session, 'telegram:user:1')], ['drinks tea'])
         self.assertEqual([row['claim'] for row in await self.store.get_profile(self.session, 'telegram:user:1', at='2025-02-01T00:00:00Z')], ['drinks coffee'])
         await self.store.hide_message_ids(self.session, [correction.db_id])
-        self.assertEqual([row['claim'] for row in await self.store.get_profile(self.session, 'telegram:user:1')], ['drinks coffee'])
+        self.assertEqual(await self.store.get_profile(self.session, 'telegram:user:1'), [],
+            'Surviving historical evidence is queued for bounded reconciliation, not inserted automatically')
         answer = await self.store.append_message(self.session, ConversationMessage.assistant_text('Alex is a doctor'))
         with self.assertRaises(ValueError):
             await self.fact(answer, 'is a doctor')
@@ -212,17 +210,12 @@ class PostgresConversationWorkflows(unittest.IsolatedAsyncioTestCase):
         await self.store.reset_full(self.session, self.defaults)
         self.assertFalse(await self.store.update_job_payload(stale, {'state': 'done'}))
 
-    async def test_disposable_preview_and_native_replay_expiry_preserve_portable_original(self):
-        cache = PreviewCache(Path(self.temp.name), max_bytes=8)
-        self.addCleanup(cache.close)
+    async def test_working_preview_and_native_replay_do_not_mutate_portable_original(self):
         message = original(1, 'Here is the picture')
         message.parts.append(MessagePart(kind=PartKind.IMAGE, data_b64='YWJj', detail='a red cup'))
-        with self.assertRaises(ValueError):
-            await self.store.append_message(self.session, message)
-        stored = await self.store.append_message(self.session, cache.externalize(message))
-        projected = replace(stored, message=ConversationMessage.user_text('[image compacted]'))
-        await self.store.update_message(self.session, projected)
-        self.assertEqual(message_body((await self.store.list_recent_visible_messages(self.session))[0].message), '[image compacted]')
+        stored = await self.store.append_message(self.session, message)
+        await self.store.retire_context_images(self.session, target_images=0)
+        self.assertIn('[Image compacted]', message_body((await self.store.list_recent_visible_messages(self.session))[0].message))
         original_saved = (await self.store.read_messages(self.session, [stored.db_id]))[0]
         self.assertEqual(original_saved.message.parts[0].text, 'Here is the picture')
         self.assertIn('a red cup', message_body(original_saved.message))
@@ -231,9 +224,7 @@ class PostgresConversationWorkflows(unittest.IsolatedAsyncioTestCase):
         reply = await self.store.append_message(self.session, ConversationMessage.assistant_text('A red cup', metadata={'provider_native': {'provider': 'fixture', 'items': [{'text': 'A red cup'}]}}))
         recent = (await self.store.list_recent_visible_messages(self.session))[0]
         self.assertIn('provider_native', recent.message.metadata)
-        path = Path(recent.message.metadata['provider_native_artifact'])
-        path.unlink()
-        portable = (await self.store.list_recent_visible_messages(self.session))[0].message
+        portable = (await self.store.read_messages(self.session, [reply.db_id]))[0].message
         self.assertNotIn('provider_native', portable.metadata)
         self.assertEqual(message_body(portable), 'A red cup')
         audit = await self.store.list_message_revisions(self.session, reply.db_id)
@@ -439,8 +430,9 @@ class PostgresConversationWorkflows(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(block.source_message_count, count)
         excerpt = await self.store.create_excerpt(self.session, ids)
         self.assertEqual(excerpt['source_ids'], ids)
-        for index in range(120):
-            await self.fact(first, f'Distinct durable preference {index}')
+        with patch.dict(os.environ, {'MEMORY_PROFILE_BYTES': '50000'}):
+            for index in range(120):
+                await self.fact(first, f'Distinct durable preference {index}')
         self.assertEqual(len(await self.store.get_profile(self.session, 'telegram:user:1')), 120)
 
     async def test_configured_job_retries_claim_pages_and_leases_retain_work(self):

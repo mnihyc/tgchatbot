@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import logging
 import math
 import re
 from uuid import uuid4, uuid5, NAMESPACE_URL
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from weakref import WeakValueDictionary
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from contextvars import ContextVar
@@ -14,7 +16,8 @@ from typing import Any
 from psycopg.errors import QueryCanceled
 
 from tgchatbot.config import AppConfig
-from tgchatbot.core.context_state import LiveConversationState, MemoryBlock, StoredConversationMessage
+from tgchatbot.core.context_state import (CompactionWorkingSet, LiveConversationState, MemoryBlock,
+    StoredConversationMessage, is_auto_note_message, matching_tool_result)
 from tgchatbot.core.events import RuntimeEvent
 from tgchatbot.core.policy import policy_for_mode
 from tgchatbot.core.compaction_schema import compaction_json_schema, compaction_schema_name, parse_structured_candidate
@@ -34,6 +37,7 @@ from tgchatbot.domain.models import (
     ToolHistoryMode,
     StickerTiming,
     TurnResult,
+    ToolResult,
 )
 from tgchatbot.logging_config import clip_for_log
 from tgchatbot.domain.provenance import attributed_message, attribution
@@ -44,19 +48,12 @@ from tgchatbot.settings_schema import (
     COMPACT_MIN_MESSAGES_MIN,
     COMPACT_TOKEN_MIN,
     COMPACT_TOOL_RATIO_THRESHOLD_MIN,
-    GROUP_SPONTANEOUS_REPLY_DELAY_MAX_S,
-    IMAGE_LIMIT_MAX,
-    MAX_INTERACTION_ROUNDS_MAX,
     MAX_INTERACTION_ROUNDS_MIN,
-    NATIVE_WEB_SEARCH_MAX_MAX,
-    PROVIDER_RETRY_COUNT_MAX,
     PROVIDER_RETRY_COUNT_MIN,
-    REPLY_DELAY_MAX_S,
     SPONTANEOUS_REPLY_CHANCE_MAX,
     SPONTANEOUS_REPLY_CHANCE_MIN,
     TEMPERATURE_MAX,
     TEMPERATURE_MIN,
-    TOP_K_MAX,
     TOP_K_MIN,
     TOP_P_MAX,
     TOP_P_MIN,
@@ -72,7 +69,9 @@ from tgchatbot.tools.registry import ToolRegistry
 logger = logging.getLogger(__name__)
 EventCallback = Callable[[RuntimeEvent], Awaitable[None]]
 _turn_scope: ContextVar[dict[str, int] | None] = ContextVar('turn_scope', default=None)
+_turn_artifacts: ContextVar[list[Any] | None] = ContextVar('turn_artifacts', default=None)
 _admission_protected: ContextVar[frozenset[int]] = ContextVar('admission_protected', default=frozenset())
+_refresh_compactions: ContextVar[set[int] | None] = ContextVar('refresh_compactions', default=None)
 
 
 class CompactionModelRequestFailed(RuntimeError):
@@ -88,7 +87,7 @@ class AgentRuntime:
         *,
         config: AppConfig,
         store: PostgresStore,
-        tool_registry: ToolRegistry,
+        tool_registry: ToolRegistry | None,
         providers: dict[str, ModelProvider],
         memory: Any = None,
         preview_cache: Any = None,
@@ -104,6 +103,7 @@ class AgentRuntime:
         self._live_sessions: dict[str, LiveConversationState] = {}
         self._live_invalidation_epoch = 0
         self._request_estimate_bias: dict[tuple[str, str, str], float] = {}
+        self._execution_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 
     @staticmethod
     def _session_log_id(session_id: str) -> str:
@@ -143,20 +143,20 @@ class AgentRuntime:
 
     async def ingest_user_message(self, *, session_id: str, incoming_message: ConversationMessage, expected_scope: dict[str, int] | None = None, intake: bool = False) -> StoredConversationMessage:
         state = await self._get_live_state(session_id)
-        if self.preview_cache is not None:
-            incoming_message = self.preview_cache.externalize(incoming_message)
         stored_incoming = await self._append_stored(session_id, incoming_message, expected_scope=expected_scope, intake=intake)
         # An edit can revise an older soft-reset context. It remains searchable,
         # but must not re-enter the new working context or revive an undone row.
         if not await self.store.read_messages(session_id, [stored_incoming.db_id], current_context=True):
             return stored_incoming
-        # Telegram redelivery is idempotent; an edit replaces the live revision.
-        if stored_incoming.db_id > state.last_message_id and stored_incoming.message.metadata.get('source_revision', 1) == 1:
-            self._append_live_message(state, stored_incoming)
-        else:
-            # Revising a compacted source invalidates its block and may expose
-            # other originals again. Reload both projections together.
-            await self._reload_live_state(state)
+        # An identical envelope/redelivery leaves the database projection version
+        # unchanged. Its already synchronized cache needs no archive reload.
+        if stored_incoming.context_version != state.database_version:
+            if stored_incoming.db_id > state.last_message_id and stored_incoming.message.metadata.get('source_revision', 1) == 1:
+                await self._append_live_message(state, stored_incoming)
+            else:
+                # Revising a compacted source invalidates its block and may expose
+                # other originals again. Reload both projections together.
+                await self._reload_live_state(state)
         logger.info(
             'msg.ingest sid=%s msg=%s role=%s parts=%s preview=%s',
             self._session_log_id(session_id),
@@ -183,10 +183,8 @@ class AgentRuntime:
         logger.info('tool.obs sid=%s name=%s phase=%s provider=%s payload=%s', self._session_log_id(session_id), name, phase, provider_name or '-', self._compact_json(payload, limit=220))
         message = self._tool_observation_message(name=name, payload=payload, phase=phase,
             summary_text=summary_text, provider_name=provider_name, metadata_update=metadata_update, evidence_parts=evidence_parts)
-        if self.preview_cache is not None:
-            message = self.preview_cache.externalize(message)
         stored = await self._append_stored(session_id, message, estimated_tokens=TokenEstimator.estimate_message(message), expected_scope=expected_scope)
-        self._append_live_message(state, stored)
+        await self._append_live_message(state, stored)
         return stored
 
     def _tool_observation_message(self, *, name: str, payload: dict[str, Any], phase: str,
@@ -252,14 +250,14 @@ class AgentRuntime:
             metadata=note_metadata,
         )
         stored = await self._append_stored(session_id, message)
-        self._append_live_message(state, stored)
+        await self._append_live_message(state, stored)
         return stored
 
     async def record_assistant_text(self, *, session_id: str, text: str, metadata: dict[str, Any] | None = None, expected_scope: dict[str, int] | None = None) -> StoredConversationMessage:
         state = await self._get_live_state(session_id)
         message = ConversationMessage.assistant_text(text, metadata=metadata)
         stored = await self._append_stored(session_id, message, expected_scope=expected_scope)
-        self._append_live_message(state, stored)
+        await self._append_live_message(state, stored)
         return stored
 
     async def run_turn(
@@ -282,16 +280,88 @@ class AgentRuntime:
         self, *, session_id: str, user_display_name: str, trigger_message_id: int,
         emit: EventCallback | None = None,
     ) -> TurnResult:
+        lock = self._execution_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._execution_locks[session_id] = lock
+        # The strong local reference includes queued waiters; idle sessions do
+        # not leave an ever-growing lock registry behind.
+        async with lock:
+            return await self._execute_turn_from_stored(session_id=session_id,
+                user_display_name=user_display_name, trigger_message_id=trigger_message_id, emit=emit)
+
+    async def prepare_context(self, *, session_id: str, emit: EventCallback | None = None) -> dict[str, int]:
+        """Prepare an active archive without loading it as an interactive cache."""
+        lock = self._execution_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._execution_locks[session_id] = lock
+        async with lock:
+            settings = await self.store.get_or_create_session(session_id, self.config.default_session_settings())
+            provider = self._require_provider(settings.provider)
+            await self._load_request_estimate_bias(settings)
+            token = _turn_scope.set(await self.store.get_scope(session_id))
+            try:
+                await self._recover_interrupted_tools(session_id)
+                state = await self.store.load_compaction_window(session_id)
+                instructions = build_system_prompt(settings)
+                compactions = 0
+                active = state.more_raw or state.more_blocks
+                while True:
+                    await self._check_turn_scope(session_id)
+                    estimate = self._estimate_request_tokens(state, settings=settings, provider=provider,
+                        instructions=instructions, tools=[])
+                    active = active or estimate > self._effective_compact_trigger_tokens(settings)
+                    if not (state.more_raw or state.more_blocks or
+                            active and estimate > self._effective_compact_target_tokens(settings)):
+                        break
+                    changed = await self._compact_old_context(session_id=session_id, settings=settings,
+                        provider=provider, state=state, emit=emit)
+                    if not changed:
+                        changed = await self._compact_old_context(session_id=session_id, settings=settings,
+                            provider=provider, state=state, pressure=True, emit=emit)
+                    if not changed:
+                        remaining = await self.store.context_preparation_counts(session_id, state.through_message_id)
+                        raise RuntimeError('Context preparation cannot progress with the current configuration or model output; '
+                            f'{remaining["remaining_raw_messages"]} raw messages and '
+                            f'{remaining["remaining_root_blocks"]} root summary blocks remain. '
+                            'Originals and completed summaries are intact; inspect the compaction error before retrying.')
+                    compactions += 1
+                # Once the raw backlog fits, image retirement can follow the
+                # ordinary policy without loading the archive during preparation.
+                compacted_images = await self._compact_if_needed(session_id=session_id, settings=settings,
+                    provider=provider, state=state, instructions=instructions, tools=[], emit=emit)
+                if self.memory is not None and (compactions or compacted_images
+                        or await self.store.compaction_needs_profile_refresh(session_id)):
+                    await self._refresh_profiles_after_compaction(session_id=session_id, state=state,
+                        settings=settings, provider=provider, instructions=instructions, tools=[], emit=emit,
+                        trigger=state.raw_messages[-1] if state.raw_messages else None)
+                return {'compactions': compactions, 'through_message_id': state.through_message_id,
+                    **await self.store.context_preparation_counts(session_id, state.through_message_id)}
+            finally:
+                _turn_scope.reset(token)
+
+    async def _execute_turn_from_stored(
+        self, *, session_id: str, user_display_name: str, trigger_message_id: int,
+        emit: EventCallback | None = None,
+    ) -> TurnResult:
         scope = await self.store.get_scope(session_id) if hasattr(self.store, 'get_scope') else None
         token = _turn_scope.set(scope)
+        artifacts: list[Any] = []
+        artifact_token = _turn_artifacts.set(artifacts)
         try:
             result = await self._run_turn_from_stored(session_id=session_id,
                 user_display_name=user_display_name, trigger_message_id=trigger_message_id, emit=emit)
             await self._check_turn_scope(session_id)
             result.scope = scope
             return result
+        except BaseException:
+            for artifact in artifacts:
+                artifact.discard()
+            raise
         finally:
             _turn_scope.reset(token)
+            _turn_artifacts.reset(artifact_token)
 
     async def _run_turn_from_stored(
         self,
@@ -303,7 +373,9 @@ class AgentRuntime:
     ) -> TurnResult:
         settings = await self.store.get_or_create_session(session_id, self.config.default_session_settings())
         provider = self._require_provider(settings.provider)
+        await self._load_request_estimate_bias(settings)
         state = await self._get_live_state(session_id)
+        await self._recover_interrupted_tools(session_id, state)
 
         policy = policy_for_mode(settings.mode)
         max_tool_rounds = self._effective_max_interaction_rounds(settings)
@@ -376,7 +448,7 @@ class AgentRuntime:
         reserved = '\n'.join(part.text or '' for part in target_message.parts) if target_message else ''
         compacted = await self._compact_if_needed(session_id=session_id, settings=settings, provider=provider,
             state=state, instructions=instructions + ('\n' + reserved if reserved else ''), tools=tools, emit=emit)
-        if compacted and self.memory is not None:
+        if self.memory is not None and (compacted or await self.store.compaction_needs_profile_refresh(session_id)):
             await self._refresh_profiles_after_compaction(session_id=session_id,state=state,settings=settings,
                 provider=provider,instructions=instructions,tools=tools,emit=emit,trigger=trigger,reserved=reserved)
         if target_message is not None:
@@ -384,14 +456,14 @@ class AgentRuntime:
                 if item.message.metadata.get('synthetic_role') == 'reply_target'), None)
             if previous_target is None or previous_target.metadata.get('reply_target') != target:
                 stored_target = await self._append_stored(session_id, target_message)
-                self._append_live_message(state, stored_target)
+                await self._append_live_message(state, stored_target)
         history = self._build_provider_history(state, settings=settings, provider_name=provider.name)
-        if self.preview_cache is not None:
-            history = [self.preview_cache.materialize(item, vision=provider.capabilities.multimodal_input) for item in history]
         logger.debug('turn.history sid=%s provider=%s messages=%s cached=%s', self._session_log_id(session_id), provider.name, len(history), not state.provider_history_dirty)
         accumulated_items: list[dict[str, Any]] = []
         turn_history_start = state.last_message_id + 1
-        collected_artifacts = []
+        collected_artifacts = _turn_artifacts.get()
+        if collected_artifacts is None:
+            collected_artifacts = []
         collected_stickers: list[OutboundSticker] = []
         last_usage = None
         deferred_tool_texts: list[str] = []
@@ -400,12 +472,15 @@ class AgentRuntime:
         total_steps = max_tool_rounds + 1
         for iteration in range(total_steps):
             await self._check_turn_scope(session_id)
+            if self.preview_cache is not None:
+                history = await self.preview_cache.materialize_many(session_id, history,
+                    vision=provider.capabilities.multimodal_input)
             final_iteration = iteration == max_tool_rounds
             current_tools = [] if final_iteration or not provider.capabilities.function_tools else tools
             iteration_instructions = instructions
             if final_iteration and tools:
                 # The last round intentionally disables tools. This keeps multi-step turns bounded and,
-                # per the runtime audit notes, forces a best-effort final reply instead of letting the
+                # forces a best-effort final reply instead of letting the
                 # model extend the same user turn forever with more tool calls.
                 iteration_instructions = instructions + "\n\n[Internal control note]: this is the final interaction round for this turn. Keep the established personality and preset voice exactly as intended by the system prompt. This note is not a user message. Do not call any more tools. Use the conversation so far and give the best final reply now."
             raw_request_estimate = provider.estimate_request_tokens(
@@ -414,13 +489,6 @@ class AgentRuntime:
                 instructions=iteration_instructions,
                 tools=current_tools,
                 extra_input_items=accumulated_items or None,
-                history_tokens_override=self._estimate_history_tokens_for_messages(
-                    state=state,
-                    provider=provider,
-                    settings=settings,
-                    selected_blocks=self._select_blocks_for_prompt(state, settings=settings),
-                    messages=history,
-                ),
             )
             adjusted_request_estimate = self._apply_request_estimate_bias(
                 raw_request_estimate,
@@ -453,7 +521,7 @@ class AgentRuntime:
             )
             await self._check_turn_scope(session_id)
             last_usage = response.usage
-            self._update_request_estimate_bias(
+            await self._update_request_estimate_bias(
                 provider_name=provider.name,
                 model=settings.model,
                 tool_history_mode=settings.tool_history_mode,
@@ -524,21 +592,23 @@ class AgentRuntime:
                 accumulated_items.extend(response.continuation_items)
                 native_items = persistent_history_items
                 pending_evidence_ids: set[int] = set()
+                admitted_images = admitted_tokens = 0
                 has_tool_evidence = False
+                batch_id = uuid4().hex
+                calls = []
                 for tool_index, tool_call in enumerate(response.tool_calls):
-                    metadata_update = None
+                    metadata_update = {'tool_batch_id': batch_id, 'tool_model': settings.model}
                     if native_items and tool_index == 0:
-                        metadata_update = {'provider_native': {'provider': provider.name, 'items': native_items}}
+                        metadata_update['provider_native'] = {'provider': provider.name, 'model': settings.model, 'items': native_items}
                     elif native_items:
-                        metadata_update = {'provider_native_skip_same_provider': True}
-                    stored_call = await self.record_tool_observation(
-                        session_id=session_id,
-                        name=tool_call.name,
-                        phase='call',
+                        metadata_update['provider_native_skip_same_provider'] = True
+                    calls.append(self._tool_observation_message(name=tool_call.name, phase='call',
                         payload={'call_id': tool_call.call_id, 'arguments': tool_call.arguments},
-                        provider_name=provider.name,
-                        metadata_update=metadata_update,
-                    )
+                        provider_name=provider.name, metadata_update=metadata_update))
+                stored_calls = await self.store.append_messages(session_id, calls, expected_scope=_turn_scope.get())
+                for stored_call in stored_calls:
+                    await self._append_live_message(state, stored_call)
+                for tool_call, stored_call in zip(response.tool_calls, stored_calls, strict=True):
                     logger.info('tool.call sid=%s name=%s call=%s args=%s', self._session_log_id(session_id), tool_call.name, clip_for_log(tool_call.call_id, limit=32), self._tool_argument_summary(tool_call.arguments))
                     # The current request is the authority for executable tools.
                     # A model can emit calls even when tools are disabled or the
@@ -558,20 +628,34 @@ class AgentRuntime:
                                     payload=tool_call.arguments,
                                 )
                             )
-                        result = await spec.runner.run(
-                            tool_call.arguments,
-                            ToolContext(
-                                session_id=session_id,
-                                user_display_name=user_display_name,
-                                scope=_turn_scope.get(),
-                                timezone=settings.metadata_timezone,
-                            ),
-                        )
+                        try:
+                            result = await spec.runner.run(
+                                tool_call.arguments,
+                                ToolContext(
+                                    session_id=session_id,
+                                    user_display_name=user_display_name,
+                                    scope=_turn_scope.get(),
+                                    timezone=settings.metadata_timezone,
+                                ),
+                            )
+                        except Exception as exc:
+                            await self._check_turn_scope(session_id)
+                            logger.exception('tool.failed sid=%s name=%s', self._session_log_id(session_id), tool_call.name)
+                            result = ToolResult(tool_call.call_id, tool_call.name, {'ok': False,
+                                'error': f'{tool_call.name} failed: {exc.__class__.__name__}',
+                                'outcome': 'unknown; effects may have occurred before the error'})
                         result.call_id = tool_call.call_id
                         collected_artifacts.extend(result.artifacts)
                         tool_output = result.output
                         evidence_parts = list(result.evidence_parts)
-                        tool_output, evidence_parts = self._admit_candidate_evidence(tool_output, evidence_parts, provider, settings)
+                        tool_output, evidence_parts = self._admit_candidate_evidence(tool_output, evidence_parts,
+                            provider, settings, images=admitted_images, tokens=admitted_tokens)
+                        # Results in this batch are protected together until the
+                        # next model request; they share its evidence allowance.
+                        if evidence_parts:
+                            admitted_images += sum(part.kind == PartKind.IMAGE for part in evidence_parts)
+                            admitted_tokens += TokenEstimator.estimate_message(
+                                ConversationMessage(role=MessageRole.TOOL, parts=evidence_parts))
                         logger.info('tool.result sid=%s name=%s ok=%s artifacts=%s stickers=%s output=%s', self._session_log_id(session_id), tool_call.name, bool(result.output.get('ok')), len(result.artifacts), len(result.stickers), self._compact_json(result.output, limit=220))
                         if result.stickers:
                             collected_stickers.extend(result.stickers)
@@ -579,7 +663,7 @@ class AgentRuntime:
                                 if self.sticker_delivery is not None:
                                     scope = _turn_scope.get() or await self.store.get_scope(session_id)
                                     operation_key = json.dumps([session_id,scope['generation'],scope['context_id'],
-                                        scope['revision'],trigger_message_id,tool_call.call_id,sticker_index])
+                                        scope['revision'],trigger_message_id,stored_call.db_id,sticker_index])
                                     sticker.delivery_operation_id = str(uuid5(NAMESPACE_URL,operation_key))
                                     operation = await self.sticker_delivery.queue(session_id,sticker.source_id or sticker.path.stem,
                                         operation_id=sticker.delivery_operation_id,expected_scope=scope,
@@ -606,15 +690,15 @@ class AgentRuntime:
                                     if self.sticker_delivery is not None and sticker.delivery_operation_id:
                                         delivered = await self.sticker_delivery.get(sticker.delivery_operation_id)
                                         tool_output = {**tool_output,'status':delivered['status'],'delivery_state':delivered['status'],
+                                            'ok':delivered['status']=='sent',
                                             'sent':delivered['status']=='sent',
-                                            'telegram_message_id':delivered['telegram_message_id']}
+                                            'telegram_message_id':delivered['telegram_message_id'],
+                                            'error':delivered.get('error')}
                     if evidence_parts:
                         has_tool_evidence = True
-                        updated_call = replace(stored_call,message=replace(stored_call.message,
-                            metadata={**stored_call.message.metadata,'tool_evidence':True}))
-                        updated_call = await self.store.update_message(session_id,updated_call)
-                        state.raw_messages = [updated_call if item.db_id == updated_call.db_id else item for item in state.raw_messages]
-                        state.rebuild_estimate()
+                        updated_call = await self.store.mark_tool_evidence(session_id, stored_call.db_id,
+                            expected_scope=_turn_scope.get())
+                        await self._append_live_message(state, updated_call)
                     stored_result = await self.record_tool_observation(
                         session_id=session_id,
                         name=tool_call.name,
@@ -622,7 +706,8 @@ class AgentRuntime:
                         payload={'call_id': tool_call.call_id, 'output': tool_output},
                         provider_name=provider.name,
                         evidence_parts=evidence_parts,
-                        metadata_update={'tool_evidence':True} if evidence_parts else None,
+                        metadata_update={'tool_batch_id': batch_id, 'tool_model': settings.model, 'tool_call_message_id': stored_call.db_id,
+                            **({'tool_evidence': True} if evidence_parts else {})},
                     )
                     if evidence_parts:
                         pending_evidence_ids.update((stored_call.db_id,stored_result.db_id))
@@ -687,6 +772,7 @@ class AgentRuntime:
                 usage=last_usage,
                 stickers=collected_stickers,
                 provider_name=provider.name,
+                provider_model=settings.model,
                 provider_history_items=persistent_history_items,
                 reply_target=target,
             )
@@ -698,6 +784,7 @@ class AgentRuntime:
         state = await self._get_live_state(session_id)
         settings = await self.store.get_or_create_session(session_id, self.config.default_session_settings())
         provider = self._require_provider(settings.provider)
+        await self._load_request_estimate_bias(settings)
         l0_blocks = sum(1 for block in state.blocks if block.level == 0)
         l1_blocks = sum(1 for block in state.blocks if block.level == 1)
         l2_blocks = sum(1 for block in state.blocks if block.level == 2)
@@ -845,12 +932,12 @@ class AgentRuntime:
 
     def _effective_max_interaction_rounds(self, settings: SessionSettings) -> int:
         if settings.max_interaction_rounds is not None:
-            return clamp_int(settings.max_interaction_rounds, minimum=MAX_INTERACTION_ROUNDS_MIN, maximum=MAX_INTERACTION_ROUNDS_MAX, default=MAX_INTERACTION_ROUNDS_MIN)
+            return clamp_int(settings.max_interaction_rounds, minimum=MAX_INTERACTION_ROUNDS_MIN, default=MAX_INTERACTION_ROUNDS_MIN)
         if settings.mode == ChatMode.CHAT:
-            return clamp_int(self.config.default_chat_max_rounds, minimum=MAX_INTERACTION_ROUNDS_MIN, maximum=MAX_INTERACTION_ROUNDS_MAX, default=MAX_INTERACTION_ROUNDS_MIN)
+            return clamp_int(self.config.default_chat_max_rounds, minimum=MAX_INTERACTION_ROUNDS_MIN, default=MAX_INTERACTION_ROUNDS_MIN)
         if settings.mode == ChatMode.ASSIST:
-            return clamp_int(self.config.default_assist_max_rounds, minimum=MAX_INTERACTION_ROUNDS_MIN, maximum=MAX_INTERACTION_ROUNDS_MAX, default=MAX_INTERACTION_ROUNDS_MIN)
-        return clamp_int(self.config.default_agent_max_rounds, minimum=MAX_INTERACTION_ROUNDS_MIN, maximum=MAX_INTERACTION_ROUNDS_MAX, default=MAX_INTERACTION_ROUNDS_MIN)
+            return clamp_int(self.config.default_assist_max_rounds, minimum=MAX_INTERACTION_ROUNDS_MIN, default=MAX_INTERACTION_ROUNDS_MIN)
+        return clamp_int(self.config.default_agent_max_rounds, minimum=MAX_INTERACTION_ROUNDS_MIN, default=MAX_INTERACTION_ROUNDS_MIN)
 
     def _effective_spontaneous_reply_chance(self, settings: SessionSettings) -> int:
         if settings.spontaneous_reply_chance is not None:
@@ -859,35 +946,34 @@ class AgentRuntime:
 
     def _effective_group_spontaneous_reply_delay_s(self, settings: SessionSettings) -> float:
         if settings.group_spontaneous_reply_delay_s is not None:
-            return clamp_float(settings.group_spontaneous_reply_delay_s, minimum=0.0, maximum=GROUP_SPONTANEOUS_REPLY_DELAY_MAX_S, default=0.0)
+            return clamp_float(settings.group_spontaneous_reply_delay_s, minimum=0.0, default=0.0)
         if settings.spontaneous_reply_idle_s is not None:
-            return clamp_float(settings.spontaneous_reply_idle_s, minimum=0.0, maximum=GROUP_SPONTANEOUS_REPLY_DELAY_MAX_S, default=0.0)
-        return clamp_float(self.config.default_group_spontaneous_reply_delay_s, minimum=0.0, maximum=GROUP_SPONTANEOUS_REPLY_DELAY_MAX_S, default=0.0)
+            return clamp_float(settings.spontaneous_reply_idle_s, minimum=0.0, default=0.0)
+        return clamp_float(self.config.default_group_spontaneous_reply_delay_s, minimum=0.0, default=0.0)
 
     def _effective_provider_retry_count(self, settings: SessionSettings) -> int:
         if settings.provider_retry_count is not None:
-            return clamp_int(settings.provider_retry_count, minimum=PROVIDER_RETRY_COUNT_MIN, maximum=PROVIDER_RETRY_COUNT_MAX, default=PROVIDER_RETRY_COUNT_MIN)
-        return clamp_int(self.config.default_provider_retry_count, minimum=PROVIDER_RETRY_COUNT_MIN, maximum=PROVIDER_RETRY_COUNT_MAX, default=PROVIDER_RETRY_COUNT_MIN)
+            return clamp_int(settings.provider_retry_count, minimum=PROVIDER_RETRY_COUNT_MIN, default=PROVIDER_RETRY_COUNT_MIN)
+        return clamp_int(self.config.default_provider_retry_count, minimum=PROVIDER_RETRY_COUNT_MIN, default=PROVIDER_RETRY_COUNT_MIN)
 
     def _effective_private_reply_delay_s(self, settings: SessionSettings) -> float:
         if settings.private_reply_delay_s is not None:
-            return clamp_float(settings.private_reply_delay_s, minimum=0.0, maximum=REPLY_DELAY_MAX_S, default=0.0)
+            return clamp_float(settings.private_reply_delay_s, minimum=0.0, default=0.0)
         if settings.reply_delay_s is not None:
-            return clamp_float(settings.reply_delay_s, minimum=0.0, maximum=REPLY_DELAY_MAX_S, default=0.0)
-        return clamp_float(self.config.default_private_reply_delay_s, minimum=0.0, maximum=REPLY_DELAY_MAX_S, default=0.0)
+            return clamp_float(settings.reply_delay_s, minimum=0.0, default=0.0)
+        return clamp_float(self.config.default_private_reply_delay_s, minimum=0.0, default=0.0)
 
     def _effective_group_reply_delay_s(self, settings: SessionSettings) -> float:
         if settings.group_reply_delay_s is not None:
-            return clamp_float(settings.group_reply_delay_s, minimum=0.0, maximum=REPLY_DELAY_MAX_S, default=0.0)
+            return clamp_float(settings.group_reply_delay_s, minimum=0.0, default=0.0)
         if settings.reply_delay_s is not None:
-            return clamp_float(settings.reply_delay_s, minimum=0.0, maximum=REPLY_DELAY_MAX_S, default=0.0)
-        return clamp_float(self.config.default_group_reply_delay_s, minimum=0.0, maximum=REPLY_DELAY_MAX_S, default=0.0)
+            return clamp_float(settings.reply_delay_s, minimum=0.0, default=0.0)
+        return clamp_float(self.config.default_group_reply_delay_s, minimum=0.0, default=0.0)
 
     def _effective_native_web_search_max(self, settings: SessionSettings) -> int | None:
         return effective_optional_disabled_int(
             settings.native_web_search_max,
             getattr(self.config.provider_config(settings.provider), 'native_web_search_max', 0),
-            maximum=NATIVE_WEB_SEARCH_MAX_MAX,
         )
 
     def _effective_temperature(self, settings: SessionSettings) -> float:
@@ -902,30 +988,30 @@ class AgentRuntime:
 
     def _effective_top_k(self, settings: SessionSettings) -> int:
         if settings.top_k is not None:
-            return clamp_int(settings.top_k, minimum=TOP_K_MIN, maximum=TOP_K_MAX, default=TOP_K_MIN)
-        return clamp_int(getattr(self.config.provider_config(settings.provider), 'top_k', TOP_K_MIN), minimum=TOP_K_MIN, maximum=TOP_K_MAX, default=TOP_K_MIN)
+            return clamp_int(settings.top_k, minimum=TOP_K_MIN, default=TOP_K_MIN)
+        return clamp_int(getattr(self.config.provider_config(settings.provider), 'top_k', TOP_K_MIN), minimum=TOP_K_MIN, default=TOP_K_MIN)
 
     def _effective_compact_trigger_tokens(self, settings: SessionSettings) -> int:
         if settings.compact_trigger_tokens is not None:
-            return max(256, int(settings.compact_trigger_tokens))
-        return max(256, int(self.config.context.compact_trigger_tokens))
+            return max(1, int(settings.compact_trigger_tokens))
+        return max(1, int(self.config.context.compact_trigger_tokens))
 
     def _effective_compact_target_tokens(self, settings: SessionSettings) -> int:
         trigger = self._effective_compact_trigger_tokens(settings)
         if settings.compact_target_tokens is not None:
-            return max(256, min(trigger, int(settings.compact_target_tokens)))
-        return max(256, min(trigger, int(self.config.context.compact_target_tokens)))
+            return max(1, min(trigger, int(settings.compact_target_tokens)))
+        return max(1, min(trigger, int(self.config.context.compact_target_tokens)))
 
     def _effective_compact_batch_tokens(self, settings: SessionSettings) -> int:
         target = self._effective_compact_target_tokens(settings)
         if settings.compact_batch_tokens is not None:
-            return max(256, min(target, int(settings.compact_batch_tokens)))
-        return max(256, min(target, int(self.config.context.compact_batch_tokens)))
+            return max(1, min(target, int(settings.compact_batch_tokens)))
+        return max(1, min(target, int(self.config.context.compact_batch_tokens)))
 
     def _configured_compact_batch_tokens(self, settings: SessionSettings) -> int:
         if settings.compact_batch_tokens is not None:
-            return max(256, int(settings.compact_batch_tokens))
-        return max(256, int(self.config.context.compact_batch_tokens))
+            return max(1, int(settings.compact_batch_tokens))
+        return max(1, int(self.config.context.compact_batch_tokens))
 
     def _effective_compact_keep_recent_ratio(self, settings: SessionSettings) -> float:
         if settings.compact_keep_recent_ratio is not None:
@@ -1006,16 +1092,39 @@ class AgentRuntime:
     def invalidate_session(self, session_id: str) -> None:
         self._live_invalidation_epoch += 1
         self._live_sessions.pop(session_id, None)
+        if self.preview_cache is not None:
+            self.preview_cache.forget_session(session_id)
 
     async def _reload_live_state(self, state: LiveConversationState) -> None:
-        state.blocks, state.raw_messages = await self.store.load_live_context(state.session_id)
+        if isinstance(state, CompactionWorkingSet):
+            projected = await self.store.load_compaction_window(state.session_id,
+                through_message_id=state.through_message_id)
+            state.blocks, state.raw_messages = projected.blocks, projected.raw_messages
+            state.database_version = projected.database_version
+            state.more_raw, state.more_blocks = projected.more_raw, projected.more_blocks
+            state.rebuild_estimate()
+            return
+        while True:
+            revision = state.cache_revision
+            blocks, raw_messages, database_version = await self.store.load_live_context_versioned(state.session_id)
+            if state.cache_revision == revision:
+                break
+            # A committed append was installed while this snapshot was loading.
+            # Read a newer snapshot instead of overwriting it with older state.
+        state.blocks, state.raw_messages = blocks, raw_messages
+        state.database_version = database_version
         state.rebuild_estimate()
 
     async def _get_live_state(self, session_id: str) -> LiveConversationState:
         while True:
             state = self._live_sessions.get(session_id)
             if state and state.loaded:
-                return state
+                database_version = await self.store.get_context_version(session_id)
+                if state.database_version != database_version:
+                    await self._reload_live_state(state)
+                if self._live_sessions.get(session_id) is state:
+                    return state
+                continue
             epoch = self._live_invalidation_epoch
             state = LiveConversationState(session_id=session_id, loaded=True)
             await self._reload_live_state(state)
@@ -1025,7 +1134,7 @@ class AgentRuntime:
                 continue
             existing = self._live_sessions.get(session_id)
             if existing and existing.loaded:
-                return existing
+                continue
             break
         self._live_sessions[session_id] = state
         # Contexts are reconstructible from PostgreSQL. Bound the number of
@@ -1037,8 +1146,18 @@ class AgentRuntime:
         logger.debug('state.load sid=%s raw=%s blocks=%s est_tokens=%s est_images=%s', self._session_log_id(session_id), len(state.raw_messages), len(state.blocks), state.estimated_tokens, state.estimated_images)
         return state
 
-    def _append_live_message(self, state: LiveConversationState, stored_message: StoredConversationMessage) -> None:
+    async def _append_live_message(self, state: LiveConversationState, stored_message: StoredConversationMessage) -> None:
+        if stored_message.context_version != state.database_version + 1:
+            await self._reload_live_state(state)
+            return
+        state.database_version = stored_message.context_version
+        if state.raw_messages and stored_message.db_id <= state.raw_messages[-1].db_id:
+            state.raw_messages = sorted([item for item in state.raw_messages if item.db_id != stored_message.db_id]
+                + [stored_message], key=lambda item: item.db_id)
+            state.rebuild_estimate()
+            return
         state.raw_messages.append(stored_message)
+        state.cache_revision += 1
         state.last_message_id = max(state.last_message_id, stored_message.db_id)
         state.estimated_tokens += stored_message.estimated_tokens
         state.estimated_images += stored_message.image_count
@@ -1080,7 +1199,12 @@ class AgentRuntime:
         multiplier = self._request_estimate_bias_for(provider_name=provider_name, model=model, tool_history_mode=tool_history_mode)
         return estimate.scaled(multiplier) if multiplier > 1.0 else estimate
 
-    def _update_request_estimate_bias(
+    async def _load_request_estimate_bias(self, settings: SessionSettings) -> None:
+        key = self._request_estimate_bias_key(provider_name=settings.provider, model=settings.model,
+            tool_history_mode=settings.tool_history_mode)
+        self._request_estimate_bias[key] = await self.store.load_token_calibration(key)
+
+    async def _update_request_estimate_bias(
         self,
         *,
         provider_name: str,
@@ -1095,9 +1219,7 @@ class AgentRuntime:
         key = self._request_estimate_bias_key(provider_name=provider_name, model=model, tool_history_mode=tool_history_mode)
         current = max(1.0, float(self._request_estimate_bias.get(key, 1.0)))
         target = min(4.0, max(1.0, (float(actual) / float(max(1, raw_estimate_total))) * 1.05))
-        if target <= current:
-            return
-        updated = max(current, min(4.0, (current * 0.75) + (target * 0.25)))
+        updated = await self.store.update_token_calibration(key, target)
         self._request_estimate_bias[key] = updated
         logger.debug(
             'estimate.bias provider=%s model=%s mode=%s raw=%s actual=%s bias=%.3f->%.3f',
@@ -1110,23 +1232,6 @@ class AgentRuntime:
             updated,
         )
 
-    def _estimate_history_tokens_for_messages(
-        self,
-        *,
-        state: LiveConversationState,
-        provider: ModelProvider,
-        settings: SessionSettings,
-        selected_blocks: list[MemoryBlock],
-        messages: list[ConversationMessage],
-    ) -> int:
-        estimate = provider.estimate_request_tokens(
-            settings=settings,
-            messages=messages,
-            instructions='',
-            tools=[],
-        )
-        return int(estimate.history_tokens)
-
     def _estimate_request_breakdown(
         self,
         *,
@@ -1138,21 +1243,12 @@ class AgentRuntime:
         extra_input_items: list[dict] | None = None,
     ) -> RequestTokenEstimate:
         history = self._build_provider_history(state, settings=settings, provider_name=provider.name)
-        selected_blocks = self._select_blocks_for_prompt(state, settings=settings)
-        history_tokens = self._estimate_history_tokens_for_messages(
-            state=state,
-            provider=provider,
-            settings=settings,
-            selected_blocks=selected_blocks,
-            messages=history,
-        )
         raw_estimate = provider.estimate_request_tokens(
             settings=settings,
             messages=history,
             instructions=instructions,
             tools=tools,
             extra_input_items=extra_input_items,
-            history_tokens_override=history_tokens,
         )
         return self._apply_request_estimate_bias(
             raw_estimate,
@@ -1226,8 +1322,30 @@ class AgentRuntime:
             return (int(block.start_message_id), 0)
         return (10**12 + int(block.sequence_no), 0)
 
+    async def _recover_interrupted_tools(self, session_id: str, state: LiveConversationState | None = None) -> None:
+        # Serialized execution has ended before recovery starts. Read durable
+        # records, never infer a tool's side effects from the former runtime.
+        pending = await self.store.list_unfinished_tool_calls(session_id)
+        if not pending:
+            return
+        recovered = []
+        for row in pending:
+            metadata = row.message.metadata
+            output = {'ok': False, 'outcome': 'unknown',
+                'error': 'Tool execution was interrupted before its outcome was recorded; effects may have occurred. Do not assume success or automatically repeat it.'}
+            recovered.append(self._tool_observation_message(name=row.message.name or 'tool', phase='result',
+                payload={'call_id': (metadata.get('tool_payload') or {}).get('call_id'), 'output': output},
+                provider_name=metadata.get('tool_provider'), metadata_update={
+                    'tool_call_message_id': row.db_id, 'tool_model': metadata.get('tool_model'), 'recovery': 'interrupted',
+                    **({'tool_evidence': True} if metadata.get('tool_evidence') else {}),
+                    **({'tool_batch_id': metadata['tool_batch_id']} if metadata.get('tool_batch_id') else {})}))
+        await self.store.append_messages(session_id, recovered, expected_scope=_turn_scope.get())
+        if state is not None:
+            await self._reload_live_state(state)
+
     async def _refresh_profiles_after_compaction(self, *, session_id, state, settings, provider,
                                                   instructions, tools, emit, trigger, reserved='',native_from_id=None):
+        observed_compaction = await self.store.get_compaction_version(session_id)
         actor_ids = state.active_participant_ids(trigger.message if trigger is not None else None)
         arguments = {'actor_ids': actor_ids, 'include_agent_preferences': True}
         try:
@@ -1247,11 +1365,19 @@ class AgentRuntime:
             + self._describe_tool_result('user_profile_fetch', result_payload))
         # Reserve the completed exchange before finalizing compaction. The
         # pair is appended after both passes, never immediately compacted away.
-        await self._compact_if_needed(session_id=session_id, settings=settings, provider=provider,
-            state=state, instructions=instructions + '\n' + reserved + '\n' + summary, tools=tools, emit=emit,
-            native_from_id=native_from_id)
+        committed_versions: set[int] = set()
+        receipt_token = _refresh_compactions.set(committed_versions)
+        try:
+            await self._compact_if_needed(session_id=session_id, settings=settings, provider=provider,
+                state=state, instructions=instructions + '\n' + reserved + '\n' + summary, tools=tools, emit=emit,
+                native_from_id=native_from_id)
+        finally:
+            _refresh_compactions.reset(receipt_token)
+        while observed_compaction + 1 in committed_versions:
+            observed_compaction += 1
         exchange = [self._tool_observation_message(name='user_profile_fetch', phase=phase, payload=payload,
-            metadata_update={'synthetic_role': 'profile_refresh', 'refresh_reason': 'compaction'})
+            metadata_update={'synthetic_role': 'profile_refresh', 'refresh_reason': 'compaction',
+                'tool_batch_id': call_id, 'compaction_version': observed_compaction})
             for phase, payload in (('call', call_payload), ('result', result_payload))]
         # This completed exchange must survive together. A partial save or
         # interleaved intake would leave invalid function history on replay.
@@ -1260,13 +1386,45 @@ class AgentRuntime:
             await self._reload_live_state(state)
         else:
             for stored in stored_exchange:
-                self._append_live_message(state, stored)
+                await self._append_live_message(state, stored)
 
-    def _admit_candidate_evidence(self, output, parts, provider, settings):
+    def _admit_candidate_evidence(self, output, parts, provider, settings, *, images=0, tokens=0):
         if not parts:
             return output, parts
         supports = (provider.supports_tool_evidence(settings) if hasattr(provider,'supports_tool_evidence')
             else getattr(provider.capabilities,'multimodal_tool_results',False))
+        if isinstance(output.get('image_results'), list):
+            # Source resolution owns availability; this request owns whether
+            # selected pixels are actually shown to the model.
+            image_limit = self._effective_max_input_images(provider, settings)
+            token_limit = self._effective_compact_trigger_tokens(settings)
+            results, kept_parts = [], []
+            for result in output['image_results']:
+                if result.get('status') != 'selected':
+                    results.append(result)
+                    continue
+                origin = f"memory_image:{result['image_id']}"
+                group = [part for part in parts if part.origin == origin]
+                group_images = sum(part.kind == PartKind.IMAGE for part in group)
+                group_tokens = TokenEstimator.estimate_message(ConversationMessage(role=MessageRole.TOOL, parts=group))
+                if not supports:
+                    reason = 'The selected provider has text-only tool results.'
+                elif not group_images:
+                    reason = 'No visual evidence was supplied.'
+                elif ((image_limit is not None and images + group_images > image_limit)
+                        or tokens + group_tokens > token_limit):
+                    reason = 'Omitted to fit this request; select fewer images to inspect.'
+                else:
+                    reason = None
+                if reason:
+                    results.append({**result, 'status': 'omitted', 'reason': reason})
+                else:
+                    results.append({**result, 'status': 'opened'})
+                    kept_parts.extend(group)
+                    images += group_images
+                    tokens += group_tokens
+            kept_parts.extend(part for part in parts if not str(part.origin or '').startswith('memory_image:'))
+            return {**output, 'image_results': results}, kept_parts
         if not supports:
             return {**output,'visual_evidence':'unavailable: selected provider has text-only tool results'}, [
                 replace(part,kind=PartKind.TEXT,data_b64=None,preview_ref=None,
@@ -1279,7 +1437,6 @@ class AgentRuntime:
         token_limit = self._effective_compact_trigger_tokens(settings)
         accepted = []
         kept_parts = []
-        images = tokens = 0
         for candidate in candidates:
             sticker_id = str(candidate.get('sticker_id',''))
             group = [part for part in parts if part.origin == f'sticker_candidate:{sticker_id}']
@@ -1307,15 +1464,12 @@ class AgentRuntime:
         entries = [(self._history_position_for_block(block),block.render_as_message())
             for block in self._select_blocks_for_prompt(state,settings=settings)]
         native_settings = replace(settings,tool_history_mode=ToolHistoryMode.NATIVE_SAME_PROVIDER)
-        for stored in state.raw_messages:
+        for position, stored in self._provider_history_rows(state.raw_messages):
             mapped = self._history_message_for_provider(settings=native_settings if stored.db_id>=native_from_id else settings,
                 provider_name=provider.name,message=stored.message)
             if mapped is not None:
-                entries.append(((stored.db_id,1),attributed_message(mapped,message_id=stored.db_id)))
+                entries.append(((position,1),attributed_message(mapped,message_id=stored.db_id)))
         history = [message for _,message in sorted(entries,key=lambda item:item[0])]
-        if self.preview_cache is not None:
-            history = [self.preview_cache.materialize(message,vision=provider.capabilities.multimodal_input)
-                for message in history]
         return history
 
     def _sanitize_provider_native_items_for_history(self, provider_name: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1363,20 +1517,27 @@ class AgentRuntime:
         base_metadata = {key: value for key, value in metadata.items() if key not in {'provider_native', 'provider_native_skip_same_provider'}}
         provider_native = metadata.get('provider_native') if isinstance(metadata.get('provider_native'), dict) else None
         native_provider = str(provider_native.get('provider') or '').strip().lower() if provider_native else ''
-        same_provider_native = settings.tool_history_mode == ToolHistoryMode.NATIVE_SAME_PROVIDER and native_provider == provider_name
+        same_provider_native = (settings.tool_history_mode == ToolHistoryMode.NATIVE_SAME_PROVIDER
+            and native_provider == provider_name and provider_native.get('model') == settings.model)
         if same_provider_native and provider_native:
             items = provider_native.get('items') if isinstance(provider_native.get('items'), list) else []
             base_metadata['provider_native'] = {
                 'provider': provider_name,
+                'model': settings.model,
                 'items': self._sanitize_provider_native_items_for_history(provider_name, items),
             }
+        if (message.role == MessageRole.TOOL and settings.tool_history_mode == ToolHistoryMode.NATIVE_SAME_PROVIDER
+                and metadata.get('tool_provider') == provider_name and metadata.get('tool_model') != settings.model):
+            base_metadata['portable_tool_history'] = True
         prepared = self._clone_message(message, metadata=base_metadata)
         if message.role != MessageRole.TOOL:
             return prepared
         phase = str(metadata.get('tool_phase') or '').strip().lower()
-        if (metadata.get('synthetic_role') == 'profile_refresh' or metadata.get('tool_evidence')) and phase in {'call', 'result'}:
+        if (metadata.get('synthetic_role') == 'profile_refresh' or metadata.get('tool_evidence')
+                or base_metadata.get('portable_tool_history')) and phase in {'call', 'result'}:
             if (settings.tool_history_mode == ToolHistoryMode.NATIVE_SAME_PROVIDER
                     and metadata.get('tool_provider') == provider_name
+                    and metadata.get('tool_model') == settings.model
                     and metadata.get('provider_native_skip_same_provider')):
                 return None
             # This is an application-executed function exchange. Every adapter
@@ -1427,11 +1588,11 @@ class AgentRuntime:
         entries: list[tuple[tuple[int, int], ConversationMessage]] = []
         for block in selected_blocks:
             entries.append((self._history_position_for_block(block), block.render_as_message()))
-        for item in state.raw_messages:
+        for position, item in self._provider_history_rows(state.raw_messages):
             mapped = self._history_message_for_provider(settings=settings, provider_name=provider_name, message=item.message)
             if mapped is not None:
                 mapped = attributed_message(mapped, message_id=item.db_id)
-                entries.append(((int(item.db_id), 1), mapped))
+                entries.append(((position, 1), mapped))
         messages = [message for _key, message in sorted(entries, key=lambda item: item[0])]
         state.provider_history_cache = messages
         state.provider_history_cache_key = cache_key
@@ -1454,8 +1615,10 @@ class AgentRuntime:
         else:
             budget_fraction = 0.22
         budget = int(target_tokens * budget_fraction)
-        budget_floor = max(256, min(1024, int(target_tokens * 0.05)))
-        budget = max(budget_floor, min(16000, budget))
+        context = self.config.context
+        budget_floor = max(context.summary_context_min_tokens,
+            min(context.summary_context_floor_tokens, int(target_tokens * 0.05)))
+        budget = max(budget_floor, min(context.summary_context_max_tokens, budget))
         selected: list[MemoryBlock] = []
         selected_ids: set[int] = set()
         covered_parent_ids: set[int] = set()
@@ -1620,17 +1783,17 @@ class AgentRuntime:
         selected_block_tokens = sum(block.estimated_tokens for block in self._select_blocks_for_prompt(state, settings=settings))
         target_tokens = self._effective_compact_target_tokens(settings)
         prompt_pressure = total_estimate is not None and total_estimate > target_tokens
-        return prompt_pressure or len(episodes) >= 6 or selected_block_tokens > int(target_tokens * 0.45)
+        return pressure or prompt_pressure or len(episodes) >= 6 or selected_block_tokens > int(target_tokens * 0.45)
 
     def _effective_max_input_images(self, provider: ModelProvider, settings: SessionSettings) -> int | None:
-        name = getattr(provider, 'name', '')
+        if not provider.capabilities.multimodal_input:
+            return None
         default = getattr(provider, 'config', self.config.provider_config(settings.provider)).max_input_images
-        return effective_optional_disabled_int(settings.max_input_images, default, maximum=IMAGE_LIMIT_MAX)
+        return effective_optional_disabled_int(settings.max_input_images, default)
 
     def _configured_compact_target_images(self, provider: ModelProvider, settings: SessionSettings) -> int | None:
-        name = getattr(provider, 'name', '')
         default = getattr(provider, 'config', self.config.provider_config(settings.provider)).compact_target_images
-        return effective_optional_disabled_int(settings.compact_target_images, default, maximum=IMAGE_LIMIT_MAX)
+        return effective_optional_disabled_int(settings.compact_target_images, default)
 
     def _effective_compact_target_images(self, provider: ModelProvider, settings: SessionSettings) -> int | None:
         configured_target = self._configured_compact_target_images(provider, settings)
@@ -1647,45 +1810,20 @@ class AgentRuntime:
         target_images: int,
         emit: EventCallback | None = None,
     ) -> int:
-        images_to_remove = max(0, int(state.estimated_images) - max(0, int(target_images)))
-        if images_to_remove <= 0:
-            return 0
-
-        removed_images = 0
-        touched_messages = 0
-        for index, stored in enumerate(state.raw_messages):
-            if removed_images >= images_to_remove:
-                break
-            if stored.db_id in _admission_protected.get():
-                continue
-            updated_parts: list[MessagePart] = []
-            changed = False
-            for part in stored.message.parts:
-                if removed_images < images_to_remove and part.kind == PartKind.IMAGE:
-                    updated_parts.append(MessagePart(kind=PartKind.TEXT, text='[Image compacted]', remote_sync=False, origin='image_compacted'))
-                    removed_images += 1
-                    changed = True
-                    continue
-                updated_parts.append(part)
-            if not changed:
-                continue
-            updated_message = replace(stored.message, parts=updated_parts)
-            updated_stored = replace(stored, message=updated_message, estimated_tokens=TokenEstimator.estimate_message(updated_message))
-            state.raw_messages[index] = await self.store.update_message(session_id, updated_stored)
-            touched_messages += 1
-
-        if removed_images > 0:
-            state.rebuild_estimate()
-            logger.info(
-                'compact.images sid=%s removed=%s touched_messages=%s remaining_images=%s target=%s',
-                self._session_log_id(session_id),
-                removed_images,
-                touched_messages,
-                state.estimated_images,
-                target_images,
-            )
+        retirement = await self.store.retire_context_images(session_id,
+            target_images=target_images, protected_ids=_admission_protected.get(),
+            through_message_id=state.through_message_id if isinstance(state, CompactionWorkingSet) else None,
+            expected_scope=_turn_scope.get())
+        removed_images = retirement.removed_images
+        if removed_images:
+            if _refresh_compactions.get() is not None:
+                _refresh_compactions.get().add(retirement.compaction_version)
+            await self._reload_live_state(state)
+            logger.info('compact.images sid=%s removed=%s remaining_images=%s target=%s',
+                self._session_log_id(session_id), removed_images, state.estimated_images, target_images)
             if emit and settings.process_visibility != ProcessVisibility.OFF:
-                await emit(RuntimeEvent(kind='phase', title='Compacting images', detail=f'compacted {removed_images} earliest images; remaining {state.estimated_images}/{target_images}'))
+                await emit(RuntimeEvent(kind='phase', title='Compacting images',
+                    detail=f'compacted {removed_images} earliest images; remaining {state.estimated_images}/{target_images}'))
         return removed_images
 
     async def _compact_old_context(
@@ -1702,7 +1840,7 @@ class AgentRuntime:
         skipped_block_ids: set[int] = set()
         skipped_digest_shards: set[tuple[int, ...]] = set()
         sequence_token_cache: dict[tuple[int, ...], int] = {}
-        max_attempts = 24
+        max_attempts = self.config.context.compaction_attempts
         attempts = 0
         while attempts < max_attempts:
             attempts += 1
@@ -1727,6 +1865,8 @@ class AgentRuntime:
                     summary_text=block_text,
                     estimated_tokens=TokenEstimator.estimate_text(block_text) + 32,
                     source_message_ids=[item.db_id for item in tool_slice],
+                    expected_scope=_turn_scope.get(),
+                    expected_source_revisions={str(item.db_id): item.message.metadata.get('source_revision', 1) for item in tool_slice},
                     level=0,
                     kind='toolspan',
                     lifecycle='sealed',
@@ -1742,10 +1882,9 @@ class AgentRuntime:
                     validator_score=candidate['score'],
                     structured_data=candidate['data'],
                 )
-                consumed_ids = {item.db_id for item in tool_slice}
-                state.blocks.append(block)
-                state.raw_messages = [item for item in state.raw_messages if item.db_id not in consumed_ids]
-                state.rebuild_estimate()
+                if _refresh_compactions.get() is not None:
+                    _refresh_compactions.get().add(block.compaction_version)
+                await self._reload_live_state(state)
                 tool_slice_tokens = self._estimate_stored_messages_prompt_tokens(
                     tool_slice,
                     settings=settings,
@@ -1810,6 +1949,9 @@ class AgentRuntime:
                         validator_score=candidate['score'],
                         structured_data=candidate['data'],
                         source_message_ids=raw_ids,
+                        expected_scope=_turn_scope.get(),
+                        expected_source_revisions={str(item.db_id): item.message.metadata.get('source_revision', 1)
+                            for item in history_slice['raw_messages']},
                     )
                     await self._reload_live_state(state)
                 else:
@@ -1818,6 +1960,9 @@ class AgentRuntime:
                         summary_text=block_text,
                         estimated_tokens=estimate,
                         source_message_ids=raw_ids,
+                        expected_scope=_turn_scope.get(),
+                        expected_source_revisions={str(item.db_id): item.message.metadata.get('source_revision', 1)
+                            for item in history_slice['raw_messages']},
                         level=1,
                         kind='episode',
                         lifecycle='sealed',
@@ -1835,10 +1980,9 @@ class AgentRuntime:
                         validator_score=candidate['score'],
                         structured_data=candidate['data'],
                     )
-                    state.blocks.append(block)
-                consumed_ids = set(raw_ids)
-                state.raw_messages = [item for item in state.raw_messages if item.db_id not in consumed_ids]
-                state.rebuild_estimate()
+                    await self._reload_live_state(state)
+                if _refresh_compactions.get() is not None:
+                    _refresh_compactions.get().add(block.compaction_version)
                 raw_history_tokens = self._estimate_stored_messages_prompt_tokens(
                     history_slice['raw_messages'],
                     settings=settings,
@@ -1886,9 +2030,10 @@ class AgentRuntime:
                 end_message_id = max((block.end_message_id for block in shard if block.end_message_id is not None), default=None)
                 estimate = TokenEstimator.estimate_text(block_text) + 32
                 if old_digest_ids:
-                    await self.store.replace_memory_blocks(
+                    block = await self.store.replace_memory_blocks(
                         session_id,
                         block_ids=old_digest_ids,
+                        expected_scope=_turn_scope.get(),
                         summary_text=block_text,
                         estimated_tokens=estimate,
                         source_message_count=source_message_count,
@@ -1909,11 +2054,12 @@ class AgentRuntime:
                         structured_data=candidate['data'],
                     )
                 else:
-                    await self.store.create_memory_block(
+                    block = await self.store.create_memory_block(
                         session_id,
                         summary_text=block_text,
                         estimated_tokens=estimate,
                         source_message_ids=[],
+                        expected_scope=_turn_scope.get(),
                         level=2,
                         kind='digest',
                         lifecycle='sealed',
@@ -1931,6 +2077,8 @@ class AgentRuntime:
                         validator_score=candidate['score'],
                         structured_data=candidate['data'],
                     )
+                if _refresh_compactions.get() is not None:
+                    _refresh_compactions.get().add(block.compaction_version)
                 await self._reload_live_state(state)
                 logger.info('compact.digest sid=%s parent_blocks=%s visible_blocks=%s', self._session_log_id(session_id), len(shard), len(state.blocks))
                 if emit and settings.process_visibility != ProcessVisibility.OFF:
@@ -1955,7 +2103,7 @@ class AgentRuntime:
             return [], []
         units = self._group_raw_compaction_units(messages)
         if len(units) < 2:
-            return units, []
+            return [], units
         total_raw_tokens = sum(
             self._estimate_stored_messages_prompt_tokens(
                 unit,
@@ -2406,9 +2554,25 @@ class AgentRuntime:
 
     def _group_raw_compaction_units(self, messages: list[StoredConversationMessage]) -> list[list[StoredConversationMessage]]:
         units: list[list[StoredConversationMessage]] = []
+        batch_ends = {item.message.metadata['tool_batch_id']: index for index, item in enumerate(messages)
+                      if item.message.metadata.get('tool_batch_id')}
         index = 0
         while index < len(messages):
             current = messages[index]
+            batch = current.message.metadata.get('tool_batch_id')
+            if batch:
+                end = batch_ends[batch]
+                # Concurrent intake belongs to the span, so no compaction can
+                # leave one half of the native exchange on the other side.
+                cursor = index
+                while cursor <= end:
+                    nested = messages[cursor].message.metadata.get('tool_batch_id')
+                    if nested:
+                        end = max(end, batch_ends[nested])
+                    cursor += 1
+                units.append(messages[index:end + 1])
+                index = end + 1
+                continue
             if self._is_tool_call_message(current.message) and index + 1 < len(messages) and self._is_matching_tool_result(current.message, messages[index + 1].message):
                 units.append([current, messages[index + 1]])
                 index += 2
@@ -2421,11 +2585,28 @@ class AgentRuntime:
             index += 1
         return units
 
+    def _provider_history_rows(self, messages: list[StoredConversationMessage]):
+        """Keep function results adjacent to their generated batch on the wire.
+
+        Intake may commit during a tool's execution. Its original timestamp and
+        source identity remain unchanged; only the provider presentation defers
+        those intervening messages until the tool exchange is complete.
+        """
+        for unit in self._group_raw_compaction_units(messages):
+            batch = unit[0].message.metadata.get('tool_batch_id')
+            if batch:
+                ordered = [item for item in unit if item.message.metadata.get('tool_batch_id') == batch]
+                if any(item.message.metadata.get('tool_evidence') for item in ordered):
+                    ordered = [replace(item, message=replace(item.message,
+                        metadata={**item.message.metadata, 'tool_evidence': True})) for item in ordered]
+                ordered += [item for item in unit if item.message.metadata.get('tool_batch_id') != batch]
+            else:
+                ordered = unit
+            yield from zip((item.db_id for item in unit), ordered, strict=True)
+
     @staticmethod
     def _is_auto_note_message(message: ConversationMessage) -> bool:
-        metadata = message.metadata if isinstance(message.metadata, dict) else {}
-        synthetic_role = str(metadata.get('synthetic_role') or '').strip().lower()
-        return synthetic_role == 'auto_user_note' or any((part.origin or '') == 'auto_note' for part in message.parts)
+        return is_auto_note_message(message)
 
     def _select_digest_shard(self, blocks: list[MemoryBlock], *, settings: SessionSettings, pressure: bool = False, excluded_parent_signatures: set[tuple[int, ...]] | None = None) -> list[MemoryBlock]:
         episodes = [
@@ -2579,9 +2760,9 @@ class AgentRuntime:
             for actor in message.metadata.get('compaction_actor_ids', []) if actor))
         working = list(messages)
         try:
-            # One corrective attempt is reserved for attribution validation. A
-            # failed correction leaves all source rows intact for later recall.
-            for attempt in range(2):
+            # Attribution rejection never changes source ownership. The
+            # operator controls how many corrections may be requested.
+            for attempt in range(self.config.context.attribution_retries + 1):
                 response = await provider.generate(
                     settings=compaction_settings,
                     messages=working,
@@ -2600,7 +2781,7 @@ class AgentRuntime:
                         candidate['participants'] = actor_ids
                     return candidate
                 logger.warning('compact.attribution_rejected provider=%s mode=%s attempt=%s', provider.name, mode, attempt + 1)
-                if attempt == 0:
+                if attempt == 0 and self.config.context.attribution_retries:
                     working.append(ConversationMessage.assistant_text(
                         '[Compaction attribution correction] The previous candidate had an ownerless user_profile claim. '
                         'Regenerate from the original sources. Every user_profile entry must begin with its supported '
@@ -2843,17 +3024,7 @@ class AgentRuntime:
 
     @staticmethod
     def _is_matching_tool_result(call_message: ConversationMessage, result_message: ConversationMessage) -> bool:
-        call_meta = call_message.metadata if isinstance(call_message.metadata, dict) else {}
-        result_meta = result_message.metadata if isinstance(result_message.metadata, dict) else {}
-        if result_message.role != MessageRole.TOOL or str(result_meta.get('tool_phase') or '').strip().lower() != 'result':
-            return False
-        call_payload = call_meta.get('tool_payload') if isinstance(call_meta.get('tool_payload'), dict) else {}
-        result_payload = result_meta.get('tool_payload') if isinstance(result_meta.get('tool_payload'), dict) else {}
-        call_id = str(call_payload.get('call_id') or '')
-        result_id = str(result_payload.get('call_id') or '')
-        if call_id and result_id:
-            return call_id == result_id
-        return (call_message.name or '') == (result_message.name or '')
+        return matching_tool_result(call_message, result_message)
 
     def _normalize_compaction_message(self, message: ConversationMessage) -> ConversationMessage | None:
         if message.role == MessageRole.TOOL:

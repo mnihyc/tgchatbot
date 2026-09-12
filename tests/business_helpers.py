@@ -16,7 +16,6 @@ from tgchatbot.domain.models import ProviderResponse, ToolResult
 from tgchatbot.providers.base import ProviderCapabilities, RequestTokenEstimate
 from psycopg import AsyncConnection, sql
 from tgchatbot.storage.postgres_store import PostgresStore
-from tgchatbot.storage.artifacts import ArtifactStore
 from tgchatbot.storage.previews import PreviewCache
 from tgchatbot.tools.base import ToolSpec
 
@@ -87,6 +86,7 @@ class BusinessTestCase(unittest.IsolatedAsyncioTestCase):
         self.path = Path(self.temp.name)
         with patch.dict(os.environ, {
             "APP_DATA_DIR": str(self.path),
+            "APP_TEMP_DIR": str(self.path / "tmp"),
             "TGBOT_TOKEN": "123456:mock-token",
             "DEFAULT_PROVIDER": "openai",
             "OPENAI_API_KEY": "mock-openai-key",
@@ -94,10 +94,9 @@ class BusinessTestCase(unittest.IsolatedAsyncioTestCase):
             "DATABASE_URL": self.test_dsn,
         }, clear=True):
             self.config = load_config()
-        self.artifact_store = ArtifactStore(self.path / "replay", max_bytes=32 * 1024 * 1024)
-        self.preview_cache = PreviewCache(self.path / "previews", max_bytes=32 * 1024 * 1024)
-        self.addCleanup(self.preview_cache.close)
         self.store = await self.new_store()
+        self.preview_cache = PreviewCache(self.store, max_bytes=32 * 1024 * 1024)
+        self.addCleanup(self.preview_cache.close)
         self.provider = ScriptedProvider()
         self.tools = FixtureTools()
         self.runtime = AgentRuntime(config=self.config, store=self.store, tool_registry=self.tools, providers={"openai": self.provider}, preview_cache=self.preview_cache)
@@ -110,9 +109,8 @@ class BusinessTestCase(unittest.IsolatedAsyncioTestCase):
         await self.store.save_session(self.session, settings)
         return settings
 
-    async def new_store(self, *, artifact_store=None):
-        store = PostgresStore(self.test_dsn, schema=self.schema,
-                              artifact_store=artifact_store or self.artifact_store)
+    async def new_store(self):
+        store = PostgresStore(self.test_dsn, schema=self.schema)
         self._stores.append(store)
         await store.initialize()
         return store

@@ -11,7 +11,7 @@ from tgchatbot.core.token_estimator import TokenEstimator
 from tgchatbot.domain.models import ChatMode, ConversationMessage, MessagePart, MessageRole, PartKind, ProviderResponse, SessionSettings, ToolCall, UsageInfo
 from tgchatbot.providers.base import (ControlDescriptor, ProviderCapabilities, RequestTokenEstimate,
     estimate_json_schema_tokens, evidence_text, pending_image_tokens, tool_message_evidence)
-from tgchatbot.settings_schema import NATIVE_WEB_SEARCH_MAX_MAX, effective_optional_disabled_int, effective_reasoning_summary
+from tgchatbot.settings_schema import effective_optional_disabled_int, effective_reasoning_summary
 from tgchatbot.tools.base import ToolSpec
 from tgchatbot.logging_config import dump_llm_exchange
 
@@ -157,7 +157,6 @@ class OpenAIResponsesProvider:
         effective_native_web_search_max = effective_optional_disabled_int(
             settings.native_web_search_max,
             self.config.native_web_search_max,
-            maximum=NATIVE_WEB_SEARCH_MAX_MAX,
         )
         if native_web_search_enabled and settings.mode != ChatMode.CHAT and effective_native_web_search_max is not None:
             # Responses API applies max_tool_calls only to built-in tools. In this adapter the
@@ -205,12 +204,14 @@ class OpenAIResponsesProvider:
             item_type = item.get('type')
             continuation_items.append(item)
             if item_type == 'function_call':
-                args_raw = item.get('arguments', '{}')
-                try:
-                    args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
-                except json.JSONDecodeError:
-                    args = {}
-                tool_calls.append(ToolCall(name=item.get('name', ''), call_id=item.get('call_id') or item.get('id') or '', arguments=args))
+                args_raw = item.get('arguments')
+                args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                if not isinstance(args, dict):
+                    raise ValueError('Function call arguments must be a JSON object')
+                name, call_id = item.get('name'), item.get('call_id')
+                if not isinstance(name, str) or not name.strip() or not isinstance(call_id, str) or not call_id.strip():
+                    raise ValueError('Function call requires a name and call_id')
+                tool_calls.append(ToolCall(name=name, call_id=call_id, arguments=args))
             elif item_type == 'web_search_call':
                 native_tool_calls.append({
                     'name': 'web_search',

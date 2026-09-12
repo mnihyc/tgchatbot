@@ -13,6 +13,8 @@ class PresetStore:
 
     def get_text(self, name: str) -> str | None:
         path = self.root / f'{name}.txt'
+        if Path(name).name != name or not path.resolve().is_relative_to(self.root.resolve()):
+            return None
         if not path.exists() or not path.is_file():
             return None
         return path.read_text(encoding='utf-8')
@@ -20,5 +22,7 @@ class PresetStore:
     def save_text(self, name: str, text: str) -> Path:
         safe_name = Path(name).stem.strip().replace('/', '_') or 'default'
         path = self.root / f'{safe_name}.txt'
+        if not path.resolve().is_relative_to(self.root.resolve()):
+            raise ValueError('Preset destination is outside the preset directory')
         path.write_text(text, encoding='utf-8')
         return path

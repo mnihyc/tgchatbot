@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -16,27 +15,14 @@ _LEGACY_STYLE_POLICY_TO_GOAL = {
     'prefer_switch': 'prefer_switch',
     'hard_switch': 'ignore_style',
 }
-_STYLE_GOAL_TO_LEGACY_POLICY = {value: key for key, value in _LEGACY_STYLE_POLICY_TO_GOAL.items()}
-_NOISE_TOKEN_RE = re.compile(r"[@#]?[A-Za-z0-9_./:\\-]+")
-_URL_RE = re.compile(r'^(?:https?://|www\.)', re.IGNORECASE)
-_PATH_RE = re.compile(r'^(?:[A-Za-z]:[\\/]|[./]{1,2}[\\/]|[/\\])')
-_NOISE_LITERAL_TOKENS = {
-    'assistant',
-    'username',
-    'nickname',
-    'telegram',
-    'discord',
-    'shell_exec',
-    'python_exec',
-    'file_send',
-    'sticker_query',
-    'sticker_send_selected',
-    'intent_action',
-}
 
 
 def _norm_text(value: Any) -> str:
     return ' '.join(str(value or '').replace('\n', ' ').replace('\t', ' ').split()).strip()
+
+
+def _norm_text_list(value: Any) -> list[str]:
+    return [text for item in value if (text := _norm_text(item))] if isinstance(value, list) else []
 
 
 def _first_present(*values: Any) -> Any:
@@ -66,45 +52,6 @@ def _norm_bool(value: Any, *, default: bool) -> bool:
     if text in {'0', 'false', 'no', 'off'}:
         return False
     return default
-
-
-def _request_tokens(text: str) -> list[str]:
-    tokens: list[str] = []
-    current: list[str] = []
-    for ch in text.lower():
-        if ch.isalnum() or ch in "_+-'":
-            current.append(ch)
-            continue
-        if current:
-            tokens.append(''.join(current))
-            current = []
-        if '\u3040' <= ch <= '\u30ff' or '\u3400' <= ch <= '\u9fff' or '\uf900' <= ch <= '\ufaff' or '\uac00' <= ch <= '\ud7af':
-            tokens.append(ch)
-    if current:
-        tokens.append(''.join(current))
-    return [token for token in tokens if token]
-
-
-def _sanitize_text_field(field_name: str, value: Any) -> tuple[str, list[str], str | None]:
-    # Normalize whitespace only. Names, slang and literal captions may be meaningful;
-    # retrieval is not responsible for guessing which words the caller meant.
-    return _norm_text(value), [], None
-
-
-def _sanitize_text_list(field_name: str, values: Any) -> tuple[list[str], list[str], list[str]]:
-    if not isinstance(values, list):
-        return [], [], []
-    cleaned_values: list[str] = []
-    dropped: list[str] = []
-    warnings: list[str] = []
-    for index, value in enumerate(values):
-        cleaned, removed, warning = _sanitize_text_field(f'{field_name}[{index}]', value)
-        if cleaned:
-            cleaned_values.append(cleaned)
-        dropped.extend(removed)
-        if warning:
-            warnings.append(warning)
-    return cleaned_values, dropped[:24], warnings[:12]
 
 
 @dataclass(slots=True)
@@ -384,69 +331,25 @@ class StickerRetrievalPlan:
     preferred_character_family: str = ''
     required_pack: str = ''
     required_character_family: str = ''
-    deprecated_aliases_used: dict[str, Any] = field(default_factory=dict)
-    field_warnings: list[str] = field(default_factory=list)
-    dropped_noise_terms: list[str] = field(default_factory=list)
+    style_goal_explicit: bool = False
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any], *, config: StickerConfig | None = None) -> 'StickerRetrievalPlan':
         config = config or StickerConfig.from_env()
         data = _norm_mapping(payload)
         advanced = _norm_mapping(data.get('advanced'))
-        deprecated_aliases_used: dict[str, Any] = {}
-        for key in (
-            'emotion_tone',
-            'social_goal',
-            'visual_hint',
-            'text_hint',
-            'prefer_pack',
-            'prefer_cluster',
-            'semantic_focus',
-            'visual_focus',
-            'style_focus',
-            'text_constraints',
-            'intensity_limits',
-            'safety_limits',
-            'text_priority',
-            'max_harshness',
-            'max_intimacy',
-            'max_meme_dependence',
-            'allow_animation',
-            'forbid',
-            'style_policy',
-        ):
-            if key in data:
-                deprecated_aliases_used[key] = data.get(key)
-
-        field_warnings: list[str] = []
-        dropped_noise_terms: list[str] = []
-
-        intent_core, dropped, warning = _sanitize_text_field('intent_core', data.get('intent_core', ''))
-        dropped_noise_terms.extend(dropped)
-        if warning:
-            field_warnings.append(warning)
+        intent_core = _norm_text(data.get('intent_core', ''))
         if not intent_core:
             raise ValueError('intent_core is required and must contain semantic content')
 
-        secondary_goals, dropped, warnings = _sanitize_text_list('secondary_goals', data.get('secondary_goals'))
-        dropped_noise_terms.extend(dropped)
-        field_warnings.extend(warnings)
-        forbid, dropped, warnings = _sanitize_text_list('forbid', _first_present(advanced.get('forbid'), data.get('forbid')))
-        dropped_noise_terms.extend(dropped)
-        field_warnings.extend(warnings)
-
-        def sanitize_from(*, field_name: str, primary: Any, fallback: Any = '') -> str:
-            cleaned, removed, local_warning = _sanitize_text_field(field_name, primary if primary not in (None, '') else fallback)
-            dropped_noise_terms.extend(removed)
-            if local_warning:
-                field_warnings.append(local_warning)
-            return cleaned
+        secondary_goals = _norm_text_list(data.get('secondary_goals'))
+        forbid = _norm_text_list(_first_present(advanced.get('forbid'), data.get('forbid')))
 
         simple_hints = SimpleHints(
-            emotion_tone=sanitize_from(field_name='reaction_tone', primary=data.get('reaction_tone'), fallback=data.get('emotion_tone')),
-            social_goal=sanitize_from(field_name='social_intent', primary=data.get('social_intent'), fallback=data.get('social_goal')),
-            visual_hint=sanitize_from(field_name='expression_cue', primary=data.get('expression_cue'), fallback=data.get('visual_hint')),
-            text_hint=sanitize_from(field_name='caption_meaning', primary=data.get('caption_meaning'), fallback=data.get('text_hint')),
+            emotion_tone=_norm_text(_first_present(data.get('reaction_tone'), data.get('emotion_tone'))),
+            social_goal=_norm_text(_first_present(data.get('social_intent'), data.get('social_goal'))),
+            visual_hint=_norm_text(_first_present(data.get('expression_cue'), data.get('visual_hint'))),
+            text_hint=_norm_text(_first_present(data.get('caption_meaning'), data.get('text_hint'))),
             diversity_preference=_normalize_diversity_preference(data.get('diversity_preference')),
         )
         persona_source = _norm_mapping(data.get('persona'))
@@ -463,38 +366,27 @@ class StickerRetrievalPlan:
 
         legacy_text_priority = _norm_text(data.get('text_priority', '')).lower()
         legacy_style_policy = _norm_text(data.get('style_policy', '')).lower()
-        if 'prefer_pack' in style_source:
-            deprecated_aliases_used['advanced.style_focus.prefer_pack'] = style_source.get('prefer_pack')
-        if 'prefer_cluster' in style_source:
-            deprecated_aliases_used['advanced.style_focus.prefer_cluster'] = style_source.get('prefer_cluster')
-        if 'prefer_pack' in persona_visual_source:
-            deprecated_aliases_used['persona.visual_identity.prefer_pack'] = persona_visual_source.get('prefer_pack')
-        if 'prefer_cluster' in persona_visual_source:
-            deprecated_aliases_used['persona.visual_identity.prefer_cluster'] = persona_visual_source.get('prefer_cluster')
 
         semantic_focus = SemanticFocus(
-            reaction_type=sanitize_from(field_name='advanced.semantic_focus.reaction_type', primary=semantic_source.get('reaction_type')),
-            reply_force=sanitize_from(field_name='advanced.semantic_focus.reply_force', primary=semantic_source.get('reply_force')),
-            emotional_valence=sanitize_from(field_name='advanced.semantic_focus.emotional_valence', primary=semantic_source.get('emotional_valence')),
-            irony_strength=sanitize_from(field_name='advanced.semantic_focus.irony_strength', primary=semantic_source.get('irony_strength')),
-            social_stance=sanitize_from(field_name='advanced.semantic_focus.social_stance', primary=semantic_source.get('social_stance')),
-            conversation_role=sanitize_from(field_name='advanced.semantic_focus.conversation_role', primary=semantic_source.get('conversation_role')),
-            relationship_fit=sanitize_from(field_name='advanced.semantic_focus.relationship_fit', primary=semantic_source.get('relationship_fit')),
+            reaction_type=_norm_text(semantic_source.get('reaction_type')),
+            reply_force=_norm_text(semantic_source.get('reply_force')),
+            emotional_valence=_norm_text(semantic_source.get('emotional_valence')),
+            irony_strength=_norm_text(semantic_source.get('irony_strength')),
+            social_stance=_norm_text(semantic_source.get('social_stance')),
+            conversation_role=_norm_text(semantic_source.get('conversation_role')),
+            relationship_fit=_norm_text(semantic_source.get('relationship_fit')),
         )
         visual_focus = VisualFocus(
-            eye_signal=sanitize_from(field_name='advanced.visual_focus.eye_signal', primary=visual_source.get('eye_signal')),
-            mouth_signal=sanitize_from(field_name='advanced.visual_focus.mouth_signal', primary=visual_source.get('mouth_signal')),
-            motion_signal=sanitize_from(field_name='advanced.visual_focus.motion_signal', primary=visual_source.get('motion_signal')),
-            delivery_style=sanitize_from(field_name='advanced.visual_focus.delivery_style', primary=visual_source.get('delivery_style')),
-            humor_style=sanitize_from(field_name='advanced.visual_focus.humor_style', primary=visual_source.get('humor_style')),
+            eye_signal=_norm_text(visual_source.get('eye_signal')),
+            mouth_signal=_norm_text(visual_source.get('mouth_signal')),
+            motion_signal=_norm_text(visual_source.get('motion_signal')),
+            delivery_style=_norm_text(visual_source.get('delivery_style')),
+            humor_style=_norm_text(visual_source.get('humor_style')),
         )
-        style_hints, dropped, warnings = _sanitize_text_list('advanced.style_focus.style_hints', style_source.get('style_hints'))
-        dropped_noise_terms.extend(dropped)
-        field_warnings.extend(warnings)
-        persona_style_hints, dropped, warnings = _sanitize_text_list('persona.visual_identity.style_hints', persona_visual_source.get('style_hints'))
-        dropped_noise_terms.extend(dropped)
-        field_warnings.extend(warnings)
+        style_hints = _norm_text_list(style_source.get('style_hints'))
+        persona_style_hints = _norm_text_list(persona_visual_source.get('style_hints'))
         raw_style_goal = _norm_text(style_source.get('style_goal', '')).lower()
+        style_goal_explicit = raw_style_goal in _STYLE_GOALS or legacy_style_policy in _LEGACY_STYLE_POLICY_TO_GOAL
         if raw_style_goal not in _STYLE_GOALS:
             raw_style_goal = _LEGACY_STYLE_POLICY_TO_GOAL.get(legacy_style_policy, 'preserve')
         style_focus = StyleFocus(
@@ -503,12 +395,8 @@ class StickerRetrievalPlan:
             prefer_pack=_norm_text(_first_present(style_source.get('preferred_pack'), style_source.get('prefer_pack'), data.get('preferred_pack'), data.get('prefer_pack'))),
             prefer_cluster=_norm_text(_first_present(style_source.get('preferred_style_cluster'), style_source.get('prefer_cluster'), data.get('preferred_style_cluster'), data.get('prefer_cluster'))),
         )
-        must_include, dropped, warnings = _sanitize_text_list('advanced.text_constraints.must_include', text_source.get('must_include'))
-        dropped_noise_terms.extend(dropped)
-        field_warnings.extend(warnings)
-        avoid_text_meanings, dropped, warnings = _sanitize_text_list('advanced.text_constraints.avoid_text_meanings', text_source.get('avoid_text_meanings'))
-        dropped_noise_terms.extend(dropped)
-        field_warnings.extend(warnings)
+        must_include = _norm_text_list(text_source.get('must_include'))
+        avoid_text_meanings = _norm_text_list(text_source.get('avoid_text_meanings'))
         text_priority = _norm_text(_first_present(text_source.get('text_priority'), legacy_text_priority, 'prefer')).lower() or 'prefer'
         if text_priority not in _TEXT_PRIORITIES:
             text_priority = 'prefer'
@@ -525,27 +413,27 @@ class StickerRetrievalPlan:
         )
         persona = StickerPersona(
             visual_identity=PersonaVisualIdentity(
-                character_archetype=sanitize_from(field_name='persona.visual_identity.character_archetype', primary=persona_visual_source.get('character_archetype')),
-                rendering_style=sanitize_from(field_name='persona.visual_identity.rendering_style', primary=persona_visual_source.get('rendering_style')),
-                palette_mood=sanitize_from(field_name='persona.visual_identity.palette_mood', primary=persona_visual_source.get('palette_mood')),
+                character_archetype=_norm_text(persona_visual_source.get('character_archetype')),
+                rendering_style=_norm_text(persona_visual_source.get('rendering_style')),
+                palette_mood=_norm_text(persona_visual_source.get('palette_mood')),
                 style_hints=persona_style_hints,
                 prefer_pack=_norm_text(_first_present(persona_visual_source.get('preferred_pack'), persona_visual_source.get('prefer_pack'))),
                 prefer_cluster=_norm_text(_first_present(persona_visual_source.get('preferred_style_cluster'), persona_visual_source.get('prefer_cluster'))),
             ),
             affect_profile=PersonaAffectProfile(
-                default_tone=sanitize_from(field_name='persona.affect_profile.default_tone', primary=persona_affect_source.get('default_tone')),
-                expression_bias=sanitize_from(field_name='persona.affect_profile.expression_bias', primary=persona_affect_source.get('expression_bias')),
-                pose_bias=sanitize_from(field_name='persona.affect_profile.pose_bias', primary=persona_affect_source.get('pose_bias')),
-                delivery_bias=sanitize_from(field_name='persona.affect_profile.delivery_bias', primary=persona_affect_source.get('delivery_bias')),
-                humor_bias=sanitize_from(field_name='persona.affect_profile.humor_bias', primary=persona_affect_source.get('humor_bias')),
+                default_tone=_norm_text(persona_affect_source.get('default_tone')),
+                expression_bias=_norm_text(persona_affect_source.get('expression_bias')),
+                pose_bias=_norm_text(persona_affect_source.get('pose_bias')),
+                delivery_bias=_norm_text(persona_affect_source.get('delivery_bias')),
+                humor_bias=_norm_text(persona_affect_source.get('humor_bias')),
             ),
         )
         selection_lens = SelectionLens(
-            social_read=sanitize_from(field_name='selection_lens.social_read', primary=selection_lens_source.get('social_read')),
-            subtext=sanitize_from(field_name='selection_lens.subtext', primary=selection_lens_source.get('subtext')),
-            face_and_pose=sanitize_from(field_name='selection_lens.face_and_pose', primary=selection_lens_source.get('face_and_pose')),
-            continuity_note=sanitize_from(field_name='selection_lens.continuity_note', primary=selection_lens_source.get('continuity_note')),
-            avoid_misread_as=sanitize_from(field_name='selection_lens.avoid_misread_as', primary=selection_lens_source.get('avoid_misread_as')),
+            social_read=_norm_text(selection_lens_source.get('social_read')),
+            subtext=_norm_text(selection_lens_source.get('subtext')),
+            face_and_pose=_norm_text(selection_lens_source.get('face_and_pose')),
+            continuity_note=_norm_text(selection_lens_source.get('continuity_note')),
+            avoid_misread_as=_norm_text(selection_lens_source.get('avoid_misread_as')),
         )
 
         return cls(
@@ -566,9 +454,7 @@ class StickerRetrievalPlan:
             preferred_character_family=_norm_text(data.get('preferred_character_family')),
             required_pack=_norm_text(data.get('required_pack')),
             required_character_family=_norm_text(data.get('required_character_family')),
-            deprecated_aliases_used=deprecated_aliases_used,
-            field_warnings=field_warnings[:16],
-            dropped_noise_terms=sorted(dict.fromkeys(dropped_noise_terms))[:32],
+            style_goal_explicit=style_goal_explicit,
         )
 
     @property
@@ -626,135 +512,6 @@ class StickerRetrievalPlan:
     @property
     def prefer_cluster(self) -> str:
         return self.style_focus.prefer_cluster
-
-    @property
-    def style_policy(self) -> str:
-        return _STYLE_GOAL_TO_LEGACY_POLICY.get(self.style_goal, 'continue')
-
-    @property
-    def has_persona_request(self) -> bool:
-        return self.persona.has_values()
-
-    def helper_hint_terms(self) -> list[str]:
-        return _request_tokens(' ; '.join(self.simple_hints.request_texts()))
-
-    def caption_query_text(self) -> str:
-        parts = [
-            self.intent_core,
-            *self.secondary_goals,
-            self.emotion_tone,
-            self.social_goal,
-            self.text_hint,
-            self.selection_lens.social_read,
-            self.selection_lens.subtext,
-            *self.semantic_focus.request_texts(),
-        ]
-        if self.text_priority == 'require':
-            parts.append('visible caption text should dominate meaning')
-        elif self.text_priority == 'prefer':
-            parts.append('caption meaning should matter strongly')
-        if self.text_constraints.must_include:
-            parts.append('caption should include or imply: ' + '; '.join(self.text_constraints.must_include))
-        return '; '.join(part for part in parts if part)
-
-    def sticker_query_text(self) -> str:
-        parts = [
-            self.intent_core,
-            *self.secondary_goals,
-            self.emotion_tone,
-            self.social_goal,
-            self.visual_hint,
-            *self.persona.request_texts(),
-            *self.selection_lens.request_texts(),
-            *self.semantic_focus.request_texts(),
-            *self.visual_focus.request_texts(),
-        ]
-        if self.style_hints:
-            parts.append('style hints: ' + '; '.join(self.style_hints))
-        return '; '.join(part for part in parts if part)
-
-    def request_terms(self) -> list[str]:
-        text = ' ; '.join([
-            self.intent_core,
-            *self.secondary_goals,
-            *self.simple_hints.request_texts(),
-            *self.persona.request_texts(),
-            *self.selection_lens.request_texts(),
-            *self.semantic_focus.request_texts(),
-            *self.visual_focus.request_texts(),
-        ])
-        return _request_tokens(text)
-
-    def style_request_terms(self) -> list[str]:
-        return _request_tokens(' ; '.join(self.style_hints))
-
-    def avoid_terms(self) -> list[str]:
-        return _request_tokens(' ; '.join([*self.forbid, *self.text_constraints.avoid_text_meanings, self.selection_lens.avoid_misread_as]))
-
-    def memory_query_bundle(self) -> dict[str, Any]:
-        return {
-            'intent_core': self.intent_core,
-            'emotion_tone': self.emotion_tone,
-            'social_goal': self.social_goal,
-            'visual_hint': self.visual_hint,
-            'text_hint': self.text_hint,
-            'persona_mode': self.persona_mode,
-            'persona_character_archetype': self.persona.visual_identity.character_archetype,
-            'persona_rendering_style': self.persona.visual_identity.rendering_style,
-            'persona_default_tone': self.persona.affect_profile.default_tone,
-            'selection_social_read': self.selection_lens.social_read,
-            'selection_subtext': self.selection_lens.subtext,
-            'selection_face_and_pose': self.selection_lens.face_and_pose,
-            'prefer_pack': self.prefer_pack,
-            'prefer_cluster': self.prefer_cluster,
-            'style_goal': self.style_goal,
-            'diversity_preference': self.diversity_preference,
-        }
-
-    def likely_culprit_fields(self) -> list[str]:
-        fields: list[str] = []
-        if self.text_constraints.must_include or self.text_constraints.avoid_text_meanings or self.text_priority == 'require':
-            fields.append('advanced.text_constraints')
-        if self.semantic_focus.active_fields():
-            fields.append('advanced.semantic_focus')
-        if self.visual_focus.active_fields():
-            fields.append('advanced.visual_focus')
-        if self.prefer_pack:
-            fields.append('preferred_pack')
-        if self.prefer_cluster:
-            fields.append('preferred_style_cluster')
-        if self.has_persona_request:
-            fields.append('persona')
-        if self.selection_lens.active_fields():
-            fields.append('selection_lens')
-        if self.max_harshness < 3 or self.max_intimacy < 4 or self.max_meme_dependence < 4:
-            fields.append('advanced.intensity_limits')
-        if self.field_warnings or self.dropped_noise_terms:
-            fields.append('sanitation')
-        return list(dict.fromkeys(fields))
-
-    def query_interpretation(self) -> dict[str, Any]:
-        return {
-            'send': self.send,
-            'intent_core': self.intent_core,
-            'secondary_goals': list(self.secondary_goals),
-            'simple_hints': self.simple_hints.display_dict(),
-            'persona_mode': self.persona_mode,
-            'persona': self.persona.display_dict(),
-            'selection_lens': self.selection_lens.as_dict(),
-            'advanced': {
-                'semantic_focus': self.semantic_focus.as_dict(),
-                'visual_focus': self.visual_focus.as_dict(),
-                'style_focus': self.style_focus.display_dict(),
-                'text_constraints': self.text_constraints.as_dict(),
-                'intensity_limits': self.intensity_limits.as_dict(),
-                'forbid': list(self.forbid),
-            },
-            'candidate_budget': self.candidate_budget,
-            'field_warnings': list(self.field_warnings),
-            'dropped_noise_terms': list(self.dropped_noise_terms),
-            'deprecated_aliases_used': dict(self.deprecated_aliases_used),
-        }
 
 
 def _normalize_diversity_preference(value: Any) -> str:

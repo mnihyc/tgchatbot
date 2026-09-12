@@ -33,7 +33,8 @@ class TokenEstimator:
         if part.kind == PartKind.TEXT:
             total += cls.estimate_text(part.text)
         elif part.kind == PartKind.IMAGE:
-            total += cls.IMAGE_TOKENS + cls.estimate_text(part.filename)
+            total += (cls.IMAGE_TOKENS if part.data_b64 or part.preview_ref else cls.estimate_text(part.text))
+            total += cls.estimate_text(part.filename)
         elif part.kind == PartKind.STICKER:
             total += cls.STICKER_TOKENS + cls.estimate_text(part.filename)
         elif part.kind == PartKind.FILE:

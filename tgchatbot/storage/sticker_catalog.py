@@ -164,6 +164,16 @@ class StickerCatalogStore:
             if not locked['acquired']:
                 raise CatalogConflict('This catalog revision is already being built')
             try:
+                # Reject already obsolete work before buying annotation/embedding
+                # requests. Activation still checks again to resolve publication races.
+                async with self.store.pool.connection() as state_conn:
+                    revision = await (await state_conn.execute('''SELECT r.state,r.parent_id,h.revision_id
+                        FROM sticker_catalog_revisions r CROSS JOIN sticker_catalog_head h
+                        WHERE r.id=%s AND h.singleton''', (revision_id,))).fetchone()
+                if not revision or revision['state'] != 'staging':
+                    raise CatalogConflict('Only a staging revision can be built')
+                if revision['parent_id'] != revision['revision_id']:
+                    raise CatalogConflict('Active catalog changed; start a new revision from the current catalog')
                 yield
             finally:
                 await conn.execute('SELECT pg_advisory_unlock(hashtextextended(%s,0))', ('sticker-build:' + revision_id,))
@@ -215,9 +225,11 @@ class StickerCatalogStore:
                         WHERE item.revision_id=%s AND (item.card IS NULL OR item.card='null'::jsonb OR
                         item.provenance->>'embedding_space_id' IS DISTINCT FROM %s OR item.dimensions<>%s OR
                         readings.payload IS NULL OR octet_length(readings.payload) <> 4*item.dimensions*jsonb_array_length(item.card->'readings') OR
-                        (%s AND (image.payload IS NULL OR octet_length(image.payload)<>4*item.dimensions))) LIMIT 1""",
+                        ((%s OR (%s AND NULLIF(regexp_replace(concat_ws('',item.card->>'appearance',
+                            item.card->>'action',item.card->>'caption'),'[[:space:]]','','g'),'') IS NOT NULL))
+                        AND (image.payload IS NULL OR octet_length(image.payload)<>4*item.dimensions))) LIMIT 1""",
                         (revision_id, recipe['embedding_space_id'], recipe['embedding_space']['dimensions'],
-                         bool(recipe.get('image_embeddings'))))).fetchone()
+                         bool(recipe.get('image_embeddings')), recipe.get('visual_embedding_source') == 'description'))).fetchone()
                     if incomplete:
                         raise CatalogConflict('Revision contains incomplete or incompatible vectors: ' + incomplete['asset_id'])
                 await conn.execute("UPDATE sticker_catalog_revisions SET state='superseded' WHERE id=%s", (head['revision_id'],))

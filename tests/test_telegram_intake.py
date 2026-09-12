@@ -9,6 +9,7 @@ from PIL import Image
 
 from tests.business_helpers import BusinessTestCase
 from tgchatbot.domain.models import PartKind
+from tgchatbot.storage.artifacts import ArtifactStore
 from tgchatbot.tools.memory import audit_records
 from tgchatbot.transports.telegram_adapter import TelegramBotApp
 
@@ -18,6 +19,7 @@ class TelegramIntakeTests(BusinessTestCase):
         await super().asyncSetUp()
         self.app = TelegramBotApp.__new__(TelegramBotApp)
         self.app.config, self.app.runtime, self.app.store = self.config, self.runtime, self.store
+        self.artifact_store = ArtifactStore(self.config.artifact_dir)
         self.app.artifact_store = self.artifact_store
         self.app.remote_workspace = SimpleNamespace(enabled=False)
         self.app._chat_states = {}
@@ -96,6 +98,22 @@ class TelegramIntakeTests(BusinessTestCase):
 
     async def test_full_reset_during_download_keeps_only_old_generation_audit_without_late_reply(self):
         await self._reset_during_download(full=True)
+
+    async def test_reset_during_document_download_discards_only_new_transfer_copy(self):
+        async def download(buffer):
+            await self.store.reset_context(self.session)
+            self.runtime.invalidate_session(self.session)
+            buffer.write(b'private document fixture')
+
+        file = SimpleNamespace(download_to_memory=AsyncMock(side_effect=download))
+        document = SimpleNamespace(file_id='synthetic-document', file_unique_id='unique-document',
+            file_name='report.pdf', mime_type='application/pdf', file_size=24,
+            get_file=AsyncMock(return_value=file))
+        await self.ingest(self.update(None, caption='Remember this report.', document=document))
+        self.assertFalse([path for path in self.artifact_store.root.rglob('*') if path.is_file()])
+        self.assertEqual(await self.store.list_messages(self.session), [])
+        self.assertTrue(await self.store.search_messages(self.session, 'report'))
+        self.app._ensure_reply_worker.assert_not_awaited()
 
     async def test_plain_text_keeps_one_original_revision_and_one_reply_candidate(self):
         update = self.update('Plain text with stable metadata.')

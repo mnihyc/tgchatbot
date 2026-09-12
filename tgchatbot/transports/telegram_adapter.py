@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import random
 import contextlib
 import hashlib
@@ -16,6 +17,7 @@ from telegram.constants import ChatAction, ChatType
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from tgchatbot.config import AppConfig
+from tgchatbot.transports.artifact_delivery import deliver_artifact
 from tgchatbot.healthcheck import start_heartbeat, stop_heartbeat
 from tgchatbot.core.runtime import AgentRuntime
 from tgchatbot.domain.models import (
@@ -39,32 +41,23 @@ from tgchatbot.media.ingest import extract_message_parts
 from tgchatbot.media.link_prefetch import fetch_link_previews, previews_to_parts
 from tgchatbot.storage.artifacts import ArtifactStore
 from tgchatbot.transports.sticker_delivery import send_sticker as deliver_sticker
+from tgchatbot.transports.telegram_routing import topic_arguments
 from tgchatbot.storage.postgres_store import PostgresStore, StaleScopeError
 from tgchatbot.storage.presets import PresetStore
 from tgchatbot.domain.provenance import telegram_metadata, telegram_actor
 from tgchatbot.tools.remote_workspace import RemoteWorkspaceClient
 from tgchatbot.settings_schema import (
-    COMPACT_TOOL_RATIO_THRESHOLD_MAX,
     COMPACT_TOOL_RATIO_THRESHOLD_MIN,
-    GEMINI_THINKING_BUDGET_MAX,
     GEMINI_THINKING_BUDGET_MIN,
-    GROUP_SPONTANEOUS_REPLY_DELAY_MAX_S,
-    IMAGE_LIMIT_MAX,
-    MAX_INTERACTION_ROUNDS_MAX,
     MAX_INTERACTION_ROUNDS_MIN,
-    MAX_OUTPUT_TOKENS_MAX,
     MAX_OUTPUT_TOKENS_MIN,
-    NATIVE_WEB_SEARCH_MAX_MAX,
     NATIVE_WEB_SEARCH_MAX_MIN,
-    PROVIDER_RETRY_COUNT_MAX,
     PROVIDER_RETRY_COUNT_MIN,
-    REPLY_DELAY_MAX_S,
     REASONING_SUMMARY_VALUES,
     SPONTANEOUS_REPLY_CHANCE_MAX,
     SPONTANEOUS_REPLY_CHANCE_MIN,
     TEMPERATURE_MAX,
     TEMPERATURE_MIN,
-    TOP_K_MAX,
     TOP_K_MIN,
     TOP_P_MAX,
     TOP_P_MIN,
@@ -196,7 +189,7 @@ class TelegramBotApp:
         return bool(control and control.supported)
 
     @staticmethod
-    def _display_optional_disabled_int(value: int | None, *, disabled_label: str, maximum: int) -> str:
+    def _display_optional_disabled_int(value: int | None, *, disabled_label: str, maximum: int | None = None) -> str:
         normalized = normalize_optional_disabled_int(value, maximum=maximum)
         if normalized in {None, 0}:
             return disabled_label
@@ -243,7 +236,7 @@ class TelegramBotApp:
             return None
         if parsed > 1.0:
             parsed = parsed / 100.0
-        if parsed < 0.0 or parsed > 0.95:
+        if not math.isfinite(parsed) or parsed < 0.0 or parsed > 1.0:
             return None
         return parsed
 
@@ -261,33 +254,33 @@ class TelegramBotApp:
             'text_verbosity': 'text_verbosity <low|medium|high|default>',
             'include_thoughts': 'include_thoughts <on|off|default>',
             'native_web_search': 'native_web_search <on|off|default>',
-            'native_web_search_max': f'native_web_search_max <{NATIVE_WEB_SEARCH_MAX_MIN}..{NATIVE_WEB_SEARCH_MAX_MAX}|default>',
+            'native_web_search_max': 'native_web_search_max <nonnegative integer|default>',
             'temperature': f'temperature <{TEMPERATURE_MIN:g}..{TEMPERATURE_MAX:g}|default>',
             'top_p': f'top_p <{TOP_P_MIN:g}..{TOP_P_MAX:g}|default>',
-            'top_k': f'top_k <{TOP_K_MIN}..{TOP_K_MAX}|default>',
+            'top_k': 'top_k <positive integer|default>',
             'thinking_budget': f'thinking_budget <{gemini_thinking_budget_usage(settings.model)}|default>',
             'thinking_level': f"thinking_level <{'|'.join(gemini_allowed_thinking_levels(settings.model))}|default>",
         }
         lines.extend(line for name, line in usage.items() if self._provider_supports_control(settings, name))
         lines.extend([
             'link_prefetch <off|title|snippet|default>',
-            f'max_output_tokens <{MAX_OUTPUT_TOKENS_MIN}..{MAX_OUTPUT_TOKENS_MAX}|default>',
-            f'max_input_images <0..{IMAGE_LIMIT_MAX}|default>  (0 disables the image-count cap)',
-            f'compact_target_images <0..{IMAGE_LIMIT_MAX}|default>  (0 disables the separate image compaction target)',
-            'compact_trigger_tokens <256..10000000|default>',
-            'compact_target_tokens <256..10000000|default>',
-            'compact_batch_tokens <256..10000000|default>',
-            'compact_keep_recent_ratio <0..0.95 | 50% | default>',
-            'compact_tool_ratio_threshold <1..100 | default>',
-            'compact_tool_min_tokens <256..10000000|default>',
-            'compact_min_messages <2..1000|default>',
-            'min_raw_messages_reserve <0..1000|default>',
-            f'max_interaction_rounds <{MAX_INTERACTION_ROUNDS_MIN}..{MAX_INTERACTION_ROUNDS_MAX}|default>',
+            'max_output_tokens <positive integer|default>',
+            'max_input_images <nonnegative integer|default>  (0 disables the image-count cap)',
+            'compact_target_images <nonnegative integer|default>  (0 disables the separate image compaction target)',
+            'compact_trigger_tokens <positive integer|default>',
+            'compact_target_tokens <positive integer|default>',
+            'compact_batch_tokens <positive integer|default>',
+            'compact_keep_recent_ratio <0..1 | 50% | default>',
+            'compact_tool_ratio_threshold <nonnegative ratio | default>',
+            'compact_tool_min_tokens <positive integer|default>',
+            'compact_min_messages <integer >=2|default>',
+            'min_raw_messages_reserve <nonnegative integer|default>',
+            'max_interaction_rounds <positive integer|default>',
             f'spontaneous_reply_chance <{SPONTANEOUS_REPLY_CHANCE_MIN}..{SPONTANEOUS_REPLY_CHANCE_MAX}|default>',
-            f'group_spontaneous_reply_delay_s <0..{int(GROUP_SPONTANEOUS_REPLY_DELAY_MAX_S)}|default>',
-            f'private_reply_delay_s <0..{int(REPLY_DELAY_MAX_S)}|default>',
-            f'group_reply_delay_s <0..{int(REPLY_DELAY_MAX_S)}|default>',
-            f'provider_retry_count <{PROVIDER_RETRY_COUNT_MIN}..{PROVIDER_RETRY_COUNT_MAX}|default>',
+            'group_spontaneous_reply_delay_s <nonnegative seconds|default>',
+            'private_reply_delay_s <nonnegative seconds|default>',
+            'group_reply_delay_s <nonnegative seconds|default>',
+            'provider_retry_count <nonnegative integer|default>',
             'metadata <on|off|default>',
             'metadata_timezone <IANA TZ like UTC or Asia/Tokyo|default>',
             'tool_history_mode <translated|native_same_provider|default>',
@@ -798,9 +791,9 @@ class TelegramBotApp:
                     cap = int(value)
                 except ValueError:
                     cap = -1
-                if cap < NATIVE_WEB_SEARCH_MAX_MIN or cap > NATIVE_WEB_SEARCH_MAX_MAX:
+                if cap < NATIVE_WEB_SEARCH_MAX_MIN:
                     current = settings.native_web_search_max if settings.native_web_search_max is not None else self._stored_native_web_search_max_default()
-                    current_text = self._display_optional_disabled_int(current, disabled_label='unlimited', maximum=NATIVE_WEB_SEARCH_MAX_MAX)
+                    current_text = self._display_optional_disabled_int(current, disabled_label='unlimited')
                     await update.effective_message.reply_text(f'Invalid native_web_search_max. Current stored value: {current_text}')
                     return
                 settings.native_web_search_max = cap
@@ -815,7 +808,7 @@ class TelegramBotApp:
                     temp = float(value)
                 except ValueError:
                     temp = -1.0
-                if temp < TEMPERATURE_MIN or temp > TEMPERATURE_MAX:
+                if not math.isfinite(temp) or temp < TEMPERATURE_MIN or temp > TEMPERATURE_MAX:
                     current = settings.temperature if settings.temperature is not None else self._stored_temperature_default(settings.provider)
                     await update.effective_message.reply_text(f'Invalid temperature. Current stored value: {current}')
                     return
@@ -831,7 +824,7 @@ class TelegramBotApp:
                     top_p = float(value)
                 except ValueError:
                     top_p = -1.0
-                if top_p < TOP_P_MIN or top_p > TOP_P_MAX:
+                if not math.isfinite(top_p) or top_p < TOP_P_MIN or top_p > TOP_P_MAX:
                     current = settings.top_p if settings.top_p is not None else self._stored_top_p_default(settings.provider)
                     await update.effective_message.reply_text(f'Invalid top_p. Current stored value: {current}')
                     return
@@ -847,7 +840,7 @@ class TelegramBotApp:
                     top_k = int(value)
                 except ValueError:
                     top_k = 0
-                if top_k < TOP_K_MIN or top_k > TOP_K_MAX:
+                if top_k < TOP_K_MIN:
                     current = settings.top_k if settings.top_k is not None else self._stored_top_k_default()
                     await update.effective_message.reply_text(f'Invalid top_k. Current stored value: {current}')
                     return
@@ -867,7 +860,7 @@ class TelegramBotApp:
                     max_tokens = int(value)
                 except ValueError:
                     max_tokens = 0
-                if max_tokens < MAX_OUTPUT_TOKENS_MIN or max_tokens > MAX_OUTPUT_TOKENS_MAX:
+                if max_tokens < MAX_OUTPUT_TOKENS_MIN:
                     current = settings.max_output_tokens if settings.max_output_tokens is not None else self.config.provider_config(settings.provider).max_output_tokens
                     await update.effective_message.reply_text(f'Invalid max_output_tokens. Current effective value: {current}')
                     return
@@ -880,10 +873,10 @@ class TelegramBotApp:
                     image_limit = int(value)
                 except ValueError:
                     image_limit = -1
-                if image_limit < 0 or image_limit > IMAGE_LIMIT_MAX:
+                if image_limit < 0:
                     default_limit = self.config.provider_config(settings.provider).max_input_images
                     current = settings.max_input_images if settings.max_input_images is not None else default_limit
-                    current_text = self._display_optional_disabled_int(current, disabled_label='unlimited', maximum=IMAGE_LIMIT_MAX)
+                    current_text = self._display_optional_disabled_int(current, disabled_label='unlimited')
                     await update.effective_message.reply_text(f'Invalid max_input_images. Current effective value: {current_text}')
                     return
                 settings.max_input_images = image_limit
@@ -895,10 +888,10 @@ class TelegramBotApp:
                     target = int(value)
                 except ValueError:
                     target = -1
-                if target < 0 or target > IMAGE_LIMIT_MAX:
+                if target < 0:
                     default_target = self.config.provider_config(settings.provider).compact_target_images
                     current = settings.compact_target_images if settings.compact_target_images is not None else default_target
-                    current_text = self._display_optional_disabled_int(current, disabled_label='disabled', maximum=IMAGE_LIMIT_MAX)
+                    current_text = self._display_optional_disabled_int(current, disabled_label='disabled')
                     await update.effective_message.reply_text(f'Invalid compact_target_images. Current effective value: {current_text}')
                     return
                 settings.compact_target_images = target
@@ -910,7 +903,7 @@ class TelegramBotApp:
                     target = int(value)
                 except ValueError:
                     target = 0
-                if target < 256 or target > 10000000:
+                if target < 1:
                     current = settings.compact_trigger_tokens if settings.compact_trigger_tokens is not None else self._compact_trigger_tokens_default()
                     await update.effective_message.reply_text(f'Invalid compact_trigger_tokens. Current effective value: {current}')
                     return
@@ -927,7 +920,7 @@ class TelegramBotApp:
                     target = int(value)
                 except ValueError:
                     target = 0
-                if target < 256 or target > 10000000:
+                if target < 1:
                     current = settings.compact_target_tokens if settings.compact_target_tokens is not None else self._compact_target_tokens_default()
                     await update.effective_message.reply_text(f'Invalid compact_target_tokens. Current effective value: {current}')
                     return
@@ -944,7 +937,7 @@ class TelegramBotApp:
                     target = int(value)
                 except ValueError:
                     target = 0
-                if target < 256 or target > 10000000:
+                if target < 1:
                     current = settings.compact_batch_tokens if settings.compact_batch_tokens is not None else self._compact_batch_tokens_default()
                     await update.effective_message.reply_text(f'Invalid compact_batch_tokens. Current effective value: {current}')
                     return
@@ -970,8 +963,8 @@ class TelegramBotApp:
                 try:
                     ratio = float(value)
                 except ValueError:
-                    ratio = 0.0
-                if ratio < 1.0 or ratio > 100.0:
+                    ratio = -1.0
+                if ratio < 0.0 or not math.isfinite(ratio):
                     current = settings.compact_tool_ratio_threshold if settings.compact_tool_ratio_threshold is not None else self._compact_tool_ratio_threshold_default()
                     await update.effective_message.reply_text(f'Invalid compact_tool_ratio_threshold. Current effective value: {current:.2f}')
                     return
@@ -984,7 +977,7 @@ class TelegramBotApp:
                     target = int(value)
                 except ValueError:
                     target = 0
-                if target < 256 or target > 10000000:
+                if target < 1:
                     current = settings.compact_tool_min_tokens if settings.compact_tool_min_tokens is not None else self._compact_tool_min_tokens_default()
                     await update.effective_message.reply_text(f'Invalid compact_tool_min_tokens. Current effective value: {current}')
                     return
@@ -997,7 +990,7 @@ class TelegramBotApp:
                     count = int(value)
                 except ValueError:
                     count = 0
-                if count < 2 or count > 1000:
+                if count < 2:
                     current = settings.compact_min_messages if settings.compact_min_messages is not None else self._compact_min_messages_default()
                     await update.effective_message.reply_text(f'Invalid compact_min_messages. Current effective value: {current}')
                     return
@@ -1014,7 +1007,7 @@ class TelegramBotApp:
                     count = int(value)
                 except ValueError:
                     count = -1
-                if count < 0 or count > 1000:
+                if count < 0:
                     current = settings.min_raw_messages_reserve if settings.min_raw_messages_reserve is not None else self._min_raw_messages_reserve_default()
                     await update.effective_message.reply_text(f'Invalid min_raw_messages_reserve. Current effective value: {current}')
                     return
@@ -1031,7 +1024,7 @@ class TelegramBotApp:
                     rounds = int(value)
                 except ValueError:
                     rounds = 0
-                if rounds < MAX_INTERACTION_ROUNDS_MIN or rounds > MAX_INTERACTION_ROUNDS_MAX:
+                if rounds < MAX_INTERACTION_ROUNDS_MIN:
                     await update.effective_message.reply_text(f'Invalid max_interaction_rounds. Current effective value: {settings.max_interaction_rounds or self._default_max_rounds_for_mode(settings.mode)}')
                     return
                 settings.max_interaction_rounds = rounds
@@ -1055,7 +1048,7 @@ class TelegramBotApp:
                     idle_s = float(value)
                 except ValueError:
                     idle_s = -1.0
-                if idle_s < 0 or idle_s > GROUP_SPONTANEOUS_REPLY_DELAY_MAX_S:
+                if idle_s < 0 or not math.isfinite(idle_s):
                     await update.effective_message.reply_text(f'Invalid group_spontaneous_reply_delay_s. Current effective value: {settings.group_spontaneous_reply_delay_s if settings.group_spontaneous_reply_delay_s is not None else self.config.default_group_spontaneous_reply_delay_s}')
                     return
                 settings.group_spontaneous_reply_delay_s = idle_s
@@ -1067,7 +1060,7 @@ class TelegramBotApp:
                     retry_count = int(value)
                 except ValueError:
                     retry_count = -1
-                if retry_count < PROVIDER_RETRY_COUNT_MIN or retry_count > PROVIDER_RETRY_COUNT_MAX:
+                if retry_count < PROVIDER_RETRY_COUNT_MIN:
                     await update.effective_message.reply_text(f'Invalid provider_retry_count. Current effective value: {settings.provider_retry_count if settings.provider_retry_count is not None else self.config.default_provider_retry_count}')
                     return
                 settings.provider_retry_count = retry_count
@@ -1079,7 +1072,7 @@ class TelegramBotApp:
                     delay_s = float(value)
                 except ValueError:
                     delay_s = -1.0
-                if delay_s < 0.0 or delay_s > REPLY_DELAY_MAX_S:
+                if delay_s < 0.0 or not math.isfinite(delay_s):
                     current = settings.private_reply_delay_s if settings.private_reply_delay_s is not None else self.config.default_private_reply_delay_s
                     await update.effective_message.reply_text(f'Invalid private_reply_delay_s. Current effective value: {current}')
                     return
@@ -1092,7 +1085,7 @@ class TelegramBotApp:
                     delay_s = float(value)
                 except ValueError:
                     delay_s = -1.0
-                if delay_s < 0.0 or delay_s > REPLY_DELAY_MAX_S:
+                if delay_s < 0.0 or not math.isfinite(delay_s):
                     current = settings.group_reply_delay_s if settings.group_reply_delay_s is not None else self.config.default_group_reply_delay_s
                     await update.effective_message.reply_text(f'Invalid group_reply_delay_s. Current effective value: {current}')
                     return
@@ -1106,7 +1099,7 @@ class TelegramBotApp:
                     delay_s = float(value)
                 except ValueError:
                     delay_s = -1.0
-                if delay_s < 0.0 or delay_s > REPLY_DELAY_MAX_S:
+                if delay_s < 0.0 or not math.isfinite(delay_s):
                     current_private = settings.private_reply_delay_s if settings.private_reply_delay_s is not None else self.config.default_private_reply_delay_s
                     current_group = settings.group_reply_delay_s if settings.group_reply_delay_s is not None else self.config.default_group_reply_delay_s
                     await update.effective_message.reply_text(f'Invalid legacy reply_delay_s. Current effective private/group values: {current_private}/{current_group}')
@@ -1320,6 +1313,7 @@ class TelegramBotApp:
         await self._mark_ingest_started(state)
         intake_completion = None
         intake_key = None
+        staged_paths: list[Path] = []
         try:
             session_id = self._session_id(chat)
             logger.info('tg.ingest.start chat=%s msg=%s group=%s edit=%s reply=%s', self._chat_log_id(chat.id), message.message_id, int(is_group), int(is_edit), int(should_reply))
@@ -1403,6 +1397,11 @@ class TelegramBotApp:
                 expected_scope=intake_scope, intake=True)
 
             parts = await self._safe_extract_parts(message, session_id)
+            for part in parts:
+                if part.artifact_path and part.remote_sync:
+                    path = Path(part.artifact_path)
+                    if path.resolve().is_relative_to(self.artifact_store.root.resolve()):
+                        staged_paths.append(path)
             if intake_scope is not None:
                 await self.store.assert_scope(session_id, {key: intake_scope[key] for key in ('generation', 'context_id')})
             logger.info('tg.ingest.parts chat=%s msg=%s sender=%s parts=%s preview=%s', self._chat_log_id(chat.id), message.message_id, user_name, self._parts_summary(parts), self._log_parts_preview(parts))
@@ -1448,6 +1447,11 @@ class TelegramBotApp:
             logger.info('tg.ingest.cancelled chat=%s msg=%s reason=scope_changed', self._chat_log_id(chat.id), message.message_id)
             return
         finally:
+            for path in staged_paths:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning('tg.intake.cleanup_failed file=%s', path.name)
             if intake_completion is not None:
                 self._intake_inflight.pop(intake_key, None)
                 intake_completion.set_result(None)
@@ -1495,6 +1499,7 @@ class TelegramBotApp:
                 parse_mode='MarkdownV2',
                 disable_web_page_preview=True,
                 reply_to_message_id=reply_to_message_id,
+                **topic_arguments(source_message),
             )
             if delivered_messages is not None:
                 delivered_messages.append(last_message)
@@ -1523,12 +1528,18 @@ class TelegramBotApp:
         if isinstance(actor_id, bool) or not isinstance(actor_id, int) or actor_id <= 0:
             raise RuntimeError('Delivered answer has no authenticated Telegram bot identity')
         actor_name = getattr(sender, 'full_name', None) or getattr(sender, 'username', None) or 'Assistant'
-        assistant_metadata = {'provider_native': {'provider': result.provider_name, 'items': result.provider_history_items}} if result.provider_name and result.provider_history_items else {}
+        assistant_metadata = {'provider_native': {'provider': result.provider_name,
+            'model': result.provider_model, 'items': result.provider_history_items}} if result.provider_name and result.provider_history_items else {}
         sent_at = getattr(first, 'date', None) or datetime.now(timezone.utc)
         assistant_metadata.update({'source': 'telegram', 'source_chat_id': str(source_message.chat.id),
             'source_message_id': message_ids[0], 'telegram_message_aliases': message_ids[1:],
             'actor_id': f'telegram:user:{actor_id}', 'actor_kind': 'bot', 'actor_name': actor_name,
             'sent_at': sent_at.isoformat(), 'reply_target': result.reply_target})
+        destination = topic_arguments(source_message)
+        if 'message_thread_id' in destination:
+            assistant_metadata['topic_id'] = str(destination['message_thread_id'])
+        if 'direct_messages_topic_id' in destination:
+            assistant_metadata['direct_messages_topic_id'] = str(destination['direct_messages_topic_id'])
         if self.config.telegram.reply_to_user_message:
             assistant_metadata.update(reply_to_source_id=str(source_message.message_id),
                                       reply_to_source_chat_id=str(source_message.chat.id))
@@ -1836,6 +1847,22 @@ class TelegramBotApp:
         *,
         sent_before_receipts: list[dict[str, object]],
     ) -> list[Message]:
+        try:
+            return await self._send_result(source_message, renderer, settings, result,
+                sent_before_receipts=sent_before_receipts)
+        finally:
+            for artifact in result.artifacts:
+                artifact.discard()
+
+    async def _send_result(
+        self,
+        source_message: Message,
+        renderer: TelegramMessageRenderer,
+        settings: SessionSettings,
+        result: TurnResult,
+        *,
+        sent_before_receipts: list[dict[str, object]],
+    ) -> list[Message]:
         delivered_messages: list[Message] = []
         after_stickers = [sticker for sticker in result.stickers if sticker.timing == StickerTiming.AFTER_FINAL]
         logger.info('tg.deliver.start chat=%s process=%s text_chars=%s artifacts=%s after_stickers=%s usage=in=%s out=%s total=%s', self._chat_log_id(source_message.chat.id), settings.process_visibility.value, len(result.text), len(result.artifacts), len(after_stickers), result.usage.input_tokens, result.usage.output_tokens, result.usage.total_tokens)
@@ -1848,24 +1875,24 @@ class TelegramBotApp:
             await renderer.complete_without_answer()
         if result.scope is not None:
             await self.store.assert_scope(self._session_id(source_message.chat), result.scope)
+        artifact_receipts = []
         if result.artifacts:
             if settings.process_visibility in {ProcessVisibility.OFF, ProcessVisibility.MINIMAL}:
                 for artifact in result.artifacts:
                     if result.scope is not None:
                         await self.store.assert_scope(self._session_id(source_message.chat), result.scope)
-                    try:
-                        suffix = artifact.path.suffix.lower()
-                        if suffix in {'.png', '.jpg', '.jpeg', '.webp'}:
-                            with artifact.path.open('rb') as fh:
-                                await source_message.get_bot().send_photo(chat_id=source_message.chat.id, photo=fh, caption=artifact.caption, reply_to_message_id=self._reply_to_message_id(source_message))
-                        else:
-                            from telegram import InputFile
-                            with artifact.path.open('rb') as fh:
-                                await source_message.get_bot().send_document(chat_id=source_message.chat.id, document=InputFile(fh, filename=artifact.filename), caption=artifact.caption, reply_to_message_id=self._reply_to_message_id(source_message))
-                    except Exception:
-                        logger.exception('Failed to send artifact %s after final delivery', artifact.path)
+                    artifact_receipts.append(await deliver_artifact(source_message.get_bot(),
+                        chat_id=source_message.chat.id, artifact=artifact,
+                        reply_to_message_id=self._reply_to_message_id(source_message),
+                        **topic_arguments(source_message)))
             else:
-                await renderer.send_artifacts(result.artifacts)
+                for artifact in result.artifacts:
+                    if result.scope is not None:
+                        await self.store.assert_scope(self._session_id(source_message.chat), result.scope)
+                    artifact_receipts.extend(await renderer.send_artifacts([artifact]))
+        for receipt in artifact_receipts:
+            await self.runtime.record_tool_observation(session_id=self._session_id(source_message.chat),
+                name='file_send', phase='delivery', payload=receipt, expected_scope=result.scope)
         if result.scope is not None:
             await self.store.assert_scope(self._session_id(source_message.chat), result.scope)
         if settings.process_visibility in {ProcessVisibility.OFF, ProcessVisibility.MINIMAL}:
@@ -1892,7 +1919,7 @@ class TelegramBotApp:
         for sticker in stickers:
             receipts.append(await deliver_sticker(source_message.get_bot(), chat_id=source_message.chat.id,
                 sticker=sticker, reply_to_message_id=self._reply_to_message_id(source_message),
-                deliveries=self.runtime.sticker_delivery))
+                deliveries=self.runtime.sticker_delivery, **topic_arguments(source_message)))
         return receipts
 
     @staticmethod

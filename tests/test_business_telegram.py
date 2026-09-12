@@ -38,6 +38,51 @@ class TelegramWorkflowTests(BusinessTestCase):
     def candidate(self, number=1, spontaneous=False):
         return ReplyCandidate(number, "tester", self.message, spontaneous=spontaneous)
 
+    async def test_operational_settings_preserve_requested_limits_without_unrelated_caps(self):
+        await self.settings()
+        for name, value in {'max_output_tokens': 131072, 'max_input_images': 200000,
+                'provider_retry_count': 8, 'max_interaction_rounds': 100,
+                'private_reply_delay_s': 901, 'group_spontaneous_reply_delay_s': 100000,
+                'compact_trigger_tokens': 20000000, 'compact_min_messages': 2000}.items():
+            with self.subTest(setting=name):
+                self.context.args = [name, str(value)]
+                await self.app.param_command(self.update, self.context)
+                restored = await (await self.new_store()).get_or_create_session(self.session,
+                    self.config.default_session_settings())
+                self.assertEqual(getattr(restored, name), value)
+
+    async def test_preset_name_cannot_read_outside_the_preset_directory(self):
+        from tgchatbot.storage.presets import PresetStore
+        await self.settings()
+        self.app.preset_store = PresetStore(self.path / 'presets')
+        outside = self.path / 'private.txt'
+        outside.write_text('Private local text')
+        (self.path / 'presets' / 'linked.txt').symlink_to(outside)
+        for name in ('../private', 'linked'):
+            self.context.args = [name]
+            await self.app.preset_command(self.update, self.context)
+            self.assertIn('Preset not found', self.message.reply_text.call_args.args[0])
+        with self.assertRaises(ValueError):
+            self.app.preset_store.save_text('linked', 'Replacement')
+        self.assertEqual(outside.read_text(), 'Private local text')
+        self.app.preset_store.save_text('quiet', 'Answer calmly.')
+        self.context.args = ['quiet']
+        await self.app.preset_command(self.update, self.context)
+        self.assertIn('Preset loaded', self.message.reply_text.call_args.args[0])
+
+    async def test_nonfinite_sampling_and_invalid_ratio_leave_settings_intact(self):
+        await self.settings(temperature=0.5, top_p=0.8, compact_tool_ratio_threshold=10.0)
+        self.provider.describe_controls = lambda settings: {
+            name: SimpleNamespace(supported=True) for name in ('temperature', 'top_p')}
+        for name, value in (('temperature', 'nan'), ('top_p', 'nan'),
+                            ('compact_tool_ratio_threshold', 'invalid')):
+            self.context.args = [name, value]
+            await self.app.param_command(self.update, self.context)
+            self.assertIn('Invalid', self.message.reply_text.call_args.args[0])
+        restored = await self.store.get_or_create_session(self.session, self.config.default_session_settings())
+        self.assertEqual((restored.temperature, restored.top_p, restored.compact_tool_ratio_threshold),
+                         (0.5, 0.8, 10.0))
+
     async def test_mode_command_obeys_chat_access_independently_of_trusted_users(self):
         self.telegram_config(whitelist=("200",), control_uids=("7",))
         self.context.args = ["agent"]
@@ -246,7 +291,7 @@ class TelegramWorkflowTests(BusinessTestCase):
         await self.app.rollback_command(self.update, self.context)
         self.assertEqual(await self.store.list_uncompacted_messages(self.session), [])
 
-    async def test_full_reset_clears_cached_persona_and_rejects_a_stale_tool_write(self):
+    async def test_full_reset_preserves_other_chat_persona_and_rejects_a_stale_tool_write(self):
         catalog = StickerCatalog(None, self.path / "stickers", persona_store=self.store)
         catalog._loaded = True
         catalog.entries_by_id = {"shared-sticker": object()}
@@ -254,16 +299,19 @@ class TelegramWorkflowTests(BusinessTestCase):
         persona = {"affect_profile": {"default_tone": "warm"}}
         await self.store.save_sticker_persona(self.session, persona)
         await self.store.save_sticker_persona("telegram:200", persona)
-        await catalog.adescribe_style_context(self.session)
-        await catalog.adescribe_style_context("telegram:200")
+        self.assertEqual((await catalog.adescribe_persona_context(self.session))['effective_persona'], persona)
+        self.assertEqual((await catalog.adescribe_persona_context("telegram:200"))['effective_persona'], persona)
         catalog.style_memory.preload(self.session, recent_sticker_ids=["old-choice"])
         scope = await self.store.get_scope(self.session)
         self.context.args = ["all"]
         await self.app.reset_command(self.update, self.context)
-        await catalog.adescribe_style_context(self.session)
-        self.assertIsNone(catalog.style_memory.get(self.session).session_persona)
-        self.assertEqual(list(catalog.style_memory.get(self.session).recent_sticker_ids), [])
-        self.assertEqual(catalog.style_memory.get("telegram:200").session_persona, persona)
+        restarted = StickerCatalog(None, self.path / "stickers", persona_store=self.store)
+        self.assertEqual((await catalog.adescribe_persona_context(self.session))['effective_persona'], {})
+        self.assertEqual((await catalog.adescribe_style_context(self.session))['recent_sticker_ids'], [])
+        self.assertEqual((await catalog.adescribe_persona_context("telegram:200"))['effective_persona'], persona)
+        for session in (self.session, "telegram:200"):
+            self.assertEqual(await catalog.adescribe_persona_context(session),
+                             await restarted.adescribe_persona_context(session))
         self.assertEqual(list(catalog.entries_by_id), ["shared-sticker"])
         stale_plan = StickerRetrievalPlan.from_payload({"intent_core": "hello",
             "persona_mode": "merge_and_remember", "persona": persona})
@@ -271,7 +319,7 @@ class TelegramWorkflowTests(BusinessTestCase):
             await catalog.aprepare_query_context(plan=stale_plan, session_id=self.session,
                 persist_persona=True, expected_scope=scope)
         self.assertIsNone(await self.store.get_sticker_persona(self.session))
-        self.assertIsNone(catalog.style_memory.get(self.session).session_persona)
+        self.assertEqual((await catalog.adescribe_persona_context(self.session))['effective_persona'], {})
 
     async def test_rollback_groups_tool_and_assistant_as_one_bot_block(self):
         first = await self.runtime.ingest_user_message(session_id=self.session, incoming_message=ConversationMessage.user_text("question"))
@@ -353,7 +401,7 @@ class TelegramWorkflowTests(BusinessTestCase):
         file_path.write_text("report")
         before = OutboundSticker(self.path / "before.webp", timing=StickerTiming.SEND_NOW)
         after = OutboundSticker(self.path / "after.webp", timing=StickerTiming.AFTER_FINAL)
-        renderer = SimpleNamespace(finalize=AsyncMock(), send_artifacts=AsyncMock(), send_stickers=AsyncMock(return_value=[]))
+        renderer = SimpleNamespace(finalize=AsyncMock(), send_artifacts=AsyncMock(return_value=[]), send_stickers=AsyncMock(return_value=[]))
         order = Mock()
         for name in ("finalize", "send_artifacts", "send_stickers"):
             order.attach_mock(getattr(renderer, name), name)

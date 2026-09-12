@@ -10,8 +10,30 @@ CREATE TABLE IF NOT EXISTS sessions (
     generation bigint NOT NULL DEFAULT 1,
     context_id bigint NOT NULL DEFAULT 1,
     revision bigint NOT NULL DEFAULT 1,
+    context_version bigint NOT NULL DEFAULT 0,
+    compaction_version bigint NOT NULL DEFAULT 0,
+    profile_refresh_version bigint NOT NULL DEFAULT 0,
     sticker_persona jsonb,
     updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Compressed image evidence, deduplicated per conversation. Canonical message
+-- revisions own these references through prompt retirement and resets, including
+-- prior revisions/generations retained for audit. Runtime caches are disposable.
+-- Physical audit deletion, not working-context retirement, governs byte removal.
+CREATE TABLE IF NOT EXISTS message_previews (
+    session_id text NOT NULL REFERENCES sessions(session_id),
+    reference text NOT NULL,
+    payload bytea NOT NULL,
+    PRIMARY KEY (session_id, reference)
+);
+
+CREATE TABLE IF NOT EXISTS provider_token_calibration (
+    provider text NOT NULL,
+    model text NOT NULL,
+    history_mode text NOT NULL,
+    multiplier double precision NOT NULL,
+    PRIMARY KEY (provider, model, history_mode)
 );
 
 -- A full reset retires agent personality/settings without erasing its audit state.
@@ -165,6 +187,8 @@ CREATE TABLE IF NOT EXISTS profile_facts (
     valid_from timestamptz,
     valid_to timestamptz,
     original_valid_to timestamptz,
+    retired_at timestamptz,
+    retirement_sources bigint[],
     source_ids bigint[] NOT NULL,
     source_revisions jsonb NOT NULL,
     valid boolean NOT NULL DEFAULT true,
@@ -176,6 +200,41 @@ CREATE INDEX IF NOT EXISTS profile_facts_actor ON profile_facts (session_id, gen
     WHERE valid;
 CREATE INDEX IF NOT EXISTS profile_facts_sources ON profile_facts USING gin (source_ids) WHERE valid;
 CREATE INDEX IF NOT EXISTS profile_facts_corrections ON profile_facts (supersedes) WHERE valid AND supersedes IS NOT NULL;
+
+-- Original text stays in message_revisions. Only the unprocessed source spans
+-- live here; a consumed row prevents indexing/rebuild from learning it twice.
+CREATE TABLE IF NOT EXISTS profile_inputs (
+    message_id bigint PRIMARY KEY REFERENCES messages(id),
+    session_id text NOT NULL REFERENCES sessions(session_id),
+    generation bigint NOT NULL,
+    source_revision integer NOT NULL,
+    actor_id text NOT NULL,
+    spans jsonb NOT NULL,
+    pending_bytes bigint NOT NULL
+);
+CREATE INDEX IF NOT EXISTS profile_inputs_pending ON profile_inputs (session_id, generation, message_id)
+    WHERE pending_bytes > 0;
+
+CREATE INDEX IF NOT EXISTS profile_facts_retirement_sources ON profile_facts USING gin (retirement_sources)
+    WHERE retired_at IS NOT NULL;
+CREATE TABLE IF NOT EXISTS profile_current (
+    session_id text NOT NULL REFERENCES sessions(session_id),
+    generation bigint NOT NULL,
+    actor_id text NOT NULL,
+    fact_ids bigint[] NOT NULL DEFAULT '{}',
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY(session_id,generation,actor_id)
+);
+CREATE TABLE IF NOT EXISTS profile_patches (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    session_id text NOT NULL REFERENCES sessions(session_id),
+    generation bigint NOT NULL,
+    source_ids bigint[] NOT NULL,
+    source_revisions jsonb NOT NULL,
+    patch jsonb NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS profile_patches_session ON profile_patches(session_id,id);
 
 CREATE TABLE IF NOT EXISTS jobs (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -202,4 +261,4 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS jobs_pending ON jobs (available_at, id) WHERE status IN ('pending', 'running');
 CREATE INDEX IF NOT EXISTS jobs_sources ON jobs USING gin (source_ids) WHERE status IN ('pending', 'running');
 
-INSERT INTO schema_version (version) VALUES (1) ON CONFLICT DO NOTHING;
+INSERT INTO schema_version (version) VALUES (3) ON CONFLICT DO NOTHING;

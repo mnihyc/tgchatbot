@@ -1,7 +1,6 @@
 """Exercise the real simple updater with disposable releases and mocked Docker/network."""
 from __future__ import annotations
 
-import hashlib
 import fcntl
 import io
 import json
@@ -150,9 +149,6 @@ class ReleaseUpdaterTests(unittest.TestCase):
                 info = tarfile.TarInfo(name)
                 info.size = len(contents)
                 archive.addfile(info, io.BytesIO(contents))
-        (directory / "SHA256SUMS").write_text("".join(
-            f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
-            for path in sorted(directory.glob("*.tar.gz"))))
 
     def run_update(self, target=None, *, success=True, **env):
         command = ["bash", str(self.install / "update.sh")]
@@ -215,12 +211,12 @@ class ReleaseUpdaterTests(unittest.TestCase):
         self.assertFalse(any("tgchatbot-linux-" in call[-1] for call in self.calls() if call[0] == "curl"))
         self.assert_simple_layout()
 
-    def test_verified_release_updater_takes_over_before_obsolete_activation_logic(self):
+    def test_bundled_release_updater_takes_over_before_obsolete_activation_logic(self):
         installed = self.install / 'update.sh'
         installed.write_text(installed.read_text().replace(
             'start() {', "start() { fail 'obsolete activation must never execute';", 1))
         result = self.run_update()
-        self.assertIn('Continuing with the verified release updater', result.stdout)
+        self.assertIn('Continuing with the release updater', result.stdout)
         self.assertEqual(installed.read_bytes(), (REPO / 'deploy' / 'update.sh').read_bytes())
         self.assertEqual(self.image_tag('tgchatbot:current'), 'v0.2.0')
         self.assertEqual(len([call for call in self.calls() if call[:2] == ['docker', 'build']]), 1)
@@ -260,7 +256,7 @@ class ReleaseUpdaterTests(unittest.TestCase):
         self.assertIn('retired-search', [call for call in calls if 'up' in call and 'bot' in call][-1])
         self.assert_data_preserved()
 
-    def test_bad_checksum_never_builds_or_stops_services(self):
+    def test_unreadable_bundle_never_builds_or_stops_services(self):
         archive = self.assets / "v0.2.0" / "tgchatbot-deploy-v0.2.0.tar.gz"
         archive.write_bytes(b"corrupted code bundle")
         self.run_update("v0.2.0", success=False)
@@ -285,7 +281,7 @@ class ReleaseUpdaterTests(unittest.TestCase):
         self.assertEqual(files['build/runtime-requirements.txt'], 'locked third-party dependencies fixture')
         self.assertFalse(any(call[:2] == ['docker', 'load'] for call in self.calls()))
         downloads = [call[-1].split('/')[-1] for call in self.calls() if call[0] == 'curl']
-        self.assertEqual(set(downloads), {'SHA256SUMS', 'tgchatbot-deploy-v0.2.0.tar.gz'})
+        self.assertEqual(set(downloads), {'tgchatbot-deploy-v0.2.0.tar.gz'})
         self.assert_data_preserved()
         self.assert_simple_layout()
 

@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 from tests.business_helpers import BusinessTestCase, ScriptedProvider
 from tgchatbot.core.memory import MemoryService
 from tgchatbot.core.runtime import AgentRuntime, CompactionModelRequestFailed
+from tgchatbot.storage.previews import PreviewCache
 from tgchatbot.domain.models import (
     ChatMode, ConversationMessage, MessagePart, MessageRole, PartKind,
     PromptInjectionMode, ProviderResponse, StickerMode, ToolCall, ToolHistoryMode,
@@ -141,7 +142,7 @@ class RuntimeWorkflowTests(BusinessTestCase):
 
     async def test_same_provider_native_history_and_translated_mode_are_distinct(self):
         settings = await self.settings(tool_history_mode=ToolHistoryMode.NATIVE_SAME_PROVIDER)
-        native = {"provider": "openai", "items": [{"type": "function_call", "call_id": "c1"}]}
+        native = {"provider": "openai", "model": settings.model, "items": [{"type": "function_call", "call_id": "c1"}]}
         await self.runtime.record_tool_observation(session_id=self.session, name="shell_exec", phase="call", payload={"call_id": "c1"}, provider_name="openai", metadata_update={"provider_native": native})
         state = await self.runtime._get_live_state(self.session)
         history = self.runtime._build_provider_history(state, settings=settings, provider_name="openai")
@@ -387,8 +388,9 @@ class ProfileContextWorkflowTests(BusinessTestCase):
             rendered = json.dumps(response_payload, ensure_ascii=False, default=str)
             self.assertIn(self.claim, rendered)
             self.assertIn("2026-01-02T11:04:05+08:00", rendered)
-            facts = [fact for profile in response_payload["profiles"] for fact in profile["facts"]]
-            self.assertEqual([(fact["subject_actor_id"], fact["source_ids"]) for fact in facts],
+            facts = [(profile["actor_id"], fact["source_ids"])
+                     for profile in response_payload["profiles"] for fact in profile["facts"]]
+            self.assertEqual(facts,
                              [(self.actor, [source.db_id])])
             await self.runtime.record_assistant_text(session_id=self.session, text=first.text)
             await self.turn("And for tomorrow?", 3)
@@ -457,7 +459,7 @@ class ProfileContextWorkflowTests(BusinessTestCase):
         memory = MemoryService(store, SimpleNamespace(enabled=False, space_id="fixture"))
         provider = ScriptedProvider(responses=[ProviderResponse(final_text="Still remembered.")])
         runtime = AgentRuntime(config=self.config, store=store, tool_registry=self.tools,
-            providers={"openai": provider}, memory=memory, preview_cache=self.preview_cache)
+            providers={"openai": provider}, memory=memory, preview_cache=PreviewCache(store, max_bytes=self.preview_cache.max_bytes))
         with patch.object(memory, "fetch_profiles", wraps=memory.fetch_profiles) as fetch:
             await runtime.run_turn(session_id=self.session, user_display_name="Alex",
                                    incoming_message=self.incoming("Continue after restart.", 5))

@@ -18,8 +18,8 @@ cd "$root"
 repository=${TGCHATBOT_RELEASE_REPO:-mnihyc/tgchatbot}
 timeout=${TGCHATBOT_HEALTH_TIMEOUT:-180}
 [[ $repository =~ ^[0-9A-Za-z_.-]+/[0-9A-Za-z_.-]+$ ]] || fail 'Invalid release repository'
-[[ $timeout =~ ^[1-9][0-9]{1,3}$ ]] && ((timeout <= 3600)) || fail 'Health timeout must be 10..3600 seconds'
-for tool in docker curl sha256sum tar flock cmp; do command -v "$tool" >/dev/null || fail "Missing required tool: $tool"; done
+[[ $timeout =~ ^[1-9][0-9]*$ ]] || fail 'Health timeout must be a positive number of seconds'
+for tool in docker curl tar flock cmp; do command -v "$tool" >/dev/null || fail "Missing required tool: $tool"; done
 docker compose version >/dev/null || fail 'Docker Compose v2 with up --wait support is required'
 mkdir -p tmp/update data
 exec 9>tmp/update.lock
@@ -27,19 +27,13 @@ flock -n 9 || fail 'Another update is running'
 work=$root/tmp/update
 # Only this updater's fixed scratch files are removed, including after failure.
 cleanup() {
-  rm -f -- "$work/SHA256SUMS" "$work/deploy.tar.gz" \
+  rm -f -- "$work/deploy.tar.gz" \
     "$work/compose.next.yml" "$work/compose.before.yml" "$work/update.next.sh" "$work/update.install.sh"
   rm -rf -- "$work/build-context"
 }
 trap cleanup EXIT
 cleanup
 download() { curl --fail --location --retry 3 --connect-timeout 15 --output "$2" "$1"; }
-verify() {
-  local expected
-  expected=$(awk -v name="$1" '$2 == name { print $1; count++ } END { if (count != 1) exit 1 }' "$work/SHA256SUMS") || return 1
-  [[ $expected =~ ^[0-9a-fA-F]{64}$ ]] || return 1
-  printf '%s  %s\n' "$expected" "$2" | sha256sum --check --strict -
-}
 # Service changes belong to the selected release's Compose definition. Exclude
 # the separately managed database, including when restoring an older release.
 application_services() {
@@ -86,9 +80,7 @@ else
   base=https://github.com/$repository/releases/download/$target
   bundle=tgchatbot-deploy-$target.tar.gz
   log "Downloading release $target deployment files"
-  download "$base/SHA256SUMS" "$work/SHA256SUMS"
   download "$base/$bundle" "$work/deploy.tar.gz"
-  verify "$bundle" "$work/deploy.tar.gz" || fail 'Deployment checksum mismatch'
   [[ $(tar -xOzf "$work/deploy.tar.gz" RELEASE_TAG) == "$target" ]] || fail 'Bundle tag mismatch'
   commit=$(tar -xOzf "$work/deploy.tar.gz" RELEASE_COMMIT)
   [[ $commit =~ ^[0-9a-f]{40}$ ]] || fail 'Invalid release commit'
@@ -103,7 +95,7 @@ else
   # competing updater wins, it exits without changing application services.
   if ! cmp -s "$root/update.sh" "$work/update.next.sh"; then
     install_updater
-    log 'Continuing with the verified release updater'
+    log 'Continuing with the release updater'
     exec bash "$root/update.sh" "$target"
   fi
   [[ -f compose.yml ]] || cp "$work/compose.next.yml" compose.yml

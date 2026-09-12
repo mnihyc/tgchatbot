@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 CARD_PROMPT = """Describe this sticker as evidence for a conversational agent choosing how to express itself.
 
@@ -116,12 +116,25 @@ class Corrections(BaseModel):
 
 
 def validate_corrections(value: dict) -> dict:
-    Corrections.model_validate(value)
-    return copy.deepcopy(value)
+    result = Corrections.model_validate(value).model_dump(exclude_unset=True)
+    # Corrections are partial cards. Validate supplied fields with the same model
+    # as generated cards before staging or making a model request.
+    def fields(patch, model):
+        if not isinstance(patch, dict):
+            raise ValueError('Card corrections must be objects')
+        for name, item in patch.items():
+            if name not in model.model_fields:
+                raise ValueError(f'Unknown card correction field: {name}')
+            if model is Card and name == 'compatibility':
+                fields(item, Compatibility)
+            else:
+                adapter = TypeAdapter(model.model_fields[name].rebuild_annotation())
+                patch[name] = adapter.dump_python(adapter.validate_python(item), mode='json')
+    fields(result.get('card', {}), Card)
+    return result
 
 
 def effective_card(generated: dict, corrections: dict) -> dict:
-    validate_corrections(corrections)
     result = copy.deepcopy(generated)
     for name, value in corrections.get('card', {}).items():
         if name == 'compatibility' and isinstance(value, dict):
@@ -135,3 +148,11 @@ def card_hash(card: dict) -> str:
 
 def reading_texts(card: dict) -> list[str]:
     return [reading['meaning'] + '\nContext: ' + reading['context'] for reading in card['readings']]
+
+
+def appearance_text(card: dict | None) -> str:
+    """Best-effort descriptive input when the embedding route cannot see pixels."""
+    card = card or {}
+    return '\n'.join(f'{label}: {card[key].strip()}' for key, label in (
+        ('appearance', 'Appearance'), ('action', 'Depicted action'), ('caption', 'Caption'))
+        if card.get(key, '').strip())

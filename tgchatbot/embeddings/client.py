@@ -2,7 +2,7 @@
 
 API contracts: https://ai.google.dev/api/embeddings and
 https://ai.google.dev/gemini-api/docs/batch-api . Gemini 001 deliberately uses
-the flat fields: the service ignored nested configuration in our live probe.
+the flat request fields required by that model's API.
 """
 from __future__ import annotations
 

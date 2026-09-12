@@ -417,7 +417,7 @@ class ChatCompletionsContractTests(unittest.IsolatedAsyncioTestCase):
         provider = await self.make_provider(name='deepseek')
         body = self.answer('Visible introduction', reasoning_content='private continuation', tool_calls=[{'id': 'a', 'type': 'function', 'function': {'name': 'lookup', 'arguments': '{}'}}])
         native = provider.persistent_history_items(provider._parse_response(body))
-        message = ConversationMessage(role=MessageRole.TOOL, name='lookup', parts=[MessagePart(kind=PartKind.TEXT, text='lookup query')], metadata={'tool_phase': 'call', 'tool_provider': 'deepseek', 'tool_payload': {'call_id': 'a', 'arguments': {}}, 'provider_native': {'provider': 'deepseek', 'items': native}})
+        message = ConversationMessage(role=MessageRole.TOOL, name='lookup', parts=[MessagePart(kind=PartKind.TEXT, text='lookup query')], metadata={'tool_phase': 'call', 'tool_provider': 'deepseek', 'tool_payload': {'call_id': 'a', 'arguments': {}}, 'provider_native': {'provider': 'deepseek', 'model': self.settings(provider).model, 'items': native}})
         runtime = object.__new__(AgentRuntime)
         settings = replace(self.settings(provider), tool_history_mode=ToolHistoryMode.NATIVE_SAME_PROVIDER)
         same = runtime._history_message_for_provider(settings=settings, provider_name='deepseek', message=message)
@@ -461,6 +461,7 @@ class AllAdaptersContractTests(unittest.IsolatedAsyncioTestCase):
                     provider._client = httpx.AsyncClient(base_url='https://example.invalid/', transport=httpx.MockTransport(handler))
                     try:
                         runtime = object.__new__(AgentRuntime)
+                        runtime.config = config
                         result = await runtime._generate_structured_candidate(provider, config.default_session_settings(), [ConversationMessage.user_text('Please use English')], mode='episode')
                         self.assertEqual(result['user_profile'], ['Use English'])
                         payload = captured[0]

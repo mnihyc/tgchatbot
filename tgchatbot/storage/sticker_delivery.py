@@ -30,12 +30,14 @@ class StickerDeliveryStore:
                  sticker_id,timing,Jsonb(metadata or {})))
             row = await (await conn.execute('SELECT * FROM sticker_deliveries WHERE operation_id=%s',
                 (operation_id,))).fetchone()
-            if (row['session_id'],row['generation'],row['context_id'],row['sticker_id']) != (
-                    session_id,scope['generation'],scope['context_id'],sticker_id):
+            if (row['session_id'],row['generation'],row['context_id'],row['revision'],row['sticker_id'],row['timing'],
+                    row['metadata'].get('content_sha256')) != (
+                    session_id,scope['generation'],scope['context_id'],scope['revision'],sticker_id,timing,
+                    (metadata or {}).get('content_sha256')):
                 raise ValueError('Delivery operation already belongs to another selection')
             return row
 
-    async def begin(self, operation_id):
+    async def begin(self, operation_id, *, sticker_id=None, content_sha256=None):
         """Only the winner may send. A repeated/unknown operation never retries."""
         async with self.store.pool.connection() as conn:
             row = await (await conn.execute('SELECT * FROM sticker_deliveries WHERE operation_id=%s',
@@ -45,6 +47,10 @@ class StickerDeliveryStore:
             scope = await self.store._session(conn, row['session_id'], lock=True)
             row = await (await conn.execute('SELECT * FROM sticker_deliveries WHERE operation_id=%s FOR UPDATE',
                 (operation_id,))).fetchone()
+            if sticker_id is not None and (sticker_id != row['sticker_id'] or (
+                    row['metadata'].get('content_sha256') is not None and
+                    content_sha256 != row['metadata']['content_sha256'])):
+                raise ValueError('Delivery bytes do not belong to the queued selection')
             if row['status'] != 'queued':
                 return {**row, 'may_send': False}
             stale = any(row[key] != scope[key] for key in ('generation','context_id','revision'))

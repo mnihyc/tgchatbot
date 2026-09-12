@@ -87,7 +87,7 @@ def build_compaction_prompt(*, mode: str) -> str:
         'digest': 'scope, interaction_modes_seen, participants, topics, user_profile, recurring_requests_or_shared_threads, why_history_matters_now, durable_state, important_changes, decisions, open_loops, artifacts, uncertainties, parent_refs',
     }[mode]
     common_lines = [
-        'Use the actual participant username or a stable short label instead of repeating generic user when different people played different roles. If involved, keep effective individual users separated and use more bullet points to describe each. ',
+        'Use stable actor IDs supplied by source provenance for participants and every actor-specific claim; names may be included as observations but are not identity. Each user_profile item must begin with its subject actor ID followed by a colon. If ownership is unknown, retain that uncertainty without assigning the claim to a named participant. ',
         'There are two common source situations: (a) task_execution: the user is trying to solve, inspect, fix, or produce something, often with tool use; (b) chat_or_sharing: the user is chatting normally, reacting, telling a story, or sharing something, often without a concrete task.',
         'Choose interaction_mode carefully. Use mixed only when both situations materially coexist in the same slice.',
         'For user_intent_or_shared_context: in task_execution, record the ask or problem to solve; in chat_or_sharing, record what and which user shared, reacted to, wanted acknowledged, or wanted the assistant to keep in mind.',
@@ -134,9 +134,9 @@ Task-style example:
 {
   "scope": "Tool-heavy span where the user wanted a replay-payload bug fixed so the bot could stop failing at runtime.",
   "interaction_mode": "task_execution",
-  "participants": ["user: name", "user: name2", "assistant", "tool: name"],
+  "participants": ["telegram:user:101", "telegram:user:202", "assistant", "tool:shell_exec"],
   "topics": ["openai replay", "reasoning items", "payload repair"],
-  "user_profile": ["User prefers narrow fixes over broad redesigns."],
+  "user_profile": ["telegram:user:101: Prefers narrow fixes over broad redesigns."],
   "user_intent_or_shared_context": ["Repair the replay payload bug in the latest patch."],
   "why_it_mattered": ["The bot was failing with 400 errors and needed a minimal corrective patch."],
   "assistant_strategy": ["Traced persisted reasoning items, patched replay serialization, and kept encrypted reasoning handles while dropping clear-text summaries."],
@@ -155,10 +155,10 @@ Mixed example:
 {
   "scope": "Tool-heavy span where the user shared a log excerpt and also wanted the assistant to inspect it and explain the failure path.",
   "interaction_mode": "mixed",
-  "participants": ["user: name", "user: name2", "assistant", "tool: name"],
+  "participants": ["telegram:user:101", "telegram:user:202", "assistant", "tool:shell_exec"],
   "topics": ["log analysis", "runtime failure", "explanation"],
   "user_profile": [],
-  "user_intent_or_shared_context": ["The user(name) shared runtime logs.", "The user(name) wanted the assistant to reconstruct the failure path from those logs."],
+  "user_intent_or_shared_context": ["telegram:user:101 shared runtime logs.", "telegram:user:101 wanted the assistant to reconstruct the failure path from those logs."],
   "why_it_mattered": ["The shared logs were the only concrete evidence for the regression and the user wanted a precise explanation rather than guesswork."],
   "assistant_strategy": ["Read the logs first, reconstructed the sequence, then explained the concrete failure mechanism."],
   "tool_timeline": ["file inspection -> read uploaded logs -> extracted the failing call chain"],
@@ -175,16 +175,16 @@ Task-style example:
   "scope": "Interaction slice where the user asked for a diff between two patches so they could inspect exactly what changed and why.",
   "interaction_mode": "task_execution",
   "tool_usage": [
-    "user(name) -> requested file inspection -> tool(shell_exec) locate OpenAI replay payload builder -> confirmed reasoning items were missing required summary field",
-    "user(name) -> requested code patch -> keep encrypted_content and send summary as an empty list -> preserves API shape without extra token cost -> tool(shell_exec) finished patch"
+    "telegram:user:101 -> requested file inspection -> tool(shell_exec) locate OpenAI replay payload builder -> confirmed reasoning items were missing required summary field",
+    "telegram:user:101 -> requested code patch -> keep encrypted_content and send summary as an empty list -> preserves API shape without extra token cost -> tool(shell_exec) finished patch"
   ],
-  "participants": ["user: name", "user: name2", "assistant"],
+  "participants": ["telegram:user:101", "telegram:user:202", "assistant"],
   "topics": ["patch diff", "regression triage", "verification"],
-  "user_profile": ["User(name) wants precise, inspectable patch artifacts rather than verbal assurances."],
+  "user_profile": ["telegram:user:101: Wants precise, inspectable patch artifacts rather than verbal assurances."],
   "user_intent_or_shared_context": ["Produce the diff between the previous patch and the new patch."],
   "why_it_mattered": ["The user wanted to verify the exact changes before trusting the fix."],
   "interaction_timeline": [
-    "user(name) -> requested a diff for the newest patch pair -> narrowed the task to artifact comparison",
+    "telegram:user:101 -> requested a diff for the newest patch pair -> narrowed the task to artifact comparison",
     "assistant -> generated a unified diff and surfaced only the meaningful source-file changes -> gave the user something directly auditable"
   ],
   "results_or_takeaways": ["A unified diff artifact was produced for the requested patch pair."],
@@ -199,13 +199,13 @@ Chat/sharing example:
   "scope": "Conversation slice where the user shared an update and the assistant mainly acknowledged, clarified, and preserved the important context.",
   "interaction_mode": "chat_or_sharing",
   "tool_usage": [],
-  "participants": ["user: name", "user: name2", "assistant"],
+  "participants": ["telegram:user:101", "telegram:user:202", "assistant"],
   "topics": ["status update", "conversation continuity", "shared context"],
   "user_profile": [],
-  "user_intent_or_shared_context": ["The user(name) shared a status update rather than asking for a concrete task."],
+  "user_intent_or_shared_context": ["telegram:user:101 shared a status update rather than asking for a concrete task."],
   "why_it_mattered": ["The update was worth preserving because it changed the conversation context going forward."],
   "interaction_timeline": [
-    "user(name) -> shared an update or observation -> introduced new conversational context",
+    "telegram:user:101 -> shared an update or observation -> introduced new conversational context",
     "assistant -> acknowledged and clarified the important point -> preserved what should matter later"
   ],
   "results_or_takeaways": ["The important shared context was captured without turning it into a fake task or a tool-output summary."],
@@ -219,9 +219,9 @@ Chat/sharing example:
 {
   "scope": "Digest of earlier runtime-compaction episodes that still matters because the same conversation-memory pipeline remains under active revision.",
   "interaction_modes_seen": ["task_execution", "chat_or_sharing"],
-  "participants": ["user: name", "user: name2", "assistant"],
+  "participants": ["telegram:user:101", "telegram:user:202", "assistant"],
   "topics": ["compaction", "runtime regressions", "patch iteration"],
-  "user_profile": ["User(name) expects design changes to be reflected in concrete code patches and dislikes hidden heuristic logic."],
+  "user_profile": ["telegram:user:101: Expects design changes to be reflected in concrete code patches and dislikes hidden heuristic logic."],
   "recurring_requests_or_shared_threads": ["Keep the compaction design aligned with the stated architecture while removing misleading or low-quality logic."],
   "why_history_matters_now": ["The same compaction pipeline is still being revised, so earlier regressions, decisions, and conversational expectations remain relevant to new patches."],
   "durable_state": ["Compaction uses structured-output schemas for L0, L1, and L2 blocks and stores deterministic block metadata separately from rendered text."],

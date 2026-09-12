@@ -69,6 +69,17 @@ class DesktopExportReading(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 desktop_message(record(1, text), ExportChat({}, None), chat_id=42)
 
+    def test_naive_export_time_uses_configured_zone_and_unix_time_stays_authoritative(self):
+        original = record(1, date='2025-01-01T08:00:00')
+        expected = desktop_message(original, ExportChat({}, None), chat_id=42).metadata['sent_at']
+        del original['date_unixtime']
+        rebuilt = desktop_message(original, ExportChat({}, None), chat_id=42)
+        self.assertEqual(rebuilt.metadata['sent_at'], expected)
+        explicit = desktop_message(original, ExportChat({}, None), chat_id=42, timezone='UTC')
+        self.assertEqual(explicit.metadata['sent_at'], '2025-01-01T08:00:00+00:00')
+        original['date'] = '2025-01-01T03:00:00+03:00'
+        self.assertEqual(desktop_message(original, ExportChat({}, None), chat_id=42).metadata['sent_at'], expected)
+
 
 @unittest.skipUnless(os.environ.get('TEST_DATABASE_URL'), 'requires disposable PostgreSQL/pgvector')
 class DesktopImportWorkflows(unittest.IsolatedAsyncioTestCase):

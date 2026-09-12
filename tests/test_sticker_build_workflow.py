@@ -118,7 +118,8 @@ class StickerBuildWorkflowTests(unittest.IsolatedAsyncioTestCase):
             await self.catalog.activate(failed.revision_id)
         self.embeddings.fail_images = False
         resumed = CatalogBuilder(self.catalog, self.provider, self.embeddings,
-                                 config=replace(BuildConfig(), concurrency=2, request_timeout_s=900))
+                                 config=replace(BuildConfig(), concurrency=2, request_timeout_s=900,
+                                                max_output_tokens=16384))
         result = await resumed.build(self.root, resume=failed.revision_id)
         self.assertTrue(result.active)
         self.assertEqual(len(self.provider.calls), 2)
@@ -178,15 +179,49 @@ class StickerBuildWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.catalog.get_asset(new_id)).aliases[0].path, 'pack/one.png')
         self.assertEqual(content_hash(self.root/'pack/one.png'), new_id.removeprefix('sha256:'))
 
-    async def test_text_only_route_keeps_reading_search_without_dropping_media_silently(self):
-        self.picture('pack/one.png', 'red')
+    async def test_text_only_route_uses_explicit_description_fallback_and_keeps_real_evidence(self):
+        from tgchatbot.stickers.catalog import StickerCatalog
+        from tgchatbot.stickers.plan import StickerRetrievalPlan
+        from tgchatbot.domain.models import PartKind
+        from tgchatbot.tools.sticker_send import _candidate_payload
+        from unittest.mock import AsyncMock
+        target = self.picture('pack/one.png', 'red')
         self.embeddings.supports_media = False
         await self.builder.build(self.root)
         asset = (await self.catalog.load_snapshot()).assets[0]
-        self.assertIsNone(asset.image_vector)
+        self.assertIsNotNone(asset.image_vector)
+        self.assertEqual(asset.provenance['visual_embedding_source'], 'description')
         self.assertEqual(asset.reading_vectors.shape, (1, 3))
         self.assertTrue(all(not document.media for call in self.embeddings.calls for document in call))
         self.assertTrue(any(part.data_b64 for part in self.provider.calls[0]['messages'][0].parts))
+        self.assertIn(CARD['appearance'], self.embeddings.calls[-1][0].text)
+        self.embeddings.enabled = True
+        self.embeddings.config.space_id = self.embeddings.space_id
+        self.embeddings.embed_query = AsyncMock(return_value=asset.image_vector)
+        catalog = StickerCatalog(self.catalog, self.root, embedding_client=self.embeddings)
+        plan = StickerRetrievalPlan.from_payload({'intent_core': 'A friendly greeting',
+            'persona_mode': 'use_once', 'persona': {'visual_identity': {'rendering_style': 'simple drawing'}}})
+        matches = await catalog.achoose(plan=plan)
+        self.assertEqual(matches[0].entry.sticker_id, target)
+        self.assertEqual(_candidate_payload(matches[0])['appearance_embedding_source'], 'description')
+        self.assertTrue(any(part.kind == PartKind.IMAGE for part in await catalog.evidence(matches)))
+
+        calls = len(self.embeddings.calls)
+        await self.builder.build(self.root, corrections={target: {'card': {'appearance': 'A vivid blue bird'}}})
+        self.assertEqual(len(self.embeddings.calls), calls + 1)
+        self.assertEqual(len(self.provider.calls), 1)
+        self.assertIn('A vivid blue bird', self.embeddings.calls[-1][0].text)
+
+    async def test_disabled_visual_channel_and_blank_description_need_no_fallback_vector(self):
+        self.picture('pack/one.png', 'red')
+        self.embeddings.supports_media = False
+        self.provider.card.update(appearance='\t', action='\n', caption='')
+        await self.builder.build(self.root)
+        self.assertIsNone((await self.catalog.load_snapshot()).assets[0].image_vector)
+        disabled = CatalogBuilder(self.catalog, self.provider, self.embeddings,
+                                  config=replace(BuildConfig(), image_embeddings=False))
+        await disabled.build(self.root)
+        self.assertIsNone((await self.catalog.load_snapshot()).assets[0].image_vector)
 
     async def vector_bytes(self):
         async with self.store.pool.connection() as conn:
@@ -244,3 +279,58 @@ class StickerBuildWorkflowTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len((await catalog.load_snapshot()).assets), 1)
         finally:
             await narrow_store.close()
+
+    async def test_obsolete_resume_rejects_before_purchasing_more_work(self):
+        target = self.picture('pack/one.png', 'red')
+        self.embeddings.fail_images = True
+        failed = await self.builder.build(self.root)
+        self.assertFalse(failed.active)
+        self.embeddings.fail_images = False
+        current = await self.builder.build(self.root)
+        calls = len(self.embeddings.calls)
+        with self.assertRaises(CatalogConflict):
+            await self.builder.build(self.root, resume=failed.revision_id)
+        self.assertEqual(len(self.embeddings.calls), calls)
+        self.assertEqual(await self.catalog.active_revision_id(), current.revision_id)
+        self.assertEqual((await self.catalog.get_asset(target)).state, 'ready')
+
+    async def test_invalid_corrections_fail_before_annotation_and_staging(self):
+        target = self.picture('pack/one.png', 'red')
+        for card in ({'caption': []}, {'compatibility': {'harshness_level': 9}},
+                     {'unrecognized_caption_field': 'hello'}, {'readings': ['not a reading']}):
+            with self.subTest(card=card), self.assertRaises(ValueError):
+                await self.builder.build(self.root, corrections={target: {'card': card}})
+        self.assertEqual(self.provider.calls, [])
+        self.assertEqual(self.embeddings.calls, [])
+        async with self.store.pool.connection() as conn:
+            row = await (await conn.execute('SELECT count(*) AS total FROM sticker_catalog_revisions')).fetchone()
+        self.assertEqual(row['total'], 0)
+
+    async def test_mixed_formats_report_unsupported_files_without_rejecting_valid_assets(self):
+        target = self.picture('pack/one.png', 'red')
+        (self.root / 'pack/animated.tgs').write_bytes(b'synthetic unsupported vector sticker')
+        result = await self.builder.build(self.root)
+        self.assertTrue(result.active)
+        self.assertEqual(result.unsupported_files, ('pack/animated.tgs',))
+        self.assertEqual({asset.asset_id for asset in (await self.catalog.load_snapshot()).assets}, {target})
+        self.assertEqual(len(self.provider.calls), 1)
+
+    async def test_unsupported_only_selection_does_not_append_unrelated_new_assets(self):
+        self.picture('existing/one.png', 'red')
+        current = await self.builder.build(self.root)
+        self.picture('new/two.png', 'blue')
+        (self.root / 'vectors').mkdir()
+        (self.root / 'vectors/animated.tgs').write_bytes(b'synthetic unsupported vector sticker')
+        for selection in ({'regenerate_files': ['vectors/animated.tgs']}, {'regenerate_packs': ['vectors']}):
+            with self.subTest(selection=selection), self.assertRaisesRegex(ValueError, 'No processable'):
+                await self.builder.build(self.root, **selection)
+        self.assertEqual(await self.catalog.active_revision_id(), current.revision_id)
+        self.assertEqual(len(self.provider.calls), 1)
+
+    async def test_unsupported_only_empty_install_does_not_claim_catalog_activation(self):
+        (self.root / 'animated.tgs').write_bytes(b'synthetic unsupported vector sticker')
+        result = await self.builder.build(self.root)
+        self.assertFalse(result.active)
+        self.assertIsNone(result.revision_id)
+        self.assertEqual(result.unsupported_files, ('animated.tgs',))
+        self.assertEqual(len(self.provider.calls), 0)

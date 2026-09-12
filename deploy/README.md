@@ -6,9 +6,10 @@ installation and survive application updates.
 
 ## Install and update
 
-You need Linux, Docker with Compose v2, Bash, curl, tar, gzip, sha256sum and flock.
-Download and unpack the release bundle, or use `deploy/update.sh` from the checkout.
-Run the updater in the directory that will hold your deployment.
+You need Linux, Docker with Compose v2, Bash, curl, tar, gzip and flock.
+Download and unpack the release bundle. Alternatively, copy `deploy/update.sh`
+from the checkout into a separate deployment directory. The updater keeps the
+installation beside its own file.
 
 ```sh
 ./update.sh                 # install or update to the latest release
@@ -39,25 +40,22 @@ setting is required. The bundled database exposes no host port.
 
 ## Upgrading older installations
 
-For v0.2.0 or earlier, refresh the updater once before upgrading. Run this from
-the existing deployment directory:
+To refresh an older updater, download the latest deployment bundle and extract
+only `update.sh` into the existing deployment directory:
 
 ```sh
-curl -fL https://github.com/mnihyc/tgchatbot/releases/latest/download/update.sh -o update.sh.new &&
-chmod 755 update.sh.new &&
-mv update.sh.new update.sh &&
+tar -xzf /path/to/tgchatbot-deploy-vX.Y.Z.tar.gz update.sh
 ./update.sh
 ```
 
 Keep the existing `compose.yml` until the updater runs; it is needed for service
 cleanup and rollback. Keep `.env` and `data/` in place.
 
-- Upgrading from v0.2.0 retains PostgreSQL conversation data. The replacement
-  sticker catalog must be built explicitly from original media. Legacy sticker
-  indexes are neither imported nor deleted.
-- Upgrading from v0.1.5 or earlier starts a fresh PostgreSQL conversation database;
-  legacy SQLite history is not migrated. Keep the original files. Those older
-  versions cannot validate the PostgreSQL schema for automatic rollback.
+This version requires a fresh conversation schema. An older database is rejected
+without changing its records. Automatic database migration is not provided;
+keep the existing installation and its backups when preparing a new database.
+Original Telegram Desktop exports can be imported into the new database, and
+the sticker catalog can be rebuilt from original media.
 
 ## Retained data
 

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, fields
 import json
 from pathlib import Path
@@ -112,12 +112,21 @@ async def coverage(store: PostgresStore, session_id: str, scope: dict[str, int],
             intervals: dict[int, list[tuple[int, int]]] = {mid: [] for mid in eligible}
             if eligible:
                 # Stream derivative rows too: a long original can have many excerpts.
+                # This audit consumes the entire cursor. Plan for that work,
+                # rather than optimizing a small initial fetch; the setting
+                # ends with this page's transaction.
+                await conn.execute('SET LOCAL cursor_tuple_fraction=1')
                 async with conn.cursor(name=f'coverage_{uuid.uuid4().hex}') as cursor:
                     cursor.itersize = options.page_size
-                    await cursor.execute('''SELECT source_ids,source_revisions,spans FROM excerpts
-                        WHERE session_id=%s AND generation=%s AND valid AND embedding IS NOT NULL
-                        AND model=%s AND source_ids && %s::bigint[]''',
-                        (session_id, scope['generation'], space_id, list(eligible)))
+                    # One containment probe per original keeps the existing
+                    # source index selective. An excerpt matching several
+                    # originals still contributes its exact spans only once.
+                    await cursor.execute('''SELECT DISTINCT e.id,e.source_ids,e.source_revisions,e.spans
+                        FROM unnest(%s::bigint[]) wanted(message_id)
+                        JOIN excerpts e ON e.source_ids @> ARRAY[wanted.message_id]
+                        WHERE e.session_id=%s AND e.generation=%s AND e.valid AND e.embedding IS NOT NULL
+                        AND e.model=%s''',
+                        (list(eligible), session_id, scope['generation'], space_id))
                     async for excerpt in cursor:
                         if excerpt['spans']:
                             spans = excerpt['spans']
@@ -190,12 +199,18 @@ async def status_records(store: PostgresStore, space_id: str, session_id: str | 
             retired['jobs_truncated'] = retired['count'] > len(retired['jobs'])
             tails = (await (await conn.execute('SELECT count(*) AS count FROM excerpt_tails WHERE session_id=%s AND generation=%s',
                                               (chat, scope['generation']))).fetchone())['count']
+            profile_material = await (await conn.execute('''SELECT count(*) AS sources,
+                COALESCE(sum(pending_bytes),0) AS bytes FROM profile_inputs
+                WHERE session_id=%s AND generation=%s AND pending_bytes>0''',
+                (chat, scope['generation']))).fetchone()
+            profile_material['bytes'] = int(profile_material['bytes'])
         yield {'type': 'status', 'session_id': chat, **scope, 'selected_space_id': space_id,
                'coverage': covered, 'jobs': await store.job_status(chat), 'excerpt_spaces': spaces,
                'job_spaces': pending_spaces, 'batch_jobs': batches[:options.status_job_limit],
                'batch_jobs_limit': options.status_job_limit,
                'batch_jobs_truncated': len(batches) > options.status_job_limit,
-               'retired_batch_slots': retired, 'pending_excerpt_tails': tails}
+               'retired_batch_slots': retired, 'pending_excerpt_tails': tails,
+               'pending_profile_material': profile_material}
 
 
 async def _check_unfinished_batches(store: PostgresStore, session_id: str, scope: dict[str, int], space_id: str) -> None:
@@ -281,7 +296,7 @@ async def audit_records(store: PostgresStore, session_id: str, *, message_id: in
 async def audit_state_records(store: PostgresStore, session_id: str, *,
                               generation: int | None = None,
                               options: OperationsConfig | None = None) -> AsyncIterator[dict[str, Any]]:
-    """Operator-only retired personality snapshots and unresolved hosted operations."""
+    """Operator-only personality, profile patch and hosted operation audit."""
     options = options if options is not None else from_env(OperationsConfig, 'MEMORY_OPERATIONS')
     await existing_scope(store, session_id)
     after = 0
@@ -298,6 +313,17 @@ async def audit_state_records(store: PostgresStore, session_id: str, *,
     after = 0
     while True:
         async with store.pool.connection() as conn:
+            rows = await (await conn.execute('''SELECT * FROM profile_patches WHERE session_id=%s
+                AND (%s::bigint IS NULL OR generation=%s) AND id>%s ORDER BY id LIMIT %s''',
+                (session_id, generation, generation, after, options.page_size))).fetchall()
+        if not rows:
+            break
+        for row in rows:
+            yield {'type': 'profile_patch', **row}
+        after = rows[-1]['id']
+    after = 0
+    while True:
+        async with store.pool.connection() as conn:
             rows = await (await conn.execute('''SELECT id,session_id,generation,status,payload,created_at,error
                 FROM jobs WHERE session_id=%s AND kind='embedding_batch'
                 AND (payload ? 'name' OR payload->>'phase' IN ('submitting','polling'))
@@ -310,13 +336,12 @@ async def audit_state_records(store: PostgresStore, session_id: str, *,
         after = rows[-1]['id']
 
 
-async def work(store: PostgresStore, config, embedding_config: EmbeddingConfig, *, batch: bool, once: bool) -> dict[str, Any]:
+@asynccontextmanager
+async def learning_resources(store: PostgresStore, config, embedding_config: EmbeddingConfig, *, batch: bool):
     # Lazy imports keep inspection/requeue commands free of generation clients.
     from tgchatbot.core.memory_worker import MemoryWorker
     from tgchatbot.providers.factory import build_providers
-    if not embedding_config.enabled:
-        raise ValueError('Embedding credentials are unavailable; status and lexical retrieval remain available')
-    if batch and embedding_config.provider != 'gemini':
+    if batch and (not embedding_config.enabled or embedding_config.provider != 'gemini'):
         raise ValueError('--batch requires the explicitly configured native Gemini embedding provider')
     async with AsyncExitStack() as stack:
         embeddings = EmbeddingClient(embedding_config)
@@ -328,12 +353,39 @@ async def work(store: PostgresStore, config, embedding_config: EmbeddingConfig, 
                 stack.push_async_callback(close)
         worker = MemoryWorker(store=store, embeddings=embeddings, providers=providers, config=config, batch=batch)
         stack.push_async_callback(worker.close)
+        yield worker, embeddings, providers
+
+
+async def work(store: PostgresStore, config, embedding_config: EmbeddingConfig, *, batch: bool, once: bool) -> dict[str, Any]:
+    async with learning_resources(store, config, embedding_config, batch=batch) as (worker, _, _):
         if once:
             processed = await worker.run_once()
             return {'type': 'worker_once', 'processed_dispatch': processed, 'last_error': worker.last_error,
                     'complete': False, 'note': 'One dispatch is not queue completion; inspect status, including deferred Batch jobs.'}
         await worker.run()
         return {'type': 'worker_stopped'}
+
+
+async def prepare_context(store: PostgresStore, config, embedding_config: EmbeddingConfig,
+                          session_id: str) -> dict[str, Any]:
+    from tgchatbot.core.memory import MemoryService
+    from tgchatbot.core.runtime import AgentRuntime
+    from tgchatbot.storage.previews import PreviewCache
+    await existing_scope(store, session_id)
+    async with learning_resources(store, config, embedding_config, batch=False) as (worker, embeddings, providers):
+        memory = MemoryService(store, embeddings, config=config.memory)
+        memory.worker = worker
+        previews = PreviewCache(store, max_bytes=config.memory.preview_cache_bytes)
+        try:
+            runtime = AgentRuntime(config=config, store=store, providers=providers,
+                tool_registry=None, memory=memory, preview_cache=previews)
+            async def progress(event):
+                emit({'type': 'context_preparation_progress', 'session_id': session_id,
+                    'phase': event.title, 'detail': event.detail})
+            result = await runtime.prepare_context(session_id=session_id, emit=progress)
+            return {'type': 'context_prepared', 'session_id': session_id, **result}
+        finally:
+            previews.close()
 
 
 async def _run(args: argparse.Namespace) -> None:
@@ -355,7 +407,7 @@ async def _run(args: argparse.Namespace) -> None:
                 emit(record)
             return
         embedding_config = EmbeddingConfig.from_env()
-        if embedding_config.dimensions != EMBEDDING_DIMENSIONS:
+        if embedding_config.enabled and embedding_config.dimensions != EMBEDDING_DIMENSIONS:
             raise ValueError(f'Conversation memory requires EMBEDDING_DIMENSIONS={EMBEDDING_DIMENSIONS}')
         if args.command == 'status':
             async for record in status_records(store, embedding_config.space_id, session_id, include_coverage=args.coverage, options=options):
@@ -365,6 +417,8 @@ async def _run(args: argparse.Namespace) -> None:
         elif args.command == 'retry-jobs':
             count = await retry_failed(store, session_id, embedding_config.space_id)
             emit({'type': 'jobs_retried', 'session_id': session_id, 'space_id': embedding_config.space_id, 'count': count})
+        elif args.command == 'prepare-context':
+            emit(await prepare_context(store, config, embedding_config, session_id))
         else:
             emit(await work(store, config, embedding_config, batch=args.batch, once=args.once))
     finally:
@@ -394,6 +448,8 @@ def parser() -> argparse.ArgumentParser:
     worker = commands.add_parser('work', help='Run the shared memory worker; stop the live bot first')
     worker.add_argument('--batch', action='store_true', help='Use native Gemini Batch for initial import or rebuild')
     worker.add_argument('--once', action='store_true', help='Perform one dispatch, including deferred-job handling; does not drain the queue')
+    prepare = commands.add_parser('prepare-context', help='Compact imported working context in batches before resuming the bot; calls the configured model')
+    prepare.add_argument('--chat-id', type=_nonzero, required=True)
     rebuild_parser = commands.add_parser('rebuild', help='Queue active canonical originals for the selected embedding space')
     rebuild_parser.add_argument('--chat-id', type=_nonzero, required=True)
     retry = commands.add_parser('retry-jobs', help='Resume failed jobs in this chat and selected space, preserving paid Batch identity')

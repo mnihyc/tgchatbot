@@ -76,6 +76,8 @@ def _decode(path: Path) -> Iterator[tuple[Image.Image, float, float]]:
                 at += duration
         return
     with av.open(str(path)) as container:
+        if not container.streams.video:
+            raise ValueError('Media contains no video frames')
         stream = container.streams.video[0]
         rate = float(stream.average_rate) if stream.average_rate else None
         origin = None

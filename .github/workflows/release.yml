@@ -34,6 +34,5 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           gh release create "$RELEASE_TAG" \
-            "dist/tgchatbot-deploy-$RELEASE_TAG.tar.gz" dist/update.sh dist/SHA256SUMS \
-            --verify-tag --title "$RELEASE_TAG" \
-            --notes 'Download and extract the deployment bundle, then run ./update.sh.'
+            "dist/tgchatbot-deploy-$RELEASE_TAG.tar.gz" \
+            --verify-tag --title "$RELEASE_TAG" --notes-from-tag

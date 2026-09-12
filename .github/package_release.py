@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import io
 from pathlib import Path
 import shutil
 import subprocess
 import tarfile
+import tempfile
 import tomllib
 import zipfile
 
@@ -15,8 +15,29 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def run(*command: str) -> None:
-    subprocess.run(command, cwd=ROOT, check=True)
+def run(*command: str, cwd: Path = ROOT) -> None:
+    subprocess.run(command, cwd=cwd, check=True)
+
+
+def build_wheel(build: Path) -> None:
+    # setuptools may reuse build/lib from earlier versions. A release owns a
+    # fresh build tree containing only current tracked application inputs.
+    tracked = subprocess.check_output(['git', 'ls-files', '-z', '--',
+        'pyproject.toml', 'README.md', 'LICENSE', 'tgchatbot', 'scripts'], cwd=ROOT)
+    with tempfile.TemporaryDirectory(prefix='release-source-', dir=build) as directory:
+        source = Path(directory)
+        for name in tracked.decode().split('\0'):
+            if not name:
+                continue
+            original = ROOT / name
+            if original.is_symlink():
+                raise ValueError(f'Release source must be a regular repository file: {name}')
+            if not original.is_file():
+                continue  # A tracked deletion in the current working tree.
+            destination = source / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(original, destination)
+        run('uv', 'build', '--wheel', '--out-dir', str(build), cwd=source)
 
 
 def main() -> None:
@@ -32,7 +53,7 @@ def main() -> None:
     build.mkdir(exist_ok=True)
     run('uv', 'export', '--frozen', '--no-dev', '--no-emit-project', '--no-header',
         '--no-annotate', '--output-file', 'build/runtime-requirements.txt')
-    run('uv', 'build', '--wheel', '--out-dir', 'build')
+    build_wheel(build)
     wheel = build / f'tgchatbot-{version}-py3-none-any.whl'
     with zipfile.ZipFile(wheel) as package:
         for name in package.namelist():
@@ -72,14 +93,6 @@ def main() -> None:
             info.mode = 0o644
             info.size = len(data)
             archive.addfile(info, io.BytesIO(data))
-    updater = dist / 'update.sh'
-    shutil.copy2(ROOT / 'deploy/update.sh', updater)
-    lines = []
-    for artifact in (bundle, updater):
-        with artifact.open('rb') as stream:
-            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-        lines.append(f'{digest}  {artifact.name}\n')
-    (dist / 'SHA256SUMS').write_text(''.join(lines))
     print(f'Packaged {bundle.name} ({bundle.stat().st_size:,} bytes)')
 
 

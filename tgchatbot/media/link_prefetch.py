@@ -55,7 +55,7 @@ class _PreviewHTMLParser(HTMLParser):
             return
         if self.in_title:
             self.title_parts.append(text)
-        elif len(self.body_text) < 60:
+        else:
             self.body_text.append(text)
 
 
@@ -110,6 +110,8 @@ async def _url_is_safe(url: str) -> bool:
 
 
 def extract_urls(text: str, *, max_urls: int) -> list[str]:
+    if max_urls <= 0:
+        return []
     seen: set[str] = set()
     out: list[str] = []
     for raw in _URL_RE.findall(text or ''):
@@ -125,16 +127,15 @@ def extract_urls(text: str, *, max_urls: int) -> list[str]:
 
 async def fetch_link_previews(text: str, *, mode: str, telegram: TelegramConfig) -> list[LinkPreviewData]:
     urls = extract_urls(text, max_urls=max(0, telegram.link_prefetch_max_urls))
-    if not urls or mode == 'off':
+    if not urls or mode == 'off' or telegram.link_prefetch_max_bytes <= 0:
         return []
-    timeout = httpx.Timeout(telegram.link_prefetch_timeout_s, connect=min(telegram.link_prefetch_timeout_s, 3.0))
+    timeout = httpx.Timeout(telegram.link_prefetch_timeout_s)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, headers={'User-Agent': 'tgchatbot-link-prefetch/1.0'}) as client:
         results: list[LinkPreviewData] = []
         for url in urls:
             try:
-                if not await _url_is_safe(url):
-                    continue
-                preview = await _fetch_one(client, url, mode=mode, max_chars=telegram.link_prefetch_max_chars)
+                preview = await _fetch_one(client, url, mode=mode, max_chars=telegram.link_prefetch_max_chars,
+                    max_bytes=telegram.link_prefetch_max_bytes, max_redirects=telegram.link_prefetch_max_redirects)
             except Exception:
                 continue
             if preview:
@@ -142,28 +143,35 @@ async def fetch_link_previews(text: str, *, mode: str, telegram: TelegramConfig)
         return results
 
 
-async def _fetch_one(client: httpx.AsyncClient, url: str, *, mode: str, max_chars: int) -> LinkPreviewData | None:
+async def _fetch_one(client: httpx.AsyncClient, url: str, *, mode: str, max_chars: int,
+                     max_bytes: int, max_redirects: int) -> LinkPreviewData | None:
     current_url = url
-    for _ in range(5):
+    for _ in range(max_redirects + 1):
         if not await _url_is_safe(current_url):
             return None
-        response = await client.get(current_url)
-        if response.is_redirect:
-            location = response.headers.get('location', '').strip()
-            if not location:
-                return None
-            current_url = str(response.url.join(location))
-            continue
-        response.raise_for_status()
-        content_type = response.headers.get('content-type', '')
+        async with client.stream('GET', current_url) as response:
+            if response.is_redirect:
+                location = response.headers.get('location', '').strip()
+                if not location:
+                    return None
+                current_url = str(response.url.join(location))
+                continue
+            response.raise_for_status()
+            content_type = response.headers.get('content-type', '')
+            body_bytes = bytearray()
+            if content_type.startswith('text/'):
+                async for chunk in response.aiter_bytes():
+                    body_bytes.extend(chunk[:max_bytes - len(body_bytes)])
+                    if len(body_bytes) >= max_bytes:
+                        break
+            text = bytes(body_bytes).decode(response.encoding or 'utf-8', errors='replace')
         parsed = urlparse(str(response.url))
         host = parsed.netloc or parsed.path
         if 'text/html' in content_type:
-            body = response.text[: max(max_chars * 2, 4000)]
             parser = _PreviewHTMLParser()
-            parser.feed(body)
-            title = _normalize(' '.join(parser.title_parts)) or None
-            description = _normalize(parser.description or '') or None
+            parser.feed(text)
+            title = _normalize(' '.join(parser.title_parts))[:max_chars] or None
+            description = _normalize(parser.description or '')[:max_chars] or None
             snippet = None
             if mode == 'snippet':
                 body_text = _normalize(' '.join(parser.body_text))
@@ -171,7 +179,7 @@ async def _fetch_one(client: httpx.AsyncClient, url: str, *, mode: str, max_char
                     snippet = body_text[:max_chars]
             return LinkPreviewData(url=str(response.url), title=title or host, description=description, snippet=snippet, content_type=content_type)
         if content_type.startswith('text/'):
-            text = _normalize(response.text)
+            text = _normalize(text)
             if not text:
                 return None
             return LinkPreviewData(url=str(response.url), title=host, description=text[:max_chars], snippet=(text[:max_chars] if mode == 'snippet' else None), content_type=content_type)

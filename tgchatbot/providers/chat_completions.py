@@ -51,7 +51,15 @@ class ChatCompletionsProvider:
         return controls
 
     def _messages_for_request(self, messages: list[ConversationMessage]) -> list[dict[str, Any]]:
-        return [item for message in messages for item in self._message_to_input_items(message)]
+        result = []
+        for message in messages:
+            for item in self._message_to_input_items(message):
+                if (result and item.get('tool_calls') and result[-1].get('tool_calls')
+                        and not item.get('content') and not result[-1].get('content')):
+                    result[-1]['tool_calls'].extend(item['tool_calls'])
+                else:
+                    result.append(item)
+        return result
 
     def _message_to_input_items(self, message: ConversationMessage) -> list[dict[str, Any]]:
         metadata = message.metadata if isinstance(message.metadata, dict) else {}
@@ -60,7 +68,7 @@ class ChatCompletionsProvider:
             return copy.deepcopy([item for item in native['items'] if isinstance(item, dict)])
         payload = metadata.get('tool_payload')
         framework_refresh = metadata.get('synthetic_role') == 'profile_refresh'
-        if message.role == MessageRole.TOOL and (metadata.get('tool_provider') == self.name or framework_refresh or metadata.get('tool_evidence')) and isinstance(payload, dict):
+        if message.role == MessageRole.TOOL and (metadata.get('tool_provider') == self.name or framework_refresh or metadata.get('tool_evidence') or metadata.get('portable_tool_history')) and isinstance(payload, dict):
             call_id = payload.get('call_id')
             if call_id and metadata.get('tool_phase') == 'call' and message.name:
                 return [{'role': 'assistant', 'content': None, 'tool_calls': [{

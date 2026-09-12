@@ -12,6 +12,7 @@ from itertools import zip_longest
 from typing import Any
 
 import numpy as np
+from av.error import FFmpegError
 
 from tgchatbot.embeddings import EmbeddingService
 from tgchatbot.stickers.config import StickerConfig
@@ -147,19 +148,24 @@ class StickerCatalog:
 
     async def _aensure_session_state(self, session_id):
         state = self.style_memory.get(session_id)
-        if not state.session_persona_loaded:
-            saved = await self.persona_store.get_sticker_persona(session_id) if self.persona_store else None
-            state.set_session_persona(saved)
+        # The database owns explicit preference changes and reset generations.
+        # A bounded local handle must not outlive either and resurrect an old persona.
+        if self.persona_store:
+            state.set_session_persona(await self.persona_store.get_sticker_persona(session_id))
+        elif not state.session_persona_loaded:
+            state.set_session_persona(None)
         return state
 
-    async def adescribe_style_context(self, session_id='default'):
-        state = await self._aensure_session_state(session_id)
+    async def adescribe_style_context(self, session_id='default', *, session_state=None, assets=None):
+        state = session_state if session_state is not None else self.style_memory.get(session_id)
         if self.delivery_store:
             rows = await self.delivery_store.recent(session_id, limit=self.config.recent_deliveries)
             state.recent_sticker_ids = [row['sticker_id'] for row in rows]
+            assets_by_id = {asset.asset_id: asset for asset in (
+                assets if assets is not None else self._index.assets)}
             state.recent_source_pack_ids = list(dict.fromkeys(
-                alias.pack for row in rows for entry in [self.entries_by_id.get(row['sticker_id'])]
-                if entry for alias in entry.asset.aliases))
+                alias.pack for row in rows for asset in [assets_by_id.get(row['sticker_id'])]
+                if asset for alias in asset.aliases))
             state.source_pack_id = state.recent_source_pack_ids[0] if state.recent_source_pack_ids else None
         return state.to_context_dict()
 
@@ -195,10 +201,12 @@ class StickerCatalog:
         return state, context
 
     def _available_path(self, asset, *, verify=True):
+        root = self.sticker_root.resolve()
         for alias in asset.aliases:
             path = self.sticker_root / alias.path
             try:
-                if path.is_file() and (not verify or content_hash(path) == asset.content_hash):
+                if path.resolve().is_relative_to(root) and path.is_file() and (
+                        not verify or content_hash(path) == asset.content_hash):
                     return path
             except OSError:
                 continue
@@ -229,7 +237,7 @@ class StickerCatalog:
                     parts.append(MessagePart(kind=PartKind.IMAGE, data_b64=frame.data_b64,
                         mime_type=frame.mime_type, text=f'{entry.sticker_id} at {frame.timestamp_s:g}s',
                         origin=origin, remote_sync=False))
-            except (OSError, ValueError) as exc:
+            except (OSError, ValueError, FFmpegError) as exc:
                 parts.append(MessagePart(kind=PartKind.TEXT, text=f'Candidate {entry.sticker_id}: '
                     f'visual evidence unavailable ({type(exc).__name__}); description only.', origin=origin, remote_sync=False))
         return parts
@@ -244,7 +252,7 @@ class StickerCatalog:
             return []
         state = session_state or await self._aensure_session_state(session_id)
         persona_context = persona_context or self._persona_context(state, plan)
-        await self.adescribe_style_context(session_id)
+        await self.adescribe_style_context(session_id, session_state=state, assets=index.assets)
         recent = set(state.recent_sticker_ids)
         # Eligibility is evaluated before limiting a channel, so unavailable or
         # explicitly excluded formats cannot occupy the displayed slots.
@@ -262,21 +270,30 @@ class StickerCatalog:
         paths = await asyncio.to_thread(lambda: {i: path for i in allowed
             if (path := self._available_path(index.assets[i], verify=False)) is not None})
         allowed = set(paths)
+        if not allowed:
+            return []
         depth = max(self.config.retrieval_depth, plan.candidate_budget)
         rankings, best_reading, channel_members = [], {}, {}
-        # Caption/ID identity is a separate route, not an AND across a prose query.
+        # An asset ID identifies one original. A caption is only a meaning hint;
+        # it must not bypass the conversational intent when vectors are available.
+        known_id = [i for i, asset in enumerate(index.assets) if asset.asset_id == plan.intent_core]
         literal = ' '.join((plan.text_hint or plan.intent_core).casefold().split())
-        exact = [i for i in allowed if index.assets[i].asset_id == plan.intent_core or
-                 (literal and ' '.join((index.assets[i].card or {}).get('caption', '').casefold().split()) == literal)]
-        if exact:
-            rankings.append(sorted(exact))
-            channel_members['literal'] = set(exact)
+        exact = {i for i in allowed if literal and
+                 ' '.join((index.assets[i].card or {}).get('caption', '').casefold().split()) == literal}
+        if known_id:
+            rankings.append([i for i in known_id if i in allowed])
+            channel_members['asset_id'] = set(known_id)
         available_vectors = index.reading_matrix is not None or index.image_matrix is not None
-        if available_vectors and not (self.embeddings and self.embeddings.enabled) and not exact:
+        if available_vectors and not (self.embeddings and self.embeddings.enabled) and not exact and not known_id:
             raise ValueError('Sticker semantic search requires the configured embedding credentials; known IDs and exact captions remain available')
-        if not exact and available_vectors and self.embeddings and self.embeddings.enabled:
+        caption_lane = sorted(exact)
+        semantic_ready = available_vectors and self.embeddings and self.embeddings.enabled and not known_id
+        if semantic_ready:
             if index.recipe.get('embedding_space_id') != self.embeddings.config.space_id:
-                raise ValueError('Sticker embedding space changed; rebuild the catalog vectors with the configured sticker embedding route')
+                if not exact:
+                    raise ValueError('Sticker embedding space changed; rebuild the catalog vectors with the configured sticker embedding route')
+                semantic_ready = False
+        if semantic_ready:
             intended = '; '.join(filter(None, [plan.intent_core, *plan.secondary_goals,
                 plan.emotion_tone, plan.social_goal, plan.text_hint,
                 plan.selection_lens.social_read, plan.selection_lens.subtext,
@@ -300,6 +317,9 @@ class StickerCatalog:
                 by_asset = {i: float(scores[row]) for row, i in enumerate(index.image_assets) if i in allowed}
                 return sorted(by_asset, key=lambda i: (-by_asset[i], index.assets[i].asset_id))
             reading, visual_rank = reading_rank(query_vectors[intended]), image_rank(query_vectors[visual])
+            if exact:
+                caption_lane = [i for i in _interleave(reading, visual_rank) if i in exact]
+                caption_lane.extend(sorted(exact - set(caption_lane)))
             global_lanes = []
             for name, values in [('reading', reading), ('image', visual_rank)]:
                 lane = values[:depth]
@@ -309,8 +329,10 @@ class StickerCatalog:
             # Preferences get a companion retrieval lane, never a global exclusion.
             persona = persona_context.get('effective_persona', {})
             identity = persona.get('visual_identity', {})
-            pack = plan.prefer_pack or identity.get('prefer_pack')
             family = plan.preferred_character_family
+            pack = plan.prefer_pack or plan.persona.visual_identity.prefer_pack
+            if not pack and not family:
+                pack = identity.get('prefer_pack')
             if plan.style_goal == 'preserve' and not pack and not family:
                 pack = state.source_pack_id
             preferred = {i for i in allowed if (pack and any(a.pack == pack for a in index.assets[i].aliases)) or
@@ -332,19 +354,23 @@ class StickerCatalog:
                 channel_members['preferred_appearance'] = set(values)
             # Fresh alternatives are exposed alongside the strongest matches. A
             # repeated best fit stays eligible; visual proximity is not semantic proof.
+            explicit_lanes = []
             if recent:
                 fresh = list(_interleave([i for i in reading if index.assets[i].asset_id not in recent],
                                          [i for i in visual_rank if index.assets[i].asset_id not in recent]))[:depth]
                 if plan.diversity_preference == 'prefer_fresh_variant':
                     rankings.insert(0, fresh)
+                    explicit_lanes.append(fresh)
                 else:
                     rankings.append(fresh)
                 channel_members['fresh_alternative'] = set(fresh)
             if plan.style_goal == 'prefer_switch' and state.recent_source_pack_ids:
                 different = [i for i in _interleave(reading, visual_rank) if not any(
                     alias.pack in state.recent_source_pack_ids for alias in index.assets[i].aliases)]
-                rankings.append(different[:depth])
-                channel_members['different_pack'] = set(different[:depth])
+                different = different[:depth]
+                rankings.append(different)
+                explicit_lanes.append(different)
+                channel_members['different_pack'] = set(different)
             if family_lane and preferred != allowed:
                 # With a small display budget, two global channels must not use
                 # every slot before the requested familiar alternative is seen.
@@ -353,10 +379,26 @@ class StickerCatalog:
                 global_lane = list(_interleave(reading[:depth], visual_rank[:depth]))
                 companions = [lane for lane in rankings if lane is not family_lane
                     and not any(lane is global_lane for global_lane in global_lanes)]
-                rankings = [global_lane, family_lane, *companions]
+                explicit_continuity = (plan.prefer_pack or plan.preferred_character_family or
+                    plan.persona.visual_identity.prefer_pack or
+                    plan.style_goal_explicit and plan.style_goal == 'preserve')
+                if explicit_continuity:
+                    rankings = [global_lane, family_lane, *companions]
+                else:
+                    # Move only inherited family continuity behind requested
+                    # fresh/switch alternatives; other companions keep their order.
+                    after_requested = max((position + 1 for position, lane in enumerate(companions)
+                        if any(lane is value for value in explicit_lanes)), default=0)
+                    rankings = [global_lane, *companions[:after_requested], family_lane,
+                        *companions[after_requested:]]
+        if exact and not known_id:
+            rankings.append(caption_lane)
+            channel_members['literal'] = exact
         selected = _interleave(*rankings)
         result = []
-        delivered_vectors = [(a.asset_id, a.image_vector) for a in index.assets if a.asset_id in recent and a.image_vector is not None]
+        delivered_vectors = [(a.asset_id, a.image_vector) for a in index.assets
+            if index.recipe.get('visual_embedding_source') != 'description'
+            and a.asset_id in recent and a.image_vector is not None]
         for i in selected:
             asset = index.assets[i]
             verified_path = await asyncio.to_thread(self._available_path, asset)

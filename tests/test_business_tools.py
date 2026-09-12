@@ -21,17 +21,19 @@ class ToolWorkflowTests(BusinessTestCase):
         remote.fetch_files.assert_awaited_once_with(session_id=self.session, remote_paths=["report.txt"], scope="outputs")
         self.assertTrue(result.output["ok"])
         self.assertEqual(result.artifacts, [artifact])
-        self.assertEqual(result.output["sent_files"], ["report.txt"])
+        self.assertEqual(result.output["prepared_files"], ["report.txt"])
+        self.assertEqual(result.output["delivery_state"], "pending")
 
     async def test_file_send_validation_and_empty_result_are_model_visible_errors(self):
         remote = SimpleNamespace(fetch_files=AsyncMock(return_value=[]))
         tool = FileSendTool(self.config, remote)
-        for args in ({"scope": "outside"}, {"paths": "not-an-array"}):
+        for args in ({"scope": "outside"}, {"paths": "not-an-array"},
+                     {'scope': 'outputs', 'paths': []}, {'paths': ['  ']}, {}):
             with self.subTest(args=args):
                 result = await tool.run(args, ToolContext(self.session, "tester"))
                 self.assertFalse(result.output["ok"])
         remote.fetch_files.assert_not_awaited()
-        result = await tool.run({"scope": "outputs", "paths": []}, ToolContext(self.session, "tester"))
+        result = await tool.run({"scope": "outputs", "paths": ['missing.txt']}, ToolContext(self.session, "tester"))
         self.assertFalse(result.output["ok"])
         self.assertEqual(result.artifacts, [])
 

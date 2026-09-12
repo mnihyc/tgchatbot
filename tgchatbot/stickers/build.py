@@ -18,7 +18,7 @@ from tgchatbot.operational import from_env
 from tgchatbot.providers.factory import build_provider
 from tgchatbot.storage.postgres_store import PostgresStore
 from tgchatbot.storage.sticker_catalog import CatalogAlias, CatalogAsset, CatalogConflict, StickerCatalogStore
-from tgchatbot.stickers.cards import CARD_PROMPT, CARD_RECIPE, CARD_SCHEMA, card_hash, effective_card, reading_texts, validate_card, validate_corrections
+from tgchatbot.stickers.cards import CARD_PROMPT, CARD_RECIPE, CARD_SCHEMA, appearance_text, card_hash, effective_card, reading_texts, validate_card, validate_corrections
 from tgchatbot.stickers.media import MediaConfig, SUPPORTED_EXTENSIONS, content_hash, prepare_media
 
 
@@ -48,10 +48,11 @@ class BuildConfig:
 
 @dataclass(frozen=True)
 class BuildResult:
-    revision_id: str
+    revision_id: str | None
     active: bool
     completed: int
     failed: tuple[dict, ...]
+    unsupported_files: tuple[str, ...] = ()
 
 
 class CatalogBuilder:
@@ -65,10 +66,22 @@ class CatalogBuilder:
             native_web_search_mode='off', include_thoughts=False)
 
     @property
+    def visual_embedding_source(self):
+        if not self.config.image_embeddings:
+            return None
+        return 'image' if self.embeddings.supports_media else 'description'
+
+    def _needs_visual(self, card):
+        return self.visual_embedding_source == 'image' or (
+            self.visual_embedding_source == 'description' and bool(appearance_text(card)))
+
+    @property
     def recipe(self):
-        return {'card_recipe': CARD_RECIPE, 'annotation': {'provider': self.config.provider, 'model': self.config.model, 'max_output_tokens': self.config.max_output_tokens}, 'media': asdict(self.media_config),
+        return {'card_recipe': CARD_RECIPE, 'annotation': {'provider': self.config.provider, 'model': self.config.model}, 'media': asdict(self.media_config),
                 'embedding_space_id': self.embeddings.space_id, 'embedding_space': self.embeddings.config.space_spec,
-                'reading_input': 'meaning-newline-context-v1', 'image_input': 'sampled-frames-only-v1',
+                'reading_input': 'meaning-newline-context-v1',
+                'image_input': 'card-appearance-action-caption-v1' if self.visual_embedding_source == 'description' else 'sampled-frames-only-v1',
+                'visual_embedding_source': self.visual_embedding_source,
                 'image_embeddings': self.config.image_embeddings and self.embeddings.supports_media}
 
     async def _save(self, revision_id, asset, **changes):
@@ -85,6 +98,9 @@ class CatalogBuilder:
                     resume: str | None = None) -> BuildResult:
         root = Path(source_root).resolve()
         corrections = corrections or {}
+        source_files = [path for path in sorted(root.rglob('*')) if path.is_file()]
+        unsupported = tuple(path.relative_to(root).as_posix() for path in source_files
+                            if path.suffix.lower() not in SUPPORTED_EXTENSIONS)
         if resume:
             snapshot = await self.store.load_snapshot(resume)
             if snapshot.recipe != self.recipe or Path(snapshot.source_root) != root:
@@ -99,8 +115,8 @@ class CatalogBuilder:
             previous = {asset.asset_id: asset for asset in snapshot.assets}
             inventory: dict[str, list[CatalogAlias]] = {}
             paths = {}
-            for path in sorted(root.rglob('*')):
-                if not path.is_file() or path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            for path in source_files:
+                if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
                     continue
                 # Catalog paths never escape the declared source directory.
                 if not path.resolve().is_relative_to(root):
@@ -116,12 +132,15 @@ class CatalogBuilder:
             if unknown:
                 raise ValueError(f'Unknown asset IDs: {sorted(unknown)}')
             packs = {alias.pack for asset in snapshot.assets for alias in asset.aliases} | {alias.pack for aliases in inventory.values() for alias in aliases}
+            packs.update(Path(path).parts[0] if len(Path(path).parts) > 1 else '' for path in unsupported)
             if set(regenerate_packs) - packs:
                 raise ValueError(f'Unknown packs: {sorted(set(regenerate_packs) - packs)}')
-            unknown_files = set(regenerate_files) - (set(paths) | {a.path for old in previous.values() for a in old.aliases})
+            unknown_files = set(regenerate_files) - (set(paths) | set(unsupported) |
+                {a.path for old in previous.values() for a in old.aliases})
             if unknown_files:
                 raise ValueError(f'Unknown relative files: {sorted(unknown_files)}')
             planned = []
+            selected = False
             for asset_id in sorted(known):
                 old = previous.get(asset_id)
                 # A reused filename now belongs to its new bytes. Missing originals
@@ -129,6 +148,7 @@ class CatalogBuilder:
                 aliases = {alias.path: alias for alias in (old.aliases if old else ()) if paths.get(alias.path, asset_id) == asset_id}
                 aliases.update({alias.path: alias for alias in inventory.get(asset_id, ())})
                 regenerate = asset_id in regenerate_ids or any(alias.pack in regenerate_packs or alias.path in regenerate_files for alias in aliases.values())
+                selected = selected or regenerate
                 correction = corrections.get(asset_id, old.corrections if old else {})
                 if not isinstance(correction, dict):
                     raise ValueError('Each correction must be an object; use {} to explicitly clear it')
@@ -142,14 +162,21 @@ class CatalogBuilder:
                 if card is not None:
                     provenance['effective_card_hash'] = card_hash(card)
                 same_readings = old is not None and old.card is not None and card is not None and reading_texts(old.card) == reading_texts(card) and old.provenance.get('reading_input') == self.recipe['reading_input']
-                same_media = old is not None and old.media.get('preparation') == asdict(self.media_config) and old.provenance.get('image_input') == self.recipe['image_input']
+                same_visual = old is not None and old.provenance.get('image_input') == self.recipe['image_input'] and (
+                    old.media.get('preparation') == asdict(self.media_config) if self.visual_embedding_source == 'image'
+                    else appearance_text(old.card) == appearance_text(card))
                 readings = old.reading_vectors if same_space and same_readings else None
-                image = old.image_vector if same_space and same_media and self.recipe['image_embeddings'] else None
-                ready = card is not None and readings is not None and (image is not None or not self.recipe['image_embeddings'])
+                image = old.image_vector if same_space and same_visual and self._needs_visual(card) else None
+                ready = card is not None and readings is not None and (image is not None or not self._needs_visual(card))
                 asset = CatalogAsset(asset_id, asset_id.removeprefix('sha256:'), tuple(aliases.values()),
                     old.media if old else {}, generated, correction, card, provenance, image, readings,
                     'ready' if ready else 'pending')
                 planned.append(asset)
+            if (regenerate_ids or regenerate_packs or regenerate_files) and not selected:
+                raise ValueError('No processable assets match the selected files, packs or IDs; '
+                                 'unsupported files: ' + ', '.join(unsupported))
+            if not planned:
+                return BuildResult(None, False, 0, (), unsupported)
             # Inventory and copied records commit together before any paid work.
             # A crash cannot leave a revision containing only half its intended input.
             revision_id = await self.store.begin_revision(source_root=str(root), recipe=self.recipe,
@@ -175,7 +202,7 @@ class CatalogBuilder:
             await asyncio.gather(*(process(asset) for asset in snapshot.assets))
             if not failures:
                 await self.store.activate(revision_id)
-        return BuildResult(revision_id, not failures, completed, tuple(failures))
+        return BuildResult(revision_id, not failures, completed, tuple(failures), unsupported)
 
     async def _process(self, revision_id, root, asset):
         prepared = None
@@ -199,6 +226,7 @@ class CatalogBuilder:
             generated = validate_card(json.loads(response.final_text))
             provenance['annotation'] = {'provider': self.config.provider, 'model': self.config.model,
                 'service_tier_requested': self.config.service_tier, 'recipe': CARD_RECIPE,
+                'max_output_tokens': self.settings.max_output_tokens,
                 'media_preparation': asdict(self.media_config), 'usage': asdict(response.usage)}
             reported_model = response.raw.get('modelVersion') or response.raw.get('model')
             if reported_model:
@@ -215,13 +243,17 @@ class CatalogBuilder:
             documents = [EmbeddingDocument(f'{asset.asset_id}:reading:{i}', text=text) for i, text in enumerate(texts)]
             readings = np.asarray(await self.embeddings.embed_documents(documents, purpose='sticker'), dtype=np.float32).reshape((-1, dimensions)) if documents else np.empty((0, dimensions), dtype=np.float32)
             await self._save(revision_id, asset, reading_vectors=readings)
-        if self.recipe['image_embeddings'] and image is None:
-            document = EmbeddingDocument(asset.asset_id + ':image', media=tuple(EmbeddingMedia(frame.mime_type, frame.data_b64) for frame in prepared.frames))
+        if self._needs_visual(asset.card) and image is None:
+            document = (EmbeddingDocument(asset.asset_id + ':image',
+                media=tuple(EmbeddingMedia(frame.mime_type, frame.data_b64) for frame in prepared.frames))
+                if self.visual_embedding_source == 'image' else
+                EmbeddingDocument(asset.asset_id + ':appearance', text=appearance_text(asset.card)))
             vectors = await self.embeddings.embed_documents([document], purpose='sticker')
             image = np.asarray(vectors[0], dtype=np.float32)
         provenance.update({'embedding_space_id': self.embeddings.space_id,
                            'embedding_space': self.embeddings.config.space_spec,
                            'effective_card_hash': card_hash(asset.card),
+                           'visual_embedding_source': self.visual_embedding_source,
                            'reading_input': self.recipe['reading_input'], 'image_input': self.recipe['image_input']})
         await self._save(revision_id, asset, media=prepared.facts if prepared else asset.media,
                          image_vector=image, reading_vectors=readings, provenance=provenance, state='ready', error=None)

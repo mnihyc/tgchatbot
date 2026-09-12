@@ -10,17 +10,22 @@ import argparse
 import asyncio
 from dataclasses import dataclass, fields
 import json
+import mimetypes
 from pathlib import Path
 import re
 from types import SimpleNamespace
 from typing import Any, Callable, Iterator
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import ijson
 from ijson.common import ObjectBuilder
 
 from tgchatbot.domain.models import ConversationMessage, MessagePart, MessageRole, PartKind, SessionSettings
+from tgchatbot.config import TelegramConfig
 from tgchatbot.domain.provenance import telegram_actor, telegram_metadata, utc_time
 from tgchatbot.operational import from_env
+from tgchatbot.settings_schema import DEFAULT_METADATA_TIMEZONE
 from tgchatbot.storage.postgres_store import PostgresStore, StaleScopeError
 
 
@@ -179,8 +184,97 @@ def _entities(record: dict[str, Any]) -> list[Any]:
     return entities
 
 
+def _attachment(record: dict[str, Any]) -> tuple[str, str, str | None, PartKind] | None:
+    kind = record.get('media_type') or ('photo' if record.get('photo') else 'file' if record.get('file') else None)
+    if not kind:
+        return None
+    filename = str(record.get('file_name') or record.get('file') or record.get('photo') or kind)
+    mime = record.get('mime_type') or mimetypes.guess_type(filename)[0]
+    visual_kind = (PartKind.STICKER if kind == 'sticker' else PartKind.IMAGE
+                   if record.get('photo') or str(mime or '').startswith(('image/', 'video/')) else PartKind.TEXT)
+    return str(kind), filename, mime, visual_kind
+
+
+def _attachment_hint(record: dict[str, Any], kind: str, filename: str, *, available: bool = False) -> str:
+    emoji = record.get('sticker_emoji') if kind == 'sticker' else None
+    emoji_hint = f'; emoji={json.dumps(emoji, ensure_ascii=False)}' if emoji else ''
+    state = 'image available' if available else 'media unavailable in bot workspace'
+    return f'[Imported attachment: {kind}{emoji_hint}; reference={json.dumps(filename, ensure_ascii=False)}; {state}]'
+
+
+def _import_visual(message: ConversationMessage, record: dict[str, Any], export_root: Path,
+                   config: TelegramConfig) -> None:
+    attachment = _attachment(record)
+    if attachment is None or attachment[3] == PartKind.TEXT:
+        return
+    kind, filename, mime, _ = attachment
+    reference = record.get('photo') or record.get('file')
+    if not isinstance(reference, str):
+        return
+    try:
+        source = (export_root / reference).resolve()
+        # An exported relative reference owns only files inside its bundle.
+        # Absolute/traversing/symlink references cannot read unrelated local data.
+        if not source.is_relative_to(export_root) or not source.is_file():
+            return
+        photo, sticker = bool(record.get('photo')), kind == 'sticker'
+        if not photo and not sticker and (config.max_document_bytes <= 0
+                or source.stat().st_size > config.max_document_bytes):
+            return
+        raw = source.read_bytes()
+    except (OSError, ValueError):
+        return
+    from tgchatbot.media.ingest import _build_visual_preview_parts, visual_parts_from_bytes
+    if photo or sticker:
+        parts = visual_parts_from_bytes(raw=raw, filename=filename,
+            max_frames=1 if photo else config.max_sticker_frames,
+            max_bytes=config.max_photo_bytes if photo else config.max_sticker_bytes,
+            max_keyframe_candidates=config.max_video_keyframe_candidates,
+            detail='auto' if photo else 'low')
+    else:
+        parts = _build_visual_preview_parts(raw=raw, mime=mime or 'application/octet-stream',
+            filename=filename, telegram_config=config)
+    if not parts:
+        return
+    for index, part in enumerate(message.parts):
+        if part.origin == 'attachment_reference':
+            message.parts[index] = MessagePart(PartKind.TEXT,
+                text=_attachment_hint(record, kind, filename, available=True),
+                origin='attachment_reference', remote_sync=False)
+            break
+    message.parts.extend(parts)
+    message.metadata['media_availability'] = 'imported'
+
+
+async def _retained_import(store: PostgresStore, session_id: str, message: ConversationMessage, scope):
+    """An unchanged export without its files cannot revoke retained visual evidence."""
+    if message.metadata.get('media_availability') != 'not_imported' or not any(
+            part.kind in {PartKind.IMAGE, PartKind.STICKER} for part in message.parts):
+        return None
+    metadata = message.metadata
+    previous = await store.read_message_by_source(session_id,
+        source=metadata['source'], source_chat_id=metadata['source_chat_id'],
+        source_message_id=metadata['source_message_id'], expected_scope=scope, generation_only=True)
+    if previous is None:
+        return None
+    original = previous.message
+    if (not original.metadata.get('imported') or original.role != message.role or original.name != message.name
+            or original.parts[0].text != message.parts[0].text
+            or any(original.metadata.get(key) != value for key, value in metadata.items()
+                   if key not in {'media_availability', 'source_revision'})):
+        return None
+    images = (await store.describe_message_images(session_id, [previous.db_id],
+        expected_scope={'generation': scope['generation']})).get(previous.db_id, [])
+    if not images or not all(image['available'] for image in images):
+        return None
+    # The no-op path needs the same full-reset boundary as an ordinary append.
+    await store.assert_scope(session_id, scope, generation_only=True)
+    return previous
+
+
 def desktop_message(record: dict[str, Any], chat: ExportChat, *, chat_id: int,
-                    bot_user_id: int | None = None) -> ConversationMessage:
+                    bot_user_id: int | None = None,
+                    timezone: str = DEFAULT_METADATA_TIMEZONE) -> ConversationMessage:
     try:
         source_id = str(record['id'])
         if not re.fullmatch(r'-?[0-9]+', source_id):
@@ -199,8 +293,15 @@ def desktop_message(record: dict[str, Any], chat: ExportChat, *, chat_id: int,
     if timestamp is None:
         raise ValueError(f'Exported message {message_id} has no timestamp.')
     edited = record.get('edited_unixtime', record.get('edited'))
+    def export_time(value):
+        if isinstance(value, str) and not value.isdigit():
+            value = datetime.fromisoformat(value.replace('Z', '+00:00'))
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=ZoneInfo(timezone))
+        return utc_time(value)
+
     message = SimpleNamespace(chat=SimpleNamespace(id=chat_id), message_id=message_id,
-        from_user=sender, sender_chat=sender_chat, date=utc_time(timestamp), edit_date=utc_time(edited),
+        from_user=sender, sender_chat=sender_chat, date=export_time(timestamp), edit_date=export_time(edited),
         message_thread_id=record.get('message_thread_id', record.get('topic_id')),
         media_group_id=record.get('grouped_id', record.get('media_group_id')),
         entities=_entities(record), caption_entities=[])
@@ -232,12 +333,13 @@ def desktop_message(record: dict[str, Any], chat: ExportChat, *, chat_id: int,
                 metadata['forward_origin'][key] = record[key]
     text = _text(record)
     parts = [MessagePart(PartKind.TEXT, text=text, remote_sync=False)]
-    media_kind = record.get('media_type') or ('photo' if record.get('photo') else 'file' if record.get('file') else None)
-    if media_kind:
-        reference = record.get('file_name') or record.get('file') or record.get('photo') or media_kind
-        filename = str(reference)
-        parts.append(MessagePart(PartKind.TEXT,
-            text=f'[Imported attachment: {media_kind}; reference={json.dumps(filename, ensure_ascii=False)}; media unavailable in bot workspace]',
+    attachment = _attachment(record)
+    if attachment:
+        media_kind, filename, mime, visual_kind = attachment
+        parts.append(MessagePart(visual_kind,
+            text=_attachment_hint(record, media_kind, filename),
+            filename=filename if visual_kind != PartKind.TEXT else None,
+            mime_type=mime if visual_kind != PartKind.TEXT else None,
             origin='attachment_reference', remote_sync=False))
         metadata['media_availability'] = 'not_imported'
     if record.get('type') == 'service' and not text:
@@ -276,18 +378,28 @@ async def import_file(store: PostgresStore, path: Path, *, chat_id: int,
                       export_chat_id: str | None = None, bot_user_id: int | None = None,
                       defaults: SessionSettings | None = None,
                       options: ImportConfig | None = None,
+                      telegram_config: TelegramConfig | None = None,
                       progress: Callable[[ImportResult], None] | None = None) -> ImportResult:
     options = options if options is not None else from_env(ImportConfig, 'IMPORT')
     session_id = f'telegram:{chat_id}'
-    await store.get_or_create_session(session_id, defaults or SessionSettings())
+    settings = await store.get_or_create_session(session_id, defaults or SessionSettings())
     scope = await store.get_scope(session_id)
     chat = inspect_export(path, export_chat_id)
+    export_root = path.parent.resolve()
     processed = batches = 0
     for batch in _batches(iter_records(path, chat), options):
         source_ids = []
         for record in batch:
-            message = desktop_message(record, chat, chat_id=chat_id, bot_user_id=bot_user_id)
-            stored = await store.append_message(session_id, message, expected_scope=scope, generation_only=True)
+            message = desktop_message(record, chat, chat_id=chat_id, bot_user_id=bot_user_id,
+                timezone=settings.metadata_timezone or DEFAULT_METADATA_TIMEZONE)
+            if any(part.kind in {PartKind.IMAGE, PartKind.STICKER} for part in message.parts):
+                if telegram_config is None:
+                    from tgchatbot.config import load_config
+                    telegram_config = load_config(require_telegram=False).telegram
+                await asyncio.to_thread(_import_visual, message, record, export_root, telegram_config)
+            stored = await _retained_import(store, session_id, message, scope)
+            if stored is None:
+                stored = await store.append_message(session_id, message, expected_scope=scope, generation_only=True)
             source_ids.append(stored.db_id)
             processed += 1
         # Append has already durably queued every original. Coalescing only
@@ -314,6 +426,7 @@ async def _run(args: argparse.Namespace) -> None:
             export_chat_id=args.export_chat_id,
             bot_user_id=int(token_id) if token_id.isdigit() else None,
             defaults=config.default_session_settings(),
+            telegram_config=config.telegram,
             options=options,
             progress=lambda status: print(f'Processed {status.messages} messages in {status.batches} bounded batches.', flush=True))
     finally:

@@ -20,11 +20,12 @@ docker compose run --rm --no-deps bot python -m scripts.build_sticker_index --re
 ```
 
 The default operation appends new files and aliases, reusing completed compatible
-analysis. Selection flags may repeat. `scripts.reset_sticker` is an alias for the
+analysis. Unsupported files are listed in the result; supported files in the same
+source are still processed. Selection flags may repeat. `scripts.reset_sticker` is an alias for the
 same regeneration workflow. Neither command deletes original media. Failed work
 stays in a staging revision; only a complete revision replaces the active catalog.
 Resume with the reported revision ID, original source directory and semantic
-settings. Transport timeout, concurrency and service tier can change on resume.
+settings. Output allowance, transport timeout, concurrency and service tier can change on resume.
 Successful annotation and embedding channels are checkpointed independently.
 
 Annotation uses `STICKER_BUILD_PROVIDER`, `STICKER_BUILD_MODEL` and
@@ -36,7 +37,8 @@ Annotation and embedding requests can incur provider charges.
 `STICKER_EMBEDDING_*` overrides the shared embedding route. Sticker dimensions
 default to 3072, independently of conversation memory's 1536 dimensions. Changing
 the embedding space rebuilds vectors while reusing unchanged cards. Text-only
-embedding routes retain reading search without the image channel. Sampling and
+embedding routes use card descriptions for best-effort appearance retrieval;
+candidate previews still come from original images. Sampling and
 other settings are listed in [the full configuration example](../.env.full.example).
 
 Apply reviewed corrections with `--corrections /app/data/corrections.json`:
@@ -80,7 +82,22 @@ Replace the example with the destination Telegram chat ID. For a full export,
 `--export-chat-id` selects its source conversation. The importer preserves source
 identities and reply references, deduplicates unchanged messages on rerun, and
 queues memory work. It does not execute historical commands, call models or
-upload media. Export attachments remain unavailable references.
+upload media. Parsable images included beside the export use the normal image
+compression path and remain available to memory reads. Missing image files and
+unsupported attachments remain references.
+
+For a large import, keep the bot stopped and prepare its working context before
+resuming it:
+
+```sh
+docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory prepare-context --chat-id=-1001234567890
+```
+
+Preparation uses the chat's configured model and existing compaction layers in
+bounded batches. It preserves searchable originals and refreshes participant
+profiles after compaction. It can incur generation charges. Interrupted work
+resumes from committed summaries when the command is run again. Search indexing
+and background profile batches are processed separately by the memory worker.
 
 ## Memory jobs and operator audit
 

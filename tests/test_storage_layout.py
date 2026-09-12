@@ -4,8 +4,6 @@ import base64
 import asyncio
 import json
 import os
-import subprocess
-import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -39,30 +37,18 @@ class StorageLayoutTests(BusinessTestCase):
         }, clear=True):
             return load_config()
 
-    async def test_lowered_native_cache_setting_discards_replay_but_retains_originals(self):
-        root = self.root / 'provider-replay'
-        old = ArtifactStore(root, max_bytes=100)
-        replay = old.save_bytes(chat_id=self.session, filename='native.json', data=b'opaque replay')
-        source = await self.store.append_message(self.session, ConversationMessage.user_text('Durable original'))
-        config = self.layout_config(MEMORY_REPLAY_CACHE_BYTES='0')
-        disabled = ArtifactStore(root, max_bytes=config.memory.replay_cache_bytes)
-        self.assertFalse(replay.exists())
-        with self.assertRaises(ValueError):
-            disabled.save_bytes(chat_id=self.session, filename='next.json', data=b'next replay')
-        retained = await self.store.read_messages(self.session, [source.db_id])
-        self.assertEqual(retained[0].message.parts[0].text, 'Durable original')
-
-    async def test_concurrent_intake_shares_replay_capacity_without_losing_originals(self):
-        root = self.root / 'provider-replay'
-        self.store.artifact_store = ArtifactStore(root, max_bytes=4000)
+    async def test_concurrent_native_history_admissions_preserve_originals_and_replay(self):
         sources = await asyncio.gather(*(self.store.append_message(self.session,
             ConversationMessage.user_text(f'Original {number}', metadata={
-                'provider_native': {'provider': 'openai', 'items': [{'text': 'x' * 3000}]}}))
-            for number in range(20)))
-        self.assertLessEqual(sum(path.stat().st_size for path in root.rglob('*') if path.is_file()), 4000)
-        retained = await self.store.read_messages(self.session, [source.db_id for source in sources], limit=len(sources))
-        self.assertEqual({source.message.parts[0].text for source in retained},
+                'provider_native': {'provider': 'openai', 'model': 'fixture',
+                    'items': [{'text': f'Native {number}'}]}})) for number in range(20)))
+        restarted = await self.new_store()
+        _, restored = await restarted.load_live_context(self.session)
+        self.assertEqual(restored, sorted(sources, key=lambda row: row.db_id))
+        originals = await restarted.read_messages(self.session, [source.db_id for source in sources], limit=len(sources))
+        self.assertEqual({source.message.parts[0].text for source in originals},
                          {f'Original {number}' for number in range(20)})
+        self.assertFalse(any('provider_native' in row.message.metadata for row in originals))
 
     async def test_cleared_temp_can_be_recreated_without_losing_retained_state(self):
         # A separate context removes only disposable fixture state, simulating
@@ -79,14 +65,15 @@ class StorageLayoutTests(BusinessTestCase):
             settings.system_prompt = 'Keep this conversation voice.'
             await store.save_session(self.session, settings)
             preview = base64.b64encode(b'inline preview bytes').decode('ascii')
-            previews = PreviewCache(config.temp_dir / 'previews', max_bytes=32 * 1024 * 1024)
+            previews = PreviewCache(store, max_bytes=8)
             self.addCleanup(previews.close)
-            image_message = previews.externalize(ConversationMessage(MessageRole.USER, [
+            image_message = ConversationMessage(MessageRole.USER, [
                 MessagePart(PartKind.TEXT, text='Remember the image'),
                 MessagePart(PartKind.IMAGE, mime_type='image/png', data_b64=preview, remote_sync=False),
-            ]))
-            await store.append_message(self.session, image_message)
-            self.assertEqual(previews.materialize(image_message, vision=True).parts[1].data_b64, preview)
+            ])
+            saved = await store.append_message(self.session, image_message)
+            materialized = await previews.materialize_many(self.session, [saved.message], vision=True)
+            self.assertEqual(materialized[0].parts[1].data_b64, preview)
             preset = PresetStore(config.preset_dir).save_text('fixture', 'saved preset')
             retained = [preset, config.sticker_dir / 'fixture.webp', config.data_dir / 'ssh' / 'identity', config.data_dir / 'ssh' / 'known_hosts']
             for path in retained[1:]:
@@ -108,11 +95,13 @@ class StorageLayoutTests(BusinessTestCase):
         self.assertTrue(new_file.is_file())
         self.assertTrue(new_remote._control_dir.is_dir())
         provider = ScriptedProvider(responses=[ProviderResponse(final_text='continued')])
-        runtime = AgentRuntime(config=config, store=restarted, tool_registry=FixtureTools(), providers={'openai': provider}, preview_cache=self.preview_cache)
+        previews.close()
+        restored_previews = PreviewCache(restarted, max_bytes=0)
+        self.addCleanup(restored_previews.close)
+        runtime = AgentRuntime(config=config, store=restarted, tool_registry=FixtureTools(), providers={'openai': provider}, preview_cache=restored_previews)
         await runtime.run_turn(session_id=self.session, user_display_name='tester', incoming_message=ConversationMessage.user_text('Continue'))
         request_parts = [part for message in provider.requests[0]['messages'] for part in message.parts]
-        self.assertTrue(any(part.kind == PartKind.TEXT and 'temporary preview expired or unavailable' in (part.text or '') for part in request_parts))
-        self.assertFalse(any(part.kind == PartKind.IMAGE and part.data_b64 for part in request_parts))
+        self.assertEqual([part.data_b64 for part in request_parts if part.kind == PartKind.IMAGE], [preview])
 
     async def test_remote_upload_history_keeps_remote_locator_after_temp_clear(self):
         with tempfile.TemporaryDirectory(dir=self.root) as temporary:
@@ -159,7 +148,9 @@ class StorageLayoutTests(BusinessTestCase):
         with patch('tgchatbot.tools.remote_workspace.asyncio.create_subprocess_exec', side_effect=scp) as execute:
             artifacts = await remote.fetch_files(session_id=self.session, remote_paths=['report.txt'])
         self.assertEqual(len(artifacts), 1)
-        self.assertEqual(artifacts[0].path, self.root / 'tmp' / 'bot' / 'artifacts' / self.session / 'remote_fetch' / 'report.txt')
+        self.assertEqual(artifacts[0].path.parent, self.root / 'tmp' / 'bot' / 'artifacts' / self.session / 'remote_fetch')
+        self.assertTrue(artifacts[0].path.name.endswith('-report.txt'))
+        self.assertTrue(artifacts[0].temporary)
         self.assertEqual(artifacts[0].path.read_bytes(), b'fetched report')
         self.assertIn('remote.invalid:' + paths.outputs + '/report.txt', execute.call_args.args)
         self.assertFalse((config.data_dir / 'artifacts').exists())
@@ -220,48 +211,60 @@ class StorageLayoutTests(BusinessTestCase):
         self.assertNotEqual(moved_temp._control_path, remote._control_path)
 
 
-class PreviewRestartTests(unittest.TestCase):
-    def test_crash_restart_discards_only_old_previews_and_preserves_one_live_cache(self):
-        with tempfile.TemporaryDirectory(prefix='preview-restart-', dir=Path(__file__).parent) as directory:
-            root = Path(directory)
-            retained = root / 'artifacts' / 'retained.txt'
-            retained.parent.mkdir()
-            retained.write_text('unrelated temporary content')
-            (root / 'previews-link').symlink_to(retained.parent, target_is_directory=True)
-            # A hard exit leaves real cache files behind and releases the OS lock;
-            # no private implementation hooks simulate the restart boundary.
-            child = subprocess.run([sys.executable, '-B', '-c', '''
-import base64, json, os, sys
-from pathlib import Path
-from tgchatbot.domain.models import ConversationMessage, MessagePart, MessageRole, PartKind
-from tgchatbot.storage.previews import PreviewCache
-cache = PreviewCache(Path(sys.argv[1]), max_bytes=8)
-message = cache.externalize(ConversationMessage(MessageRole.USER, [MessagePart(PartKind.IMAGE,
-    filename='old.jpg', data_b64=base64.b64encode(b'oldold').decode())]))
-print(json.dumps({'directory': str(cache.root), 'reference': message.parts[0].preview_ref}), flush=True)
-os._exit(0)
-''', str(root)], check=True, capture_output=True, text=True)
-            previous = json.loads(child.stdout)
-            self.assertTrue(Path(previous['directory']).is_dir())
-            with patch.dict(os.environ, {'MEMORY_PREVIEW_CACHE_BYTES': '8'}):
-                cache = PreviewCache(root)
-            try:
-                self.assertFalse(Path(previous['directory']).exists())
-                self.assertEqual(retained.read_text(), 'unrelated temporary content')
-                expired = cache.materialize(ConversationMessage(MessageRole.USER,
-                    [MessagePart(PartKind.TEXT, text='Original caption'),
-                     MessagePart(PartKind.IMAGE, filename='old.jpg', preview_ref=previous['reference'])]), vision=True)
-                self.assertEqual(expired.parts[0].text, 'Original caption')
-                self.assertIn('expired or unavailable', expired.parts[1].text)
-                cached = []
-                for data in (b'aaaaaa', b'bbbbbb'):
-                    cached.append(cache.externalize(ConversationMessage(MessageRole.USER,
-                        [MessagePart(PartKind.IMAGE, data_b64=base64.b64encode(data).decode())])))
-                self.assertLessEqual(sum(path.stat().st_size for path in cache.root.iterdir()), 8)
-                self.assertIsNone(cache.materialize(cached[0], vision=True).parts[0].data_b64)
-                self.assertEqual(cache.materialize(cached[1], vision=True).parts[0].data_b64, base64.b64encode(b'bbbbbb').decode())
-                with self.assertRaisesRegex(RuntimeError, 'Another bot'):
-                    PreviewCache(root, max_bytes=8)
-                self.assertEqual(cache.materialize(cached[1], vision=True).parts[0].data_b64, base64.b64encode(b'bbbbbb').decode())
-            finally:
-                cache.close()
+class PreviewReconstructionTests(BusinessTestCase):
+    async def test_cache_eviction_restart_and_zero_cache_keep_identical_pixels(self):
+        await self.settings(max_input_images=3, compact_target_images=1)
+        cache = PreviewCache(self.store, max_bytes=2)
+        self.addCleanup(cache.close)
+        originals = []
+        for text, image in [('first', 'YWFh'), ('second', 'YmJi')]:
+            saved = await self.store.append_message(self.session, ConversationMessage(MessageRole.USER,
+                [MessagePart(PartKind.TEXT, text=text), MessagePart(PartKind.IMAGE,
+                 data_b64=image, mime_type='image/png')]))
+            originals.append(saved)
+        expected = await cache.materialize_many(self.session, [item.message for item in originals], vision=True)
+        cache.close()
+        restarted = await self.new_store()
+        empty_cache = PreviewCache(restarted, max_bytes=0)
+        self.addCleanup(empty_cache.close)
+        _, raw = await restarted.load_live_context(self.session)
+        reconstructed = await empty_cache.materialize_many(self.session, [item.message for item in raw], vision=True)
+        self.assertEqual(reconstructed, expected)
+        self.assertEqual([part.data_b64 for item in reconstructed for part in item.parts if part.kind == PartKind.IMAGE],
+                         ['YWFh', 'YmJi'])
+        audit = await restarted.list_message_revisions(self.session, originals[0].db_id)
+        self.assertNotIn('data_b64', json.dumps(audit, default=str))
+
+    async def test_image_retirement_is_atomic_and_deduplication_is_session_scoped(self):
+        await self.settings()
+        image = ConversationMessage(MessageRole.USER, [MessagePart(PartKind.STICKER, text='🙂'),
+            MessagePart(PartKind.IMAGE, data_b64='YWJj', mime_type='image/png')])
+        first = await self.store.append_message(self.session, image)
+        second = await self.store.append_message(self.session, image)
+        other = 'telegram:other'
+        await self.store.get_or_create_session(other, self.config.default_session_settings())
+        elsewhere = await self.store.append_message(other, image)
+        reference = first.message.parts[-1].preview_ref
+        self.assertEqual(reference, second.message.parts[-1].preview_ref)
+        self.assertEqual((await self.store.retire_context_images(self.session, target_images=1)).removed_images, 1)
+        self.assertEqual(await self.store.load_preview_data(self.session, [reference]), {reference: b'abc'})
+        self.assertEqual((await self.store.retire_context_images(self.session, target_images=0)).removed_images, 1)
+        self.assertEqual(await self.store.load_preview_data(self.session, [reference]), {reference: b'abc'})
+        self.assertEqual(await self.store.load_preview_data(other, [reference]), {reference: b'abc'})
+        _, rows = await self.store.load_live_context(self.session)
+        self.assertTrue(all(item.message.parts[0].text == '🙂' for item in rows))
+        self.assertTrue(all(item.message.parts[-1].text == '[Image compacted]' for item in rows))
+        canonical = await self.store.read_messages(self.session, [first.db_id])
+        self.assertEqual(canonical[0].message.parts[-1].preview_ref, reference)
+
+    async def test_native_continuation_reconstructs_without_a_sidecar_or_runtime(self):
+        native = {'provider': 'gemini', 'items': [{'role': 'model', 'parts': [
+            {'text': 'Visible answer', 'thoughtSignature': 'opaque-signature'}]}]}
+        saved = await self.store.append_message(self.session, ConversationMessage.assistant_text(
+            'Visible answer', metadata={'provider_native': native}))
+        restarted = await self.new_store()
+        _, reconstructed = await restarted.load_live_context(self.session)
+        self.assertEqual(reconstructed, [saved])
+        self.assertEqual(reconstructed[0].message.metadata['provider_native'], native)
+        audit = await restarted.list_message_revisions(self.session, saved.db_id)
+        self.assertNotIn('provider_native', audit[0]['metadata'])

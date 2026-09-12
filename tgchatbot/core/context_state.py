@@ -3,15 +3,34 @@ from dataclasses import dataclass, field
 from typing import Any
 from tgchatbot.domain.models import ConversationMessage, MessageRole, PartKind
 
+
+def matching_tool_result(call_message: ConversationMessage, result_message: ConversationMessage) -> bool:
+    call_meta, result_meta = call_message.metadata, result_message.metadata
+    if (call_message.role != MessageRole.TOOL or call_meta.get('tool_phase') != 'call'
+            or result_message.role != MessageRole.TOOL or result_meta.get('tool_phase') != 'result'):
+        return False
+    call_payload, result_payload = call_meta.get('tool_payload') or {}, result_meta.get('tool_payload') or {}
+    call_id, result_id = str(call_payload.get('call_id') or ''), str(result_payload.get('call_id') or '')
+    if call_id and result_id:
+        return call_id == result_id
+    return (call_message.name or '') == (result_message.name or '')
+
+
+def is_auto_note_message(message: ConversationMessage) -> bool:
+    return message.metadata.get('synthetic_role') == 'auto_user_note' or any(
+        (part.origin or '') == 'auto_note' for part in message.parts)
+
 @dataclass(slots=True)
 class StoredConversationMessage:
     db_id: int
     message: ConversationMessage
     estimated_tokens: int
     created_at: int | None = None
+    context_version: int = field(default=0, compare=False, repr=False)
     @property
     def image_count(self) -> int:
-        return sum(1 for part in self.message.parts if part.kind == PartKind.IMAGE)
+        return sum(1 for part in self.message.parts if part.kind == PartKind.IMAGE
+            and (part.data_b64 or part.preview_ref))
 
 @dataclass(slots=True)
 class MemoryBlock:
@@ -35,6 +54,7 @@ class MemoryBlock:
     validator_status: str | None = None
     validator_score: float | None = None
     structured_data: dict[str, Any] = field(default_factory=dict)
+    compaction_version: int = field(default=0, compare=False, repr=False)
     def render_as_message(self) -> ConversationMessage:
         scope_bits: list[str] = []
         if self.time_start or self.time_end:
@@ -61,6 +81,8 @@ class LiveConversationState:
     estimated_images: int = 0
     last_message_id: int = 0
     loaded: bool = False
+    cache_revision: int = 0
+    database_version: int = -1
     provider_history_cache: list[ConversationMessage] = field(default_factory=list)
     provider_history_cache_key: tuple[str, str, str, tuple[int, ...], int] | None = None
     provider_history_token_cache: dict[tuple[str, str, str, tuple[int, ...], int], int] = field(default_factory=dict)
@@ -103,6 +125,7 @@ class LiveConversationState:
         return list(participants)
 
     def rebuild_estimate(self) -> int:
+        self.cache_revision += 1
         self.estimated_tokens = sum(block.estimated_tokens for block in self.blocks) + sum(item.estimated_tokens for item in self.raw_messages)
         self.estimated_images = sum(item.image_count for item in self.raw_messages)
         self.last_message_id = max(max((item.db_id for item in self.raw_messages), default=0),
@@ -111,3 +134,17 @@ class LiveConversationState:
         self.provider_history_cache_key = None
         self.provider_history_token_cache.clear()
         return self.estimated_tokens
+
+
+@dataclass(slots=True)
+class CompactionWorkingSet(LiveConversationState):
+    """A bounded database projection for maintenance, never a live cache entry."""
+    through_message_id: int = 0
+    more_raw: bool = False
+    more_blocks: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ImageRetirement:
+    removed_images: int
+    compaction_version: int | None = None

@@ -51,3 +51,4 @@ async def bind_message_source(store: PostgresStore, session_id: str, message_id:
                 (session_id,generation,source,source_chat_id,source_message_id,message_id)
                 VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING''',
                 (session_id, scope['generation'], source, source_chat_id, source_id, message_id))
+        await conn.execute('UPDATE sessions SET context_version=context_version+1 WHERE session_id=%s', (session_id,))

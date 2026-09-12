@@ -172,6 +172,12 @@ class OutboundArtifact:
     filename: str
     mime_type: str | None = None
     caption: str | None = None
+    temporary: bool = False
+
+    def discard(self) -> None:
+        """Release an owned transfer copy, never the original workspace file."""
+        if self.temporary:
+            self.path.unlink(missing_ok=True)
 
 
 @dataclass(slots=True)
@@ -191,15 +197,21 @@ class OutboundSticker:
         return str(self.source_id or self.label or self.path.stem or 'sticker').strip() or 'sticker'
 
     def delivery_receipt(self) -> dict[str, Any]:
-        return {
+        state = self.delivery_state or 'queued'
+        receipt = {
             'sticker_id': self.source_id or self.path.stem,
             'sticker_label': self.label,
             'delivery_timing': self.timing.value,
             'emoji': self.emoji,
-            'delivery_state': 'failed',
-            'sent': False,
+            'delivery_state': state,
+            'sent': state == 'sent',
             'operation_id': self.delivery_operation_id,
         }
+        if self.telegram_message_id is not None:
+            receipt['telegram_message_id'] = self.telegram_message_id
+        if self.error is not None:
+            receipt['error'] = self.error
+        return receipt
 
 
 @dataclass(slots=True)
@@ -241,6 +253,7 @@ class TurnResult:
     usage: UsageInfo = field(default_factory=UsageInfo)
     stickers: list[OutboundSticker] = field(default_factory=list)
     provider_name: str | None = None
+    provider_model: str | None = None
     provider_history_items: list[dict[str, Any]] = field(default_factory=list)
     scope: dict[str, int] | None = None
     reply_target: dict[str, Any] = field(default_factory=dict)

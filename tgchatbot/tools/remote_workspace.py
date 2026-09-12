@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import codecs
 import hashlib
 import json
 import logging
@@ -9,7 +10,6 @@ import os
 import posixpath
 import tempfile
 import re
-import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -106,6 +106,9 @@ class RemoteWorkspaceClient:
                 )
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=self.ssh.connect_timeout_s + 5)
+                except asyncio.CancelledError:
+                    await self._terminate_process(proc)
+                    raise
                 except asyncio.TimeoutError:
                     await self._terminate_process(proc)
                     raise RuntimeError('Timed out starting persistent SSH master')
@@ -144,6 +147,9 @@ class RemoteWorkspaceClient:
         )
         try:
             await asyncio.wait_for(proc.wait(), timeout=self.ssh.connect_timeout_s + 2)
+        except asyncio.CancelledError:
+            await self._terminate_process(proc)
+            raise
         except asyncio.TimeoutError:
             await self._terminate_process(proc)
             return False
@@ -173,6 +179,9 @@ class RemoteWorkspaceClient:
             )
             try:
                 await asyncio.wait_for(proc.wait(), timeout=self.ssh.connect_timeout_s + 5)
+            except asyncio.CancelledError:
+                await self._terminate_process(proc)
+                raise
             except asyncio.TimeoutError:
                 await self._terminate_process(proc)
 
@@ -226,7 +235,12 @@ class RemoteWorkspaceClient:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            _stdout, stderr = await proc.communicate()
+            try:
+                _stdout, stderr = await asyncio.wait_for(proc.communicate(),
+                    timeout=self.ssh.default_timeout_s + self.ssh.connect_timeout_s)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                await self._terminate_process(proc)
+                raise
             if proc.returncode != 0:
                 raise RuntimeError(f'Failed to sync input files: {stderr.decode("utf-8", errors="replace")[:400]}')
             for path, remote_path in to_upload:
@@ -310,9 +324,7 @@ class RemoteWorkspaceClient:
         paths = await self.ensure_session_dirs(session_id)
         remote_script = f'{paths.root}/run.py'
         wrapped = (
-            f"set -e; cat > {shq(remote_script)} <<'PYCODE'\n"
-            f"{code}\n"
-            "PYCODE\n"
+            f"set -e; printf %s {shq(code)} > {shq(remote_script)}; "
             f"cd {shq(paths.root)}; "
             f"TGCHATBOT_SESSION_DIR={shq(paths.root)} "
             f"TGCHATBOT_INPUT_DIR={shq(paths.inputs)} "
@@ -354,7 +366,7 @@ class RemoteWorkspaceClient:
         max_files: int | None = None,
     ) -> list[OutboundArtifact]:
         paths = await self.ensure_session_dirs(session_id)
-        max_files = max_files or self.ssh.max_output_files
+        max_files = self.ssh.max_output_files if max_files is None else max_files
         if remote_paths:
             remote_paths = [self._scope_to_path(paths, scope.rstrip('/')) + '/' + path.lstrip('/') if not os.path.isabs(path) else path for path in remote_paths]
             selected = [self._validate_remote_path(paths, value) for value in remote_paths]
@@ -366,27 +378,42 @@ class RemoteWorkspaceClient:
         local_dir = self.config.artifact_dir / session_id / 'remote_fetch'
         local_dir.mkdir(parents=True, exist_ok=True)
         artifacts: list[OutboundArtifact] = []
-        for remote_path in selected:
-            filename = os.path.basename(remote_path)
-            local_path = local_dir / filename
-            scp_cmd = self._scp_base_args()
-            scp_cmd.extend([f"{self.ssh.host}:{remote_path}", str(local_path)])
-            proc = await asyncio.create_subprocess_exec(
-                *scp_cmd,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _stdout, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                logger.warning('Failed to fetch remote file %s: %s', remote_path, stderr.decode('utf-8', errors='replace')[:300])
-                continue
-            if not local_path.exists() or not local_path.is_file():
-                continue
-            if local_path.stat().st_size > self.ssh.max_output_file_bytes:
-                local_path.unlink(missing_ok=True)
-                continue
-            artifacts.append(OutboundArtifact(path=local_path, filename=filename))
+        try:
+            for remote_path in selected:
+                filename = os.path.basename(remote_path)
+                descriptor, temporary = tempfile.mkstemp(prefix='fetch-', suffix='-' + filename, dir=local_dir)
+                os.close(descriptor)
+                local_path = Path(temporary)
+                retained = False
+                try:
+                    scp_cmd = self._scp_base_args()
+                    scp_cmd.extend([f"{self.ssh.host}:{remote_path}", str(local_path)])
+                    proc = await asyncio.create_subprocess_exec(
+                        *scp_cmd,
+                        stdin=asyncio.subprocess.DEVNULL,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    try:
+                        _stdout, stderr = await asyncio.wait_for(proc.communicate(),
+                            timeout=self.ssh.default_timeout_s + self.ssh.connect_timeout_s)
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        await self._terminate_process(proc)
+                        raise
+                    if proc.returncode != 0:
+                        logger.warning('Failed to fetch remote file %s: %s', remote_path, stderr.decode('utf-8', errors='replace')[:300])
+                        continue
+                    if not local_path.is_file() or local_path.stat().st_size > self.ssh.max_output_file_bytes:
+                        continue
+                    artifacts.append(OutboundArtifact(path=local_path, filename=filename, temporary=True))
+                    retained = True
+                finally:
+                    if not retained:
+                        local_path.unlink(missing_ok=True)
+        except BaseException:
+            for artifact in artifacts:
+                artifact.discard()
+            raise
         return artifacts
 
     async def _run_ssh_command(self, command: str, *, timeout_s: int) -> dict[str, Any]:
@@ -399,7 +426,15 @@ class RemoteWorkspaceClient:
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s + self.ssh.connect_timeout_s)
+            stdout, stderr, _ = await asyncio.wait_for(asyncio.gather(
+                self._read_output(proc.stdout, self.ssh.max_stdout_chars),
+                self._read_output(proc.stderr, self.ssh.max_stderr_chars),
+                proc.wait()), timeout=timeout_s + self.ssh.connect_timeout_s)
+        except asyncio.CancelledError:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            await proc.communicate()
+            raise
         except asyncio.TimeoutError:
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
@@ -409,12 +444,26 @@ class RemoteWorkspaceClient:
         result = {
             'ok': proc.returncode == 0,
             'returncode': proc.returncode,
-            'stdout': stdout_b.decode('utf-8', errors='replace')[: self.ssh.max_stdout_chars],
-            'stderr': stderr_b.decode('utf-8', errors='replace')[: self.ssh.max_stderr_chars],
+            'stdout': stdout,
+            'stderr': stderr,
         }
         level = logger.info if result['ok'] else logger.warning
         level('remote.exec.done rc=%s stdout=%s stderr=%s', result['returncode'], len(result['stdout']), len(result['stderr']))
         return result
+
+    @staticmethod
+    async def _read_output(stream: asyncio.StreamReader, limit: int) -> str:
+        decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+        kept: list[str] = []
+        remaining = max(0, limit)
+        while chunk := await stream.read(64 * 1024):
+            if remaining:
+                text = decoder.decode(chunk)[:remaining]
+                kept.append(text)
+                remaining -= len(text)
+        if remaining:
+            kept.append(decoder.decode(b'', final=True)[:remaining])
+        return ''.join(kept)
 
     async def _terminate_process(self, proc: asyncio.subprocess.Process) -> None:
         with contextlib.suppress(ProcessLookupError):

@@ -6,12 +6,15 @@ from typing import Any, Mapping, Sequence
 
 async def expand_message_ids(store, session_id: str, message_ids: Sequence[int], *,
                              expected_scope: Mapping[str, Any] | None = None,
-                             neighbors: int | None = None, limit: int | None = None) -> list[int]:
+                             neighbors: int | None = None, limit: int | None = None,
+                             include_selected: bool = True) -> list[int]:
     """Keep selected sources first, then explicit replies and nearby originals.
 
     The caller's read window determines the total result size. Neighbor defaults
     come from the existing environment, independently of the archive's size.
     Import order never determines proximity; timestamps do, with IDs breaking ties.
+    Search can request only related originals without spending that read window
+    on sources it has already returned. The selected seed window remains bounded.
     """
     ids = list(dict.fromkeys(int(value) for value in message_ids))
     neighbors = store.config.relationship_neighbors if neighbors is None else neighbors
@@ -33,7 +36,8 @@ async def expand_message_ids(store, session_id: str, message_ids: Sequence[int],
             (session_id, scope['generation'], ids))).fetchall()
         by_id = {row['id']: row for row in seeds}
         selected = [message_id for message_id in ids if message_id in by_id][:limit]
-        result = list(selected)
+        result = list(selected) if include_selected else []
+        seen = set(ids)
         if len(result) == limit:
             return result
         for message_id in selected:
@@ -56,8 +60,9 @@ async def expand_message_ids(store, session_id: str, message_ids: Sequence[int],
                         AND NOT m.hidden AND NOT m.deleted LIMIT 1''',
                         (session_id, scope['generation'], seed['source'], seed['source_chat_id'],
                          seed['reply_to_source_id']))).fetchone()
-                if reply and reply['id'] not in result:
+                if reply and reply['id'] not in seen:
                     result.append(reply['id'])
+                    seen.add(reply['id'])
                     if len(result) == limit:
                         return result
         for message_id in selected:
@@ -75,8 +80,9 @@ async def expand_message_ids(store, session_id: str, message_ids: Sequence[int],
                         AND (sent_at,id) {operator} (%s,%s) ORDER BY sent_at {direction},id {direction} LIMIT %s''',
                         parameters)).fetchall()
                     for row in rows:
-                        if row['id'] not in result:
+                        if row['id'] not in seen:
                             result.append(row['id'])
+                            seen.add(row['id'])
                             if len(result) == limit:
                                 return result
         return result

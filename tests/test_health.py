@@ -35,3 +35,11 @@ class HealthTests(unittest.IsolatedAsyncioTestCase):
             path.write_text(json.dumps({"pid": os.getpid(), "time": 99}))
             with patch("tgchatbot.healthcheck.os.kill", side_effect=ProcessLookupError):
                 self.assertFalse(healthy(path, now=100))
+
+    def test_configured_age_controls_readiness(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'health'
+            path.write_text(json.dumps({'pid': os.getpid(), 'time': 100}))
+            with patch.dict(os.environ, {'APP_HEALTH_MAX_AGE_S': '60'}):
+                self.assertTrue(healthy(path, now=145))
+                self.assertFalse(healthy(path, now=161))

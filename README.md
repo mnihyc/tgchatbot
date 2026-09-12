@@ -12,12 +12,8 @@ chats can use different providers without replacing their conversation state.
 You need Linux, Docker with Compose, a Telegram bot token, and a configured model
 provider. Keep deployment files and retained data separate from the source checkout.
 
-```sh
-mkdir tgchatbot
-cd tgchatbot
-curl -fsSLO https://github.com/mnihyc/tgchatbot/releases/latest/download/update.sh
-bash update.sh
-```
+Download and unpack the [latest deployment bundle](https://github.com/mnihyc/tgchatbot/releases/latest),
+then run `./update.sh` from the extracted directory.
 
 The first run creates `.env`. Set `TGBOT_TOKEN` and a provider key, then run
 `./update.sh` again. Existing `.env` settings are retained. The updater configures
@@ -87,6 +83,11 @@ Retry and rollback affect the current context. They do not retract Telegram
 messages or undo remote actions. Full reset leaves the shared sticker library and
 optional SSH workspace intact. Participants are identified by stable source IDs,
 not display names; forwarded content retains its separate attribution.
+
+Memory search includes image references beside attributed conversation context.
+The agent can open selected images with `memory_read`. Compressed image evidence
+stays in PostgreSQL after prompt compaction and `/reset`; `/reset_full` makes the
+old generation audit-only. Missing exported image files remain unavailable.
 
 Stickers require an explicitly built catalog. The agent retrieves candidates,
 inspects available evidence, and chooses a sticker or text. Query previews are

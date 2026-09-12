@@ -111,7 +111,7 @@ class StickerEvidenceWorkflowTests(BusinessTestCase):
         restarted = AgentRuntime(config=self.config,store=self.store,tool_registry=self.tools,providers={'gemini':gemini},preview_cache=self.preview_cache)
         state = await restarted._get_live_state(self.session)
         history = restarted._build_provider_history(state,settings=settings,provider_name='gemini')
-        history = [self.preview_cache.materialize(row,vision=True) for row in history]
+        history = await self.preview_cache.materialize_many(self.session, history, vision=True)
         contents = [item for row in history for item in gemini._message_to_contents(row)]
         responses = [part['functionResponse'] for item in contents for part in item.get('parts',[]) if 'functionResponse' in part]
         self.assertEqual(sum(len(response.get('parts',[])) for response in responses),2)
@@ -216,9 +216,11 @@ class StickerDeliveryWorkflowTests(BusinessTestCase):
 
     async def queued(self, operation='operation', timing=StickerTiming.AFTER_FINAL):
         scope = await self.store.get_scope(self.session)
-        await self.deliveries.queue(self.session,'asset',operation_id=operation,expected_scope=scope,timing=timing.value)
+        digest = hashlib.sha256(self.asset.read_bytes()).hexdigest()
+        await self.deliveries.queue(self.session,'asset',operation_id=operation,expected_scope=scope,
+            timing=timing.value, metadata={'content_sha256': digest})
         return OutboundSticker(self.asset,source_id='asset',timing=timing,delivery_operation_id=operation,
-            content_sha256=hashlib.sha256(self.asset.read_bytes()).hexdigest())
+            content_sha256=digest)
 
     async def deliver(self, sticker):
         return await send_sticker(self.bot,chat_id=100,sticker=sticker,deliveries=self.deliveries)
@@ -289,3 +291,123 @@ class StickerDeliveryWorkflowTests(BusinessTestCase):
         self.assertTrue((await renderer.send_stickers([sticker]))[0]['sent'])
         self.assertTrue((await self.deliver(sticker))['sent'])
         self.bot.send_sticker.assert_awaited_once()
+
+    async def test_reconstructed_selection_gets_the_actual_prior_receipt(self):
+        first = await self.queued()
+        await self.deliver(first)
+        restored = replace(first, delivery_state='queued', telegram_message_id=None)
+        receipt = await self.deliver(restored)
+        self.assertEqual(receipt, restored.delivery_receipt())
+        self.assertEqual(restored.delivery_state, 'sent')
+        self.assertEqual(restored.telegram_message_id, 51)
+        self.bot.send_sticker.assert_awaited_once()
+
+    async def test_durable_operation_cannot_be_reused_for_another_selection(self):
+        selected = await self.queued()
+        for other in (replace(selected, source_id='different-asset'),
+                      replace(selected, content_sha256='different-content')):
+            with self.assertRaises(ValueError):
+                await self.deliver(other)
+        self.bot.send_sticker.assert_not_awaited()
+        self.assertEqual((await self.deliveries.get('operation'))['status'], 'queued')
+        self.assertTrue((await self.deliver(selected))['sent'])
+
+    async def test_queue_retry_preserves_exact_original_timing_and_content(self):
+        scope = await self.store.get_scope(self.session)
+        await self.deliveries.queue(self.session, 'asset', operation_id='bound', expected_scope=scope,
+            timing='after_final', metadata={'content_sha256': 'original'})
+        for timing, content in [('send_now', 'original'), ('after_final', 'replacement')]:
+            with self.subTest(timing=timing, content=content), self.assertRaises(ValueError):
+                await self.deliveries.queue(self.session, 'asset', operation_id='bound', expected_scope=scope,
+                    timing=timing, metadata={'content_sha256': content})
+        row = await self.deliveries.get('bound')
+        self.assertEqual(row['timing'], 'after_final')
+        self.assertEqual(row['metadata']['content_sha256'], 'original')
+
+    async def test_concurrent_delivery_attempts_have_one_telegram_owner(self):
+        selected = await self.queued()
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def delayed_ack(**kwargs):
+            entered.set()
+            await release.wait()
+            return SimpleNamespace(message_id=61)
+        self.bot.send_sticker.side_effect = delayed_ack
+        first = asyncio.create_task(self.deliver(selected))
+        try:
+            await entered.wait()
+            replay = replace(selected)
+            self.assertEqual((await self.deliver(replay))['delivery_state'], 'sending')
+            self.bot.send_sticker.assert_awaited_once()
+        finally:
+            release.set()
+            receipt = await first
+        self.assertEqual(receipt['delivery_state'], 'sent')
+        self.assertEqual((await self.deliver(replay))['telegram_message_id'], 61)
+        self.bot.send_sticker.assert_awaited_once()
+
+    async def test_static_upload_conversion_preserves_pixels_and_original_identity(self):
+        import io
+        from PIL import Image
+        for extension in ('png', 'jpg'):
+            with self.subTest(extension=extension):
+                self.asset = self.path / f'original.{extension}'
+                picture = Image.new('RGBA', (12, 10), (70, 120, 200, 255))
+                if extension == 'png':
+                    picture.putpixel((0, 0), (20, 30, 40, 0))
+                    picture.save(self.asset)
+                else:
+                    picture.convert('RGB').save(self.asset)
+                original = self.asset.read_bytes()
+                with Image.open(io.BytesIO(original)) as image:
+                    expected = image.convert('RGBA').tobytes()
+                selected = await self.queued(extension)
+                sent = []
+                async def capture(**kwargs):
+                    sent.append((kwargs['sticker'].name, kwargs['sticker'].read()))
+                    return SimpleNamespace(message_id=71)
+                self.bot.send_sticker.side_effect = capture
+                receipt = await self.deliver(selected)
+                self.assertTrue(receipt['sent'])
+                self.assertTrue(sent[0][0].endswith('.webp'))
+                with Image.open(io.BytesIO(sent[0][1])) as image:
+                    self.assertEqual(image.format, 'WEBP')
+                    self.assertEqual(image.convert('RGBA').tobytes(), expected)
+                self.assertEqual(self.asset.read_bytes(), original)
+                self.assertEqual(selected.content_sha256, hashlib.sha256(original).hexdigest())
+
+    async def test_unsupported_animation_is_not_silently_reduced_to_one_frame(self):
+        from PIL import Image
+        self.asset = self.path / 'animation.gif'
+        first, last = Image.new('RGB', (12, 12), 'red'), Image.new('RGB', (12, 12), 'blue')
+        first.save(self.asset, save_all=True, append_images=[last], duration=100, loop=0)
+        original = self.asset.read_bytes()
+        result = await self.deliver(await self.queued())
+        self.assertFalse(result['sent'])
+        self.assertEqual(result['error'], 'unsupported_sticker_animation')
+        self.bot.send_sticker.assert_not_awaited()
+        self.assertEqual(self.asset.read_bytes(), original)
+
+    async def test_verified_original_is_frozen_before_the_telegram_request(self):
+        original = self.asset.read_bytes()
+        selected = await self.queued()
+        sent = []
+        async def replace_source_during_send(**kwargs):
+            self.asset.write_bytes(b'replacement after hash verification')
+            sent.append(kwargs['sticker'].read())
+            return SimpleNamespace(message_id=72)
+        self.bot.send_sticker.side_effect = replace_source_during_send
+        result = await self.deliver(selected)
+        self.assertTrue(result['sent'])
+        self.assertEqual(sent, [original])
+
+    async def test_each_delivery_preserves_its_source_topic(self):
+        for field, value in (('message_thread_id', 37), ('direct_messages_topic_id', 17)):
+            with self.subTest(field=field):
+                selected = await self.queued(field)
+                result = await send_sticker(self.bot, chat_id=100, sticker=selected,
+                    deliveries=self.deliveries, **{field: value})
+                self.assertTrue(result['sent'])
+                request = self.bot.send_sticker.await_args.kwargs
+                self.assertEqual(request[field], value)
+                other = 'message_thread_id' if field == 'direct_messages_topic_id' else 'direct_messages_topic_id'
+                self.assertNotIn(other, request)

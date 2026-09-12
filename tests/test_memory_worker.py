@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import replace
 import os
@@ -10,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 import numpy as np
 
 from tests.business_helpers import BusinessTestCase
+from tgchatbot.core.memory import MemoryService
 from tgchatbot.core.memory_worker import MemoryWorker, ExcerptBuilder, WorkerConfig
 from tgchatbot.domain.models import ConversationMessage, ProviderResponse
 from tgchatbot.embeddings import BatchJob, BatchItemResult
@@ -53,6 +55,15 @@ class WorkerWorkflowTests(BusinessTestCase):
         jobs = await self.store.claim_jobs(kind='memory_ingest', limit=16, lease_seconds=900)
         await self.worker._ingest(jobs)
 
+    async def profile_jobs(self):
+        job = await self.store.claim_profile_batch(session_id=self.session, lazy=True,
+            max_bytes=self.worker.limits.profile_request_bytes, lease_seconds=self.worker.limits.lease_seconds)
+        return [job] if job else []
+
+    def patch_response(self, facts=(), removals=()):
+        return ProviderResponse(final_text=json.dumps({'additions': [dict(fact, status=fact.get('status', 'active'),
+            reason='Supported by the cited original declaration.') for fact in facts], 'removals': list(removals)}))
+
     async def test_live_tail_accumulates_originals_across_batches_and_seals_after_idle(self):
         first = await self.source('I prefer jasmine tea.', 1)
         await self.ingest_pending()
@@ -95,11 +106,11 @@ class WorkerWorkflowTests(BusinessTestCase):
     async def test_profile_generation_uses_original_actor_evidence_and_rejects_fabricated_sources(self):
         source = await self.source('I prefer concise replies.', 1)
         await self.ingest_pending()
-        jobs = await self.store.claim_jobs(kind='memory_profile', limit=1, lease_seconds=900)
+        jobs = await self.profile_jobs()
         fact = {'subject_actor_id': 'telegram:user:7', 'asserted_by': 'telegram:user:7',
                 'claim': 'Prefers concise replies', 'kind': 'explicit', 'source_ids': [source.db_id],
                 'valid_from': None, 'valid_to': None}
-        self.provider.responses = [ProviderResponse(final_text=json.dumps({'facts': [fact]}))]
+        self.provider.responses = [self.patch_response([fact])]
         await self.worker._profile(jobs)
         saved = await self.store.get_profile(self.session, 'telegram:user:7')
         self.assertEqual(saved[0]['source_ids'], [source.db_id])
@@ -172,29 +183,27 @@ class WorkerWorkflowTests(BusinessTestCase):
         limits = from_env(WorkerConfig, 'MEMORY_WORKER', {
             'MEMORY_WORKER_INGEST_SOURCES': '250', 'MEMORY_WORKER_CLAIM_JOBS': '64',
             'MEMORY_WORKER_EXCERPT_TOKENS': '30000', 'MEMORY_WORKER_EXCERPT_CANDIDATE_CHARS': '32',
-            'MEMORY_WORKER_PROFILE_REQUEST_BYTES': '50000', 'MEMORY_WORKER_PROFILE_MAX_FACTS': '23',
-            'MEMORY_WORKER_PROFILE_CLAIM_CHARS': '1500', 'MEMORY_WORKER_PROFILE_OUTPUT_TOKENS': '8192',
-            'MEMORY_WORKER_PROFILE_EXISTING_PER_ACTOR': '0', 'MEMORY_WORKER_PROFILE_EXISTING_TOTAL': '0'})
+            'MEMORY_WORKER_PROFILE_REQUEST_BYTES': '50000', 'MEMORY_WORKER_PROFILE_OUTPUT_TOKENS': '8192'})
         self.worker = MemoryWorker(store=self.store, embeddings=self.embeddings,
-            providers={'openai': self.provider}, config=self.config, batch=True, limits=limits)
+            providers={'openai': self.provider}, config=replace(self.config, memory=replace(self.config.memory, profile_bytes=8192)), batch=True, limits=limits)
         self.assertTrue(await self.worker.run_once())
         async with self.store.pool.connection() as conn:
             excerpts = await (await conn.execute('SELECT source_ids FROM excerpts')).fetchall()
         self.assertEqual({mid for row in excerpts for mid in row['source_ids']}, {row.db_id for row in originals})
-        profile_jobs = await self.store.claim_jobs(kind='memory_profile', limit=10, lease_seconds=900)
+        profile_jobs = await self.profile_jobs()
         self.assertEqual(len(profile_jobs), 1)
         self.assertEqual(set(profile_jobs[0]['source_ids']), {row.db_id for row in originals})
         facts = [{'subject_actor_id': 'telegram:user:7', 'asserted_by': 'telegram:user:7',
                   'claim': f'Prefers option {index}', 'kind': 'explicit', 'source_ids': [row.db_id],
                   'valid_from': None, 'valid_to': None, 'supersedes': None}
                  for index, row in enumerate(originals[:23], start=1)]
-        self.provider.responses = [ProviderResponse(final_text=json.dumps({'facts': facts}))]
+        self.provider.responses = [self.patch_response(facts)]
         await self.worker._profile(profile_jobs)
         request = self.provider.requests[-1]
         evidence = json.loads(request['messages'][0].parts[0].text)
         self.assertEqual(len(evidence['original_evidence']), 205)
-        self.assertEqual(evidence['existing_facts'], [])
-        self.assertIn('at most 23 concise claims, each at most 1500 characters', request['instructions'])
+        self.assertTrue(all(not profile['facts'] for profile in evidence['current_profiles']))
+        self.assertIn('must fit 8192 UTF-8 bytes', request['instructions'])
         self.assertEqual(request['settings'].max_output_tokens, 8192)
         self.assertEqual(len(await self.store.get_profile(self.session, 'telegram:user:7', limit=100)), 23)
 
@@ -206,11 +215,12 @@ class WorkerWorkflowTests(BusinessTestCase):
                 'source': 'telegram', 'source_chat_id': '100', 'source_message_id': '2',
                 'actor_id': 'telegram:user:99', 'actor_kind': 'bot', 'actor_name': 'Another bot'}))
         await self.ingest_pending()
-        jobs = await self.store.claim_jobs(kind='memory_profile', limit=16, lease_seconds=900)
-        self.assertGreater(len(jobs), 1)
-        self.provider.responses = [ProviderResponse(final_text='{"facts": []}') for _ in jobs]
-        for job in jobs:
-            await self.worker._profile([job])
+        batches = 0
+        while jobs := await self.profile_jobs():
+            self.provider.responses = [self.patch_response()]
+            await self.worker._profile(jobs)
+            batches += 1
+        self.assertGreater(batches, 1)
         evidence = [piece for request in self.provider.requests
                     for piece in json.loads(request['messages'][0].parts[0].text)['original_evidence']]
         self.assertEqual({row['source_span']['message_id'] for row in evidence}, {human.db_id})
@@ -220,15 +230,406 @@ class WorkerWorkflowTests(BusinessTestCase):
     async def test_invalid_later_profile_claim_cannot_partially_publish_valid_earlier_claim(self):
         source = await self.source('I prefer tea and concise replies.', 1)
         await self.ingest_pending()
-        jobs = await self.store.claim_jobs(kind='memory_profile', limit=1, lease_seconds=900)
+        jobs = await self.profile_jobs()
         fact = {'subject_actor_id': 'telegram:user:7', 'asserted_by': 'telegram:user:7',
                 'claim': 'Prefers concise replies', 'kind': 'explicit', 'source_ids': [source.db_id],
                 'valid_from': None, 'valid_to': None, 'supersedes': None}
-        self.provider.responses = [ProviderResponse(final_text=json.dumps({'facts': [fact,
-            {**fact, 'claim': 'Invented from absent evidence', 'source_ids': [source.db_id + 999]}]}))]
+        self.provider.responses = [self.patch_response([fact,
+            {**fact, 'claim': 'Invented from absent evidence', 'source_ids': [source.db_id + 999]}])]
         with self.assertRaisesRegex(ValueError, 'unavailable source'):
             await self.worker._profile(jobs)
         self.assertEqual(await self.store.get_profile(self.session, 'telegram:user:7'), [])
+
+    async def test_background_profiles_wait_for_a_batch_and_do_not_depend_on_embeddings(self):
+        self.embeddings.enabled = False
+        self.worker.limits = replace(self.worker.limits, profile_request_bytes=26)
+        first = await self.source('I prefer tea.', 1)
+        for _ in range(3):
+            await self.worker.run_once()
+        self.assertEqual(self.provider.requests, [], 'A short message must not trigger profile generation')
+        second = await self.source('I like birds.', 2)
+        self.provider.responses = [self.patch_response([{
+            'subject_actor_id': 'telegram:user:7', 'asserted_by': 'telegram:user:7',
+            'claim': 'Prefers tea and likes birds', 'kind': 'explicit',
+            'source_ids': [first.db_id, second.db_id], 'valid_from': None, 'valid_to': None, 'supersedes': None}])]
+        for _ in range(5):
+            await self.worker.run_once()
+            if self.provider.requests:
+                break
+        self.assertEqual(len(self.provider.requests), 1)
+        self.assertEqual((await self.store.get_profile(self.session, 'telegram:user:7'))[0]['source_ids'],
+                         [first.db_id, second.db_id])
+        self.embeddings.embed_documents.assert_not_awaited()
+
+    async def test_bulk_import_does_not_starve_profiles_while_new_originals_keep_arriving(self):
+        self.worker.batch = True
+        self.embeddings.enabled = False
+        self.worker.limits = replace(self.worker.limits, profile_request_bytes=26)
+        self.provider.responses = [self.patch_response() for _ in range(5)]
+        for number in range(1, 6):
+            await self.source('I prefer jasmine tea. I like quiet places.', number)
+            await self.worker.run_once()
+        self.assertTrue(self.provider.requests, 'Profile processing must progress before the import queue drains')
+        self.assertTrue(await self.store.search_messages(self.session, 'jasmine'))
+
+    async def test_lazy_profile_fetch_processes_only_one_unicode_batch_before_indexing(self):
+        self.worker.limits = replace(self.worker.limits, profile_request_bytes=32)
+        text = '我喜欢安静的地方和有趣的企鹅。' * 4
+        original = await self.source(text, 1)
+        memory = MemoryService(self.store, self.embeddings)
+        memory.worker = self.worker
+        seen = ''
+        while len(seen) < len(text):
+            self.provider.responses = [self.patch_response()]
+            before = len(self.provider.requests)
+            result = await memory.fetch_profiles(self.session, ['telegram:user:7'])
+            self.assertTrue(result['ok'])
+            self.assertNotIn('more_available', result)
+            self.assertEqual(len(self.provider.requests), before + 1)
+            evidence = json.loads(self.provider.requests[-1]['messages'][0].parts[0].text)['original_evidence']
+            chunk = ''.join(item['text'] for item in evidence)
+            self.assertLessEqual(len(chunk.encode('utf-8')), 32)
+            seen += chunk
+        self.assertEqual(seen, text)
+        await memory.fetch_profiles(self.session, ['telegram:user:7'])
+        self.assertEqual(len(self.provider.requests), before + 1, 'Consumed sources must not learn again')
+        self.assertEqual((await self.store.read_messages(self.session, [original.db_id]))[0].message.parts[0].text, text)
+        self.embeddings.embed_documents.assert_not_awaited()
+
+    async def test_database_failure_rolls_back_every_profile_fact_and_source_cursor(self):
+        original = await self.source('I prefer tea. I like birds.', 1)
+        facts = [{'subject_actor_id': 'telegram:user:7', 'asserted_by': 'telegram:user:7',
+            'claim': claim, 'kind': 'explicit', 'source_ids': [original.db_id],
+            'valid_from': None, 'valid_to': None, 'supersedes': None} for claim in ('Prefers tea', 'Likes birds')]
+        async with self.store.pool.connection() as conn:
+            await conn.execute('''CREATE FUNCTION reject_second_fact() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN IF NEW.claim='Likes birds' THEN RAISE EXCEPTION 'synthetic publication failure'; END IF;
+                RETURN NEW; END $$''')
+            await conn.execute('''CREATE TRIGGER reject_second_fact BEFORE INSERT ON profile_facts
+                FOR EACH ROW EXECUTE FUNCTION reject_second_fact()''')
+        self.provider.responses = [self.patch_response(facts)]
+        from psycopg.errors import RaiseException
+        with self.assertRaises(RaiseException):
+            await self.worker._profile(await self.profile_jobs())
+        self.assertEqual(await self.store.get_profile(self.session, 'telegram:user:7'), [])
+        async with self.store.pool.connection() as conn:
+            pending = (await (await conn.execute('SELECT pending_bytes FROM profile_inputs WHERE message_id=%s', (original.db_id,))).fetchone())['pending_bytes']
+            audits = (await (await conn.execute('SELECT count(*) AS n FROM profile_patches')).fetchone())['n']
+        self.assertEqual(pending, len('I prefer tea. I like birds.'.encode()))
+        self.assertEqual(audits, 0)
+
+    async def test_concurrent_lazy_fetches_do_not_learn_or_publish_the_same_batch_twice(self):
+        source = await self.source('I prefer jasmine tea.', 1)
+        started, release = asyncio.Event(), asyncio.Event()
+        async def generate(**kwargs):
+            started.set()
+            await release.wait()
+            return self.patch_response([{'subject_actor_id': 'telegram:user:7', 'asserted_by': 'telegram:user:7',
+                'claim': 'Prefers jasmine tea', 'kind': 'explicit', 'source_ids': [source.db_id],
+                'valid_from': None, 'valid_to': None, 'supersedes': None}])
+        memory = MemoryService(self.store, self.embeddings)
+        memory.worker = self.worker
+        with patch.object(self.provider, 'generate', AsyncMock(side_effect=generate)) as request:
+            first = asyncio.create_task(memory.fetch_profiles(self.session, ['telegram:user:7']))
+            await asyncio.wait_for(started.wait(), timeout=5)
+            try:
+                second = await memory.fetch_profiles(self.session, ['telegram:user:7'])
+                self.assertEqual(second['profiles'][0]['facts'], [], 'Read the committed state while learning is in flight')
+                request.assert_awaited_once()
+            finally:
+                release.set()
+            result = await first
+        self.assertEqual(result['profiles'][0]['facts'][0]['claim'], 'Prefers jasmine tea')
+        async with self.store.pool.connection() as conn:
+            audits = (await (await conn.execute('SELECT count(*) AS n FROM profile_patches')).fetchone())['n']
+        self.assertEqual(audits, 1)
+
+    async def test_over_budget_patch_preserves_previous_profile_and_retryable_originals(self):
+        first = await self.source('I prefer tea.', 1)
+        old = await self.store.save_profile_fact(self.session, subject_actor_id='telegram:user:7',
+            asserted_by='telegram:user:7', claim='Prefers tea', source_ids=[first.db_id])
+        second = await self.source('I now prefer a quieter place.', 2)
+        self.provider.responses = [self.patch_response([{'subject_actor_id': 'telegram:user:7',
+            'asserted_by': 'telegram:user:7', 'claim': '安静' * 1000, 'kind': 'explicit',
+            'source_ids': [second.db_id], 'valid_from': None, 'valid_to': None, 'supersedes': None}],
+            [{'fact_id': old['id'], 'reason': 'Replace redundant detail.'}])]
+        with self.assertRaisesRegex(ValueError, 'MEMORY_PROFILE_BYTES'):
+            await self.worker._profile(await self.profile_jobs())
+        self.assertEqual([fact['id'] for fact in await self.store.get_profile(self.session, 'telegram:user:7')], [old['id']])
+        async with self.store.pool.connection() as conn:
+            pending = (await (await conn.execute('SELECT sum(pending_bytes) AS n FROM profile_inputs')).fetchone())['n']
+        self.assertGreater(pending, 0)
+
+    async def test_structured_retirement_keeps_audit_and_withdrawal_restores_if_evidence_is_hidden(self):
+        first = await self.source('I prefer tea.', 1)
+        old = await self.store.save_profile_fact(self.session, subject_actor_id='telegram:user:7',
+            asserted_by='telegram:user:7', claim='Prefers tea', source_ids=[first.db_id])
+        withdrawal = await self.source('That preference no longer applies.', 2)
+        self.provider.responses = [self.patch_response([{'subject_actor_id': 'telegram:user:7',
+            'asserted_by': 'telegram:user:7', 'claim': 'Withdraws preference for tea', 'kind': 'explicit',
+            'status': 'retracted', 'source_ids': [withdrawal.db_id], 'valid_from': None,
+            'valid_to': None, 'supersedes': old['id']}])]
+        await self.worker._profile(await self.profile_jobs())
+        self.assertEqual(await self.store.get_profile(self.session, 'telegram:user:7'), [])
+        await self.store.hide_message_ids(self.session, [withdrawal.db_id])
+        self.assertEqual(await self.store.get_profile(self.session, 'telegram:user:7'), [])
+        self.provider.responses = [self.patch_response([{'subject_actor_id': 'telegram:user:7',
+            'asserted_by': 'telegram:user:7', 'claim': 'Prefers tea', 'kind': 'explicit',
+            'source_ids': [first.db_id], 'valid_from': None, 'valid_to': None, 'supersedes': None}])]
+        await self.worker._profile(await self.profile_jobs())
+        self.assertEqual([fact['id'] for fact in await self.store.get_profile(self.session, 'telegram:user:7')], [old['id']])
+        async with self.store.pool.connection() as conn:
+            audit = (await (await conn.execute('SELECT patch FROM profile_patches')).fetchone())['patch']
+        self.assertEqual(audit['additions'][0]['status'], 'retracted')
+        self.assertIn('reason', audit['additions'][0])
+
+    async def test_full_reset_during_profile_generation_cannot_publish_or_process_old_evidence(self):
+        await self.source('A previous-generation preference.', 1)
+        async def reset_in_flight(**kwargs):
+            await self.store.reset_full(self.session, self.config.default_session_settings())
+            return self.patch_response()
+        with patch.object(self.provider, 'generate', AsyncMock(side_effect=reset_in_flight)):
+            from tgchatbot.storage.postgres_store import StaleScopeError
+            with self.assertRaises(StaleScopeError):
+                await self.worker._profile(await self.profile_jobs())
+        self.assertEqual(await self.profile_jobs(), [])
+        async with self.store.pool.connection() as conn:
+            sources = (await (await conn.execute('SELECT count(*) AS n FROM message_revisions')).fetchone())['n']
+            patches = (await (await conn.execute('SELECT count(*) AS n FROM profile_patches')).fetchone())['n']
+        self.assertEqual(sources, 1)
+        self.assertEqual(patches, 0)
+
+    async def test_profile_consolidation_retains_old_and_new_original_evidence(self):
+        first = await self.source('I prefer tea.', 1)
+        old = await self.store.save_profile_fact(self.session, subject_actor_id='telegram:user:7',
+            asserted_by='telegram:user:7', claim='Prefers tea', source_ids=[first.db_id])
+        self.provider.responses = [self.patch_response()]
+        await self.worker._profile(await self.profile_jobs())
+        second = await self.source('I prefer it unsweetened.', 2)
+        self.provider.responses = [self.patch_response([{'subject_actor_id': 'telegram:user:7',
+            'asserted_by': 'telegram:user:7', 'claim': 'Prefers unsweetened tea', 'kind': 'explicit',
+            'source_ids': [first.db_id, second.db_id], 'valid_from': None, 'valid_to': None, 'supersedes': None}],
+            [{'fact_id': old['id'], 'reason': 'The consolidated statement preserves both supported preferences.'}])]
+        await self.worker._profile(await self.profile_jobs())
+        facts = await self.store.get_profile(self.session, 'telegram:user:7')
+        self.assertEqual([fact['source_ids'] for fact in facts], [[first.db_id, second.db_id]])
+        self.assertEqual(facts[0]['claim'], 'Prefers unsweetened tea')
+        async with self.store.pool.connection() as conn:
+            audit = (await (await conn.execute('SELECT source_revisions FROM profile_patches ORDER BY id DESC LIMIT 1')).fetchone())['source_revisions']
+        self.assertEqual(audit, {str(first.db_id): 1, str(second.db_id): 1})
+        await self.store.hide_message_ids(self.session, [second.db_id])
+        self.assertEqual(await self.store.get_profile(self.session, 'telegram:user:7'), [])
+        self.provider.responses = [self.patch_response([{'subject_actor_id': 'telegram:user:7',
+            'asserted_by': 'telegram:user:7', 'claim': 'Prefers tea', 'kind': 'explicit',
+            'source_ids': [first.db_id], 'valid_from': None, 'valid_to': None, 'supersedes': None}])]
+        await self.worker._profile(await self.profile_jobs())
+        restored = await self.store.get_profile(self.session, 'telegram:user:7')
+        self.assertEqual([fact['id'] for fact in restored], [old['id']])
+        self.assertEqual(restored[0]['claim'], 'Prefers tea')
+
+    async def test_soft_reset_during_profile_generation_preserves_learning(self):
+        source = await self.source('I prefer calm replies.', 1)
+        async def reset_in_flight(**kwargs):
+            await self.store.reset_context(self.session)
+            return self.patch_response([{'subject_actor_id': 'telegram:user:7', 'asserted_by': 'telegram:user:7',
+                'claim': 'Prefers calm replies', 'kind': 'explicit', 'source_ids': [source.db_id],
+                'valid_from': None, 'valid_to': None, 'supersedes': None}])
+        with patch.object(self.provider, 'generate', AsyncMock(side_effect=reset_in_flight)):
+            await self.worker._profile(await self.profile_jobs())
+        self.assertEqual((await self.store.get_profile(self.session, 'telegram:user:7'))[0]['claim'], 'Prefers calm replies')
+        self.assertEqual(await self.profile_jobs(), [])
+
+    async def test_lazy_batches_preserve_order_across_unicode_parts(self):
+        from tgchatbot.domain.models import MessagePart, PartKind
+        self.worker.limits = replace(self.worker.limits, profile_request_bytes=4)
+        original = ConversationMessage.user_text('喜喜', metadata={'source': 'telegram', 'source_chat_id': '100',
+            'source_message_id': '1', 'actor_id': 'telegram:user:7', 'actor_kind': 'user'})
+        original.parts.append(MessagePart(kind=PartKind.TEXT, text='AB'))
+        await self.runtime.ingest_user_message(session_id=self.session, incoming_message=original)
+        seen = []
+        while jobs := await self.profile_jobs():
+            self.provider.responses = [self.patch_response()]
+            await self.worker._profile(jobs)
+            evidence = json.loads(self.provider.requests[-1]['messages'][0].parts[0].text)['original_evidence']
+            seen.extend(item['text'] for item in evidence)
+        self.assertEqual(''.join(seen), '喜喜AB')
+
+    async def test_generated_service_and_attachment_descriptions_are_not_profile_declarations(self):
+        for number, origin in enumerate(('attachment_excerpt', 'attachment_reference', 'service_event'), start=1):
+            message = ConversationMessage.user_text('I prefer the service-generated description.', metadata={
+                'source': 'telegram', 'source_chat_id': '100', 'source_message_id': str(number),
+                'actor_id': 'telegram:user:7', 'actor_kind': 'user'})
+            message.parts[0].origin = origin
+            source = await self.runtime.ingest_user_message(session_id=self.session, incoming_message=message)
+            with self.assertRaisesRegex(ValueError, 'original message'):
+                await self.store.save_profile_fact(self.session, subject_actor_id='telegram:user:7',
+                    asserted_by='telegram:user:7', claim='A fabricated personal preference', source_ids=[source.db_id])
+        self.assertEqual(await self.profile_jobs(), [])
+        self.assertEqual(self.provider.requests, [])
+
+    async def test_removal_only_patch_cannot_commit_after_existing_evidence_changes(self):
+        first = await self.source('I prefer tea.', 1)
+        old = await self.store.save_profile_fact(self.session, subject_actor_id='telegram:user:7',
+            asserted_by='telegram:user:7', claim='Prefers tea', source_ids=[first.db_id])
+        self.provider.responses = [self.patch_response()]
+        await self.worker._profile(await self.profile_jobs())
+        second = await self.source('That detail is no longer useful.', 2)
+        async def change_in_flight(**kwargs):
+            await self.store.hide_message_ids(self.session, [first.db_id])
+            return self.patch_response(removals=[{'fact_id': old['id'], 'reason': 'Redundant profile detail.'}])
+        from tgchatbot.storage.postgres_store import StaleScopeError
+        with patch.object(self.provider, 'generate', AsyncMock(side_effect=change_in_flight)):
+            with self.assertRaises(StaleScopeError):
+                await self.worker._profile(await self.profile_jobs())
+        async with self.store.pool.connection() as conn:
+            audits = (await (await conn.execute('SELECT count(*) AS n FROM profile_patches')).fetchone())['n']
+            pending = (await (await conn.execute('SELECT pending_bytes FROM profile_inputs WHERE message_id=%s', (second.db_id,))).fetchone())['pending_bytes']
+        self.assertEqual(audits, 1, 'The stale retirement must not publish another audit patch')
+        self.assertGreater(pending, 0)
+
+    async def test_lower_profile_bound_reconciles_previous_membership_once_without_new_messages(self):
+        source = await self.source('I prefer quiet places and calm, concise replies.', 1)
+        old = [await self.store.save_profile_fact(self.session, subject_actor_id='telegram:user:7',
+            asserted_by='telegram:user:7', claim=f'Preference {number}: ' + '安静' * 80,
+            source_ids=[source.db_id]) for number in range(3)]
+        self.provider.responses = [self.patch_response()]
+        await self.worker._profile(await self.profile_jobs())
+        self.worker.config = replace(self.config, memory=replace(self.config.memory, profile_bytes=900))
+        memory = MemoryService(self.store, self.embeddings, config=self.worker.config.memory)
+        memory.worker = self.worker
+        self.provider.responses = [self.patch_response([{'subject_actor_id': 'telegram:user:7',
+            'asserted_by': 'telegram:user:7', 'claim': 'Prefers quiet places and calm, concise replies.',
+            'kind': 'explicit', 'source_ids': [source.db_id], 'valid_from': None, 'valid_to': None, 'supersedes': None}],
+            [{'fact_id': fact['id'], 'reason': 'Consolidate the supported preference under the smaller profile budget.'} for fact in old])]
+        before = len(self.provider.requests)
+        profile = (await memory.fetch_profiles(self.session, ['telegram:user:7']))['profiles'][0]
+        self.assertEqual(len(self.provider.requests), before + 1)
+
+        self.assertLessEqual(len(json.dumps(profile, ensure_ascii=False).encode('utf-8')), 900)
+        self.assertEqual(len(profile['facts']), 1)
+        generation_input = json.loads(self.provider.requests[-1]['messages'][0].parts[0].text)
+        self.assertEqual(generation_input['original_evidence'], [])
+        current = next(profile for profile in generation_input['current_profiles']
+                       if profile['actor_id'] == 'telegram:user:7')
+        self.assertEqual(len(current['facts']), 3)
+        await memory.fetch_profiles(self.session, ['telegram:user:7'])
+        self.assertEqual(len(self.provider.requests), before + 1)
+
+    async def test_agent_only_budget_reconciliation_preserves_human_assertor(self):
+        source = await self.source('Please keep your replies calm and concise.', 1)
+        old = [await self.store.save_profile_fact(self.session, subject_actor_id='agent',
+            asserted_by='telegram:user:7', claim=f'Reply preference {number}: ' + '安静' * 80,
+            source_ids=[source.db_id]) for number in range(3)]
+        self.provider.responses = [self.patch_response()]
+        await self.worker._profile(await self.profile_jobs())
+        self.worker.config = replace(self.config, memory=replace(self.config.memory, profile_bytes=900))
+        memory = MemoryService(self.store, self.embeddings, config=self.worker.config.memory)
+        memory.worker = self.worker
+        self.provider.responses = [self.patch_response([{'subject_actor_id': 'agent',
+            'asserted_by': 'telegram:user:7', 'claim': 'Use calm, concise replies.',
+            'kind': 'explicit', 'source_ids': [source.db_id], 'valid_from': None, 'valid_to': None, 'supersedes': None}],
+            [{'fact_id': fact['id'], 'reason': 'Consolidate the same human-supported reply preference.'} for fact in old])]
+        before = len(self.provider.requests)
+        result = await memory.fetch_profiles(self.session, ['agent'])
+        self.assertNotIn('refresh_error', result)
+        profile = result['profiles'][0]
+        self.assertEqual(len(self.provider.requests), before + 1)
+        self.assertLessEqual(len(json.dumps(profile, ensure_ascii=False).encode('utf-8')), 900)
+        self.assertEqual(len(profile['facts']), 1)
+        self.assertEqual(profile['facts'][0]['asserted_by'], 'telegram:user:7')
+        self.assertEqual(profile['facts'][0]['source_ids'], [source.db_id])
+
+    async def test_lazy_subject_selection_does_not_spend_its_batch_on_unrelated_old_backlog(self):
+        older = await self.source('Unrelated older material. ' * 100, 1, actor='telegram:user:8')
+        requested = await self.source('I prefer jasmine tea.', 2)
+        memory = MemoryService(self.store, self.embeddings)
+        memory.worker = self.worker
+        self.provider.responses = [self.patch_response([{'subject_actor_id': 'telegram:user:7',
+            'asserted_by': 'telegram:user:7', 'claim': 'Prefers jasmine tea', 'kind': 'explicit',
+            'source_ids': [requested.db_id], 'valid_from': None, 'valid_to': None, 'supersedes': None}])]
+        result = await memory.fetch_profiles(self.session, ['telegram:user:7'])
+        evidence = json.loads(self.provider.requests[-1]['messages'][0].parts[0].text)['original_evidence']
+        self.assertEqual({row['message_id'] for row in evidence}, {requested.db_id})
+        self.assertEqual(result['profiles'][0]['facts'][0]['claim'], 'Prefers jasmine tea')
+        async with self.store.pool.connection() as conn:
+            pending = (await (await conn.execute('SELECT pending_bytes FROM profile_inputs WHERE message_id=%s', (older.db_id,))).fetchone())['pending_bytes']
+        self.assertGreater(pending, 0)
+
+    async def test_lazy_subject_request_leaves_unrelated_pending_job_to_background(self):
+        older = await self.source('I enjoy hiking.', 1, actor='telegram:user:8')
+        job = (await self.profile_jobs())[0]
+        await self.store.defer_job(job, payload=job['payload'], delay_seconds=0)
+        await self.source('I prefer jasmine tea.', 2)
+        memory = MemoryService(self.store, self.embeddings)
+        memory.worker = self.worker
+        before = len(self.provider.requests)
+        result = await memory.fetch_profiles(self.session, ['telegram:user:7'])
+        self.assertEqual(len(self.provider.requests), before)
+        self.assertEqual(result['profiles'][0]['facts'], [])
+        self.assertNotIn('refresh_error', result)
+        self.provider.responses = [self.patch_response()]
+        self.assertTrue(await self.worker.run_once())
+        evidence = json.loads(self.provider.requests[-1]['messages'][0].parts[0].text)['original_evidence']
+        self.assertEqual({row['message_id'] for row in evidence}, {older.db_id})
+
+    async def test_background_profiles_share_progress_between_chats_with_old_backlogs(self):
+        await self.source('Earlier imported preferences. ' * 100, 1)
+        other = 'telegram:200'
+        await self.store.get_or_create_session(other, self.config.default_session_settings())
+        await self.store.append_message(other, ConversationMessage.user_text('Recent preferences. ' * 100,
+            metadata={'source': 'telegram', 'source_chat_id': '200', 'source_message_id': '1',
+                      'actor_id': 'telegram:user:8', 'actor_kind': 'user'}))
+        self.provider.responses = [self.patch_response() for _ in range(4)]
+        serviced = []
+        for _ in range(4):
+            job = await self.store.claim_profile_batch(max_bytes=64, lease_seconds=900)
+            serviced.append(job['session_id'])
+            await self.worker._profile([job])
+        self.assertEqual(serviced, [self.session, other, self.session, other])
+        async with self.store.pool.connection() as conn:
+            pending = await (await conn.execute('SELECT pending_bytes FROM profile_inputs')).fetchall()
+        self.assertTrue(all(row['pending_bytes'] > 0 for row in pending))
+
+    async def test_many_restored_audit_facts_reenter_bounded_batches_without_expanding_current_profile(self):
+        common = await self.source('I enjoy learning hobbies.', 1)
+        selected = await self.store.save_profile_fact(self.session, subject_actor_id='telegram:user:7',
+            asserted_by='telegram:user:7', claim='Enjoys learning hobbies', source_ids=[common.db_id])
+        self.provider.responses = [self.patch_response()]
+        await self.worker._profile(await self.profile_jobs())
+        originals = []
+        for number in range(20):
+            source = await self.source(f'I prefer option {number}.', number + 2)
+            originals.append(source)
+            independent = await self.store.save_profile_fact(self.session, subject_actor_id='telegram:user:7',
+                asserted_by='telegram:user:7', claim=f'Prefers option {number}', source_ids=[source.db_id])
+            self.provider.responses = [self.patch_response([{'subject_actor_id': 'telegram:user:7',
+                'asserted_by': 'telegram:user:7', 'claim': f'Enjoys learning hobbies and prefers option {number}',
+                'kind': 'explicit', 'source_ids': [common.db_id, source.db_id],
+                'valid_from': None, 'valid_to': None, 'supersedes': None}],
+                [{'fact_id': fact['id'], 'reason': 'Consolidated supported preferences.'} for fact in (selected, independent)])]
+            await self.worker._profile(await self.profile_jobs())
+            selected = (await self.store.get_profile(self.session, 'telegram:user:7'))[0]
+        await self.store.hide_message_ids(self.session, [common.db_id])
+        self.assertEqual(await self.store.get_profile(self.session, 'telegram:user:7'), [])
+        async with self.store.pool.connection() as conn:
+            current = (await (await conn.execute('SELECT fact_ids FROM profile_current WHERE actor_id=%s', ('telegram:user:7',))).fetchone())['fact_ids']
+            restored = (await (await conn.execute("SELECT count(*) AS n FROM profile_facts WHERE valid AND claim LIKE 'Prefers option %'")).fetchone())['n']
+        self.assertEqual(current, [])
+        self.assertEqual(restored, 20)
+        self.worker.limits = replace(self.worker.limits, profile_request_bytes=64)
+        memory = MemoryService(self.store, self.embeddings)
+        memory.worker = self.worker
+        self.provider.responses = [self.patch_response([{'subject_actor_id': 'telegram:user:7',
+            'asserted_by': 'telegram:user:7', 'claim': 'Prefers option 0', 'kind': 'explicit',
+            'source_ids': [originals[0].db_id], 'valid_from': None, 'valid_to': None, 'supersedes': None}])]
+        before = len(self.provider.requests)
+        result = await memory.fetch_profiles(self.session, ['telegram:user:7'])
+        self.assertEqual(len(self.provider.requests), before + 1)
+        request = json.loads(self.provider.requests[-1]['messages'][0].parts[0].text)
+        self.assertTrue(all(not profile['facts'] for profile in request['current_profiles']))
+        self.assertLessEqual(sum(len(item['text'].encode('utf-8')) for item in request['original_evidence']), 64)
+        self.assertEqual([fact['claim'] for fact in result['profiles'][0]['facts']], ['Prefers option 0'])
+        self.assertLessEqual(len(json.dumps(result['profiles'][0], ensure_ascii=False).encode('utf-8')), 4096)
 
     async def test_partial_paid_batch_retries_only_failed_original_through_standard_route(self):
         await self.source('First independent topic.', 1, topic='first')

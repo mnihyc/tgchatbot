@@ -24,6 +24,7 @@ class GenerationRetirementTests(BusinessTestCase):
         self.space = 'synthetic-space'
         self.vector = np.array([1.] + [0.] * 1535)
         self.embeddings = SimpleNamespace(enabled=True, space_id=self.space,
+            count_tokens=AsyncMock(side_effect=NotImplementedError),
             submit_batch=AsyncMock(), find_batch=AsyncMock(), poll_batch=AsyncMock(), read_batch_results=AsyncMock())
         self.worker = MemoryWorker(store=self.store, embeddings=self.embeddings, providers={}, config=self.config)
 
@@ -147,7 +148,12 @@ class GenerationRetirementTests(BusinessTestCase):
         async with self.store.pool.connection() as conn:
             await conn.execute('UPDATE jobs SET available_at=now() WHERE id=%s', (prepared['id'],))
         self.embeddings.poll_batch.return_value = BatchJob(name='batches/paid', state='JOB_STATE_PENDING', done=False, space_id=self.space)
-        self.assertTrue(await self.worker.run_once())
+        # Intervening intake gets a turn; the five queue owners must still let
+        # this already-paid job progress within one scheduler rotation.
+        for _ in range(5):
+            self.assertTrue(await self.worker.run_once())
+            if self.embeddings.poll_batch.await_count:
+                break
         self.embeddings.poll_batch.assert_awaited_once_with('batches/paid')
         self.embeddings.submit_batch.assert_awaited_once()
 

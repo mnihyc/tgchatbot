@@ -7,10 +7,11 @@ import re
 import time
 from dataclasses import dataclass, field
 
-from telegram import Bot, InputFile, Message
+from telegram import Bot, Message
 from telegram.error import BadRequest
 
 from tgchatbot.transports.sticker_delivery import send_sticker as deliver_sticker
+from tgchatbot.transports.telegram_routing import topic_arguments
 from tgchatbot.core.events import RuntimeEvent
 from tgchatbot.domain.models import OutboundArtifact, OutboundSticker, ProcessVisibility, ResponseDelivery
 
@@ -480,7 +481,7 @@ class TelegramMessageRenderer:
         return self.source_message.message_id
 
     async def _send_text_via_bot(self, bot: Bot, chat_id: int, text: str) -> Message:
-        message = await bot_message_safe(bot, 'send_message', chat_id=chat_id, text=text, parse_mode='MarkdownV2', disable_web_page_preview=True, reply_to_message_id=self._reply_to_message_id())
+        message = await bot_message_safe(bot, 'send_message', chat_id=chat_id, text=text, parse_mode='MarkdownV2', disable_web_page_preview=True, reply_to_message_id=self._reply_to_message_id(), **topic_arguments(self._delivery_target()))
         self._remember_final_message(message)
         return message
 
@@ -536,22 +537,17 @@ class TelegramMessageRenderer:
     async def _send_new_text(self, text: str) -> None:
         await self.send_text(text)
 
-    async def send_artifacts(self, artifacts: list[OutboundArtifact]) -> None:
+    async def send_artifacts(self, artifacts: list[OutboundArtifact]) -> list[dict]:
+        from tgchatbot.transports.artifact_delivery import deliver_artifact
         target = self._delivery_target()
         bot = target.get_bot()
         chat_id = target.chat.id
         reply_to_message_id = self._reply_to_message_id()
+        receipts = []
         for artifact in artifacts:
-            try:
-                suffix = artifact.path.suffix.lower()
-                if suffix in {'.png', '.jpg', '.jpeg', '.webp'}:
-                    with artifact.path.open('rb') as fh:
-                        await bot.send_photo(chat_id=chat_id, photo=fh, caption=artifact.caption, reply_to_message_id=reply_to_message_id)
-                else:
-                    with artifact.path.open('rb') as fh:
-                        await bot.send_document(chat_id=chat_id, document=InputFile(fh, filename=artifact.filename), caption=artifact.caption, reply_to_message_id=reply_to_message_id)
-            except Exception:
-                logger.exception('Failed to send artifact %s', artifact.path)
+            receipts.append(await deliver_artifact(bot, chat_id=chat_id, artifact=artifact,
+                reply_to_message_id=reply_to_message_id, **topic_arguments(target)))
+        return receipts
 
     async def send_stickers(self, stickers: list[OutboundSticker]) -> list[dict[str, object]]:
         target = self._delivery_target()
@@ -559,5 +555,5 @@ class TelegramMessageRenderer:
         for sticker in stickers:
             receipts.append(await deliver_sticker(target.get_bot(), chat_id=target.chat.id,
                 sticker=sticker, reply_to_message_id=self._reply_to_message_id(),
-                deliveries=self.sticker_delivery))
+                deliveries=self.sticker_delivery, **topic_arguments(target)))
         return receipts

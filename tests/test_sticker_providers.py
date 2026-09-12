@@ -46,7 +46,7 @@ class StickerProviderWorkflows(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(matches, [])
             self.assertEqual(catalog.stats()['stickers'], 0)
 
-    async def run_build_asset(self, embedding_backend, generation_backend='gemini'):
+    async def run_build_asset(self, embedding_backend, generation_backend='gemini', *, image_embeddings=True):
         directory = TemporaryDirectory(dir=Path(__file__).resolve().parent)
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
@@ -90,7 +90,7 @@ class StickerProviderWorkflows(unittest.IsolatedAsyncioTestCase):
             requests_per_minute=1e12, max_retries=0), http_client=http)
         store = Mock(stage_asset=AsyncMock())
         builder = CatalogBuilder(store, generation, embeddings, config=BuildConfig(provider=generation_backend,
-            model=app_config.default_model_for_provider(generation_backend), image_embeddings=embedding_backend == 'gemini'), media_config=MediaConfig(max_frames=2))
+            model=app_config.default_model_for_provider(generation_backend), image_embeddings=image_embeddings), media_config=MediaConfig(max_frames=2))
         await builder._process('new-staging-revision', root, asset)
         return requests, vector_requests, store.stage_asset.await_args_list, builder.recipe
 
@@ -113,9 +113,10 @@ class StickerProviderWorkflows(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final['state'], 'ready')
         self.assertEqual(final['reading_vectors'].shape, (2, 2))
         self.assertEqual(final['image_vector'].shape, (2,))
+        self.assertEqual(final['provenance']['visual_embedding_source'], 'image')
 
     async def test_text_embedding_provider_does_not_change_the_generation_provider(self):
-        requests, vectors, stages, recipe = await self.run_build_asset('openai')
+        requests, vectors, stages, recipe = await self.run_build_asset('openai', image_embeddings=False)
         self.assertEqual(len(requests), 1)
         self.assertIn('generationConfig', requests[0])
         self.assertEqual(len(vectors), 1)
@@ -125,6 +126,17 @@ class StickerProviderWorkflows(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(recipe['image_embeddings'])
         self.assertIsNone(stages[-1].kwargs['image_vector'])
         self.assertEqual(stages[-1].kwargs['reading_vectors'].shape, (2, 2))
+
+    async def test_text_appearance_fallback_does_not_claim_to_embed_pixels(self):
+        requests, vectors, stages, recipe = await self.run_build_asset('openai')
+        self.assertEqual(len(requests), 1)
+        self.assertTrue(any('inlineData' in part for part in requests[0]['contents'][0]['parts']))
+        self.assertEqual(len(vectors), 2)
+        self.assertEqual(vectors[1]['input'], [
+            'Appearance: Two simple fictional shapes.\nDepicted action: An offered embrace.\nCaption: 抱抱'])
+        self.assertFalse(recipe['image_embeddings'])
+        self.assertEqual(stages[-1].kwargs['provenance']['visual_embedding_source'], 'description')
+        self.assertEqual(stages[-1].kwargs['image_vector'].shape, (2,))
 
     async def test_openai_annotation_uses_native_images_and_strict_card_schema_with_gemini_vectors(self):
         requests, vectors, stages, recipe = await self.run_build_asset('gemini', 'openai')

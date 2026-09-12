@@ -31,6 +31,9 @@ def _candidate_payload(match: StickerMatch) -> dict[str, Any]:
         'character_families': list(asset.family_ids),
         'style_tags': list(asset.style_tags),
         'animated': match.entry.animated,
+        'appearance_embedding_source': (asset.provenance.get('visual_embedding_source') or (
+            'image' if asset.provenance.get('image_input') == 'sampled-frames-only-v1' else None))
+            if asset.image_vector is not None else None,
         'recently_delivered': match.recently_delivered,
         'visually_similar_deliveries': list(match.visually_similar_deliveries),
     }
@@ -74,7 +77,6 @@ def _advanced_schema() -> dict[str, Any]:
                     'style_goal': _param('string', 'How strongly to preserve or switch style families.', enum=['preserve', 'allow_switch', 'prefer_switch', 'ignore_style'], default='preserve'),
                     'style_hints': _param('array', 'Optional visual-family hints like rough manga line, pastel, or deadpan meme.', items={'type': 'string'}),
                     'preferred_pack': _param('string', 'Optional pack family or source pack id to preserve or stay near.'),
-                    'preferred_style_cluster': _param('string', 'Legacy style reference; include descriptive appearance in expression_cue for a fresh catalog.'),
                 },
                 'additionalProperties': False,
             },
@@ -119,7 +121,6 @@ def _persona_schema() -> dict[str, Any]:
                     'palette_mood': _param('string', 'Persistent palette or visual mood, for example soft pastel, monochrome, or bright candy.'),
                     'style_hints': _param('array', 'Persistent style-family hints.', items={'type': 'string'}),
                     'preferred_pack': _param('string', 'Persistent pack family or source pack id to preserve or stay near.'),
-                    'preferred_style_cluster': _param('string', 'Persistent style cluster id to preserve or stay near.'),
                 },
                 'additionalProperties': False,
             },
@@ -162,8 +163,8 @@ class StickerQueryTool:
             name='sticker_query',
             description=(
                 'Query the sticker system with a simple-first plan. Always provide intent_core. '
-                'Only add one to three helper hints when they clearly matter: reaction_tone, social_intent, expression_cue, caption_meaning, preferred_pack, or preferred_style_cluster. '
-                'Use diversity_preference=prefer_fresh_variant only when you want a slightly fresher variant than recent similar queries. '
+                'Add helper hints when they materially affect the choice: reaction_tone, social_intent, expression_cue, caption_meaning, or preferred_pack. '
+                'Use diversity_preference=prefer_fresh_variant when you want an alternative to recently delivered stickers. '
                 'Use persona when the sticker should keep a recurring visual or expressive identity across the session. '
                 'Use selection_lens when subtle subtext, face, pose, or social read matters. '
                 'Leave advanced empty unless you intentionally want axis-level control. Do not put usernames, bot names, or transport metadata into semantic fields.'
@@ -179,7 +180,6 @@ class StickerQueryTool:
                     'expression_cue': _param('string', 'Optional simple face or pose cue, for example side-eye, blank stare, pout, or tiny shrug.'),
                     'caption_meaning': _param('string', 'Optional caption or overlay meaning hint when visible text matters.'),
                     'preferred_pack': _param('string', 'Optional pack family or source pack id to preserve or stay near.'),
-                    'preferred_style_cluster': _param('string', 'Legacy style reference; include descriptive appearance in expression_cue for a fresh catalog.'),
                     'diversity_preference': _param('string', 'Whether to keep normal ranking or slightly prefer fresher variants than very recent ones.', enum=['default', 'prefer_fresh_variant'], default='default'),
                     'allow_animation': _param('boolean', 'Allow animated stickers if they fit better.', default=False),
                     'candidate_budget': _param('integer', 'How many candidates to inspect.', minimum=1, maximum=catalog.config.max_candidates, default=catalog.config.candidate_count),
@@ -204,11 +204,13 @@ class StickerQueryTool:
                 return ToolResult(call_id='', name=self.spec.name,
                                   output={'ok': True, 'skipped': True, 'reason': 'send=false'})
             plan = StickerRetrievalPlan.from_payload(args, config=self.catalog.config)
-            await self.catalog.aensure_loaded()
             state, persona = await self.catalog.aprepare_query_context(plan=plan, session_id=ctx.session_id,
                 persist_persona=True, expected_scope=ctx.scope)
             matches = await self.catalog.achoose(plan=plan, session_id=ctx.session_id,
                 session_state=state, persona_context=persona)
+            channels = {channel for match in matches for channel in match.channels}
+            retrieval = ('semantic' if channels - {'literal', 'asset_id'} else
+                'asset_id' if 'asset_id' in channels else 'literal' if 'literal' in channels else 'none')
             constraints = {key: value for key, value in {
                 'must_include': plan.text_constraints.must_include,
                 'avoid_text_meanings': plan.text_constraints.avoid_text_meanings,
@@ -222,7 +224,7 @@ class StickerQueryTool:
                 'ok': True, 'status': 'candidates' if matches else 'no_candidates',
                 'catalog_revision': matches[0].entry.revision_id if matches else self.catalog.stats()['revision'],
                 'intent': plan.intent_core, 'constraints': constraints,
-                'search_scope': {'required_pack': plan.required_pack or None,
+                'search_scope': {'retrieval': retrieval, 'required_pack': plan.required_pack or None,
                     'required_character_family': plan.required_character_family or None,
                     'allow_animation': plan.allow_animation,
                     'intensity_limits': plan.intensity_limits.as_dict()},
@@ -231,6 +233,7 @@ class StickerQueryTool:
                 'candidate_count': len(matches),
                 'candidates': [_candidate_payload(match) for match in matches],
                 'guidance': 'This shortlist is not the entire catalog. Interpret the actual caption, image and sender/recipient roles with the conversation. '
+                    'Literal lookup alone does not establish contextual fit. '
                     'Descriptions are conditional interpretations, not verified fit. Inspect supplied images; if unavailable do not claim visual inspection. '
                     'Choose a fitting expression, refine the query, or use text. No sticker has been sent. '
                     'Only sticker_send_selected commits a choice; recent and visually similar deliveries are context, not repeat bans.',
@@ -260,7 +263,6 @@ class StickerSendSelectedTool:
 
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         try:
-            await self.catalog.aensure_loaded()
             sticker_id = str(args.get('selected_sticker_id', args.get('sticker_id', '')) or '').strip()
             if not sticker_id:
                 return ToolResult(call_id='', name=self.spec.name, output={'ok': False, 'error': 'Empty selected_sticker_id'})

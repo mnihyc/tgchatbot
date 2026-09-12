@@ -39,6 +39,23 @@ class MemoryBusinessTests(BusinessTestCase):
         return await self.runtime.ingest_user_message(session_id=self.session,
             incoming_message=self.message(text, actor, source_id, **kwargs))
 
+    async def test_search_unzoned_filters_use_conversation_timezone_without_reinterpreting_offsets(self):
+        source = await self.ingest('I prefer jasmine tea.')
+        tool = next(tool for tool in self.memory.tools if tool.name == 'memory_search')
+        local = {'query': 'jasmine', 'after': '2026-01-02T11:00:00', 'before': '2026-01-02T12:00:00'}
+        aware = {'query': 'jasmine', 'after': '2026-01-02T03:00:00+00:00', 'before': '2026-01-02T04:00:00Z'}
+        default_context = ToolContext(self.session, 'Alex')
+        utc_context = ToolContext(self.session, 'Alex', timezone='UTC')
+        local_result = (await tool.runner.run(local, default_context)).output
+        aware_result = (await tool.runner.run(aware, default_context)).output
+        aware_in_utc = (await tool.runner.run(aware, utc_context)).output
+        self.assertTrue(local_result['results'])
+        self.assertEqual(local_result, aware_result)
+        self.assertEqual(local_result, aware_in_utc)
+        self.assertEqual((await tool.runner.run(local, utc_context)).output['results'], [])
+        stored = (await self.store.read_messages(self.session, [source.db_id]))[0]
+        self.assertEqual(stored.message.metadata['sent_at'], '2026-01-02T03:04:05+00:00')
+
     async def test_profile_fetch_keeps_same_name_people_and_agent_preferences_separate_with_freshness(self):
         alice = await self.ingest('I prefer tea. Please keep your answers concise.', 'telegram:user:7', 1)
         bob = await self.ingest('I might prefer coffee.', 'telegram:user:8', 2)
@@ -72,7 +89,6 @@ class MemoryBusinessTests(BusinessTestCase):
         identity_source = profiles['telegram:user:7']['identity']['last_message']
         self.assertEqual((identity_source['message_id'], identity_source['source_revision']), (alice.db_id, 1))
         self.assertEqual(identity_source['sent_at'], '2026-01-02T11:04:05+08:00')
-        self.assertEqual(profiles['telegram:user:7']['latest_returned_evidence_at'], identity_source['sent_at'])
         for key in ('as_of', 'fetched_at'):
             self.assertEqual(datetime.fromisoformat(result[key]).utcoffset(), timedelta(hours=8))
         self.assertLessEqual(result['as_of'], result['fetched_at'])
@@ -82,33 +98,23 @@ class MemoryBusinessTests(BusinessTestCase):
         self.assertEqual(self.provider.requests, [])
         self.embeddings.embed_query.assert_not_awaited()
 
-    async def test_profile_fetch_pages_every_fact_and_does_not_modify_profile_or_sources(self):
-        source = await self.ingest('I have five independent durable preferences.')
+    async def test_profile_fetch_is_bounded_without_paging_or_modifying_original_evidence(self):
+        source = await self.ingest('I have several durable preferences.')
         facts = [await self.store.save_profile_fact(self.session, subject_actor_id='telegram:user:7',
-            asserted_by='telegram:user:7', claim=f'Preference {number}', source_ids=[source.db_id]) for number in range(5)]
-        memory = MemoryService(self.store, self.embeddings, config=replace(self.memory.config, profile_facts=2))
-        before, collected, timestamps = None, [], []
-        while True:
-            page = (await memory.fetch_profiles(self.session, ['telegram:user:7'],
-                include_agent_preferences=False, before_fact_id=before))['profiles'][0]
-            collected.extend(page['facts'])
-            timestamps.append(page['latest_returned_fact_at'])
-            self.assertEqual(page['latest_returned_fact_at'], max(fact['created_at'] for fact in page['facts']))
-            self.assertEqual(page['latest_returned_evidence_at'], '2026-01-02T11:04:05+08:00')
-            if not page['truncated']:
-                break
-            before = page['next_before_fact_id']
-        self.assertEqual([fact['id'] for fact in collected], [fact['id'] for fact in reversed(facts)])
-        self.assertEqual(len(timestamps), 3)
-        self.assertEqual(timestamps, sorted(timestamps, reverse=True))
+            asserted_by='telegram:user:7', claim=f'Preference {number}: ' + '喜欢安静的地方。' * 30,
+            source_ids=[source.db_id]) for number in range(3)]
+        memory = MemoryService(self.store, self.embeddings, config=replace(self.memory.config, profile_bytes=1600))
+        profile = (await memory.fetch_profiles(self.session, ['telegram:user:7'],
+            include_agent_preferences=False))['profiles'][0]
+        self.assertLessEqual(len(json.dumps(profile, ensure_ascii=False).encode('utf-8')), 1600)
+        self.assertTrue(profile['facts'])
+        self.assertNotIn('next_before_fact_id', profile)
+        self.assertNotIn('truncated', profile)
         async with self.store.pool.connection() as conn:
             rows = await (await conn.execute('SELECT * FROM profile_facts ORDER BY id')).fetchall()
             revisions = await (await conn.execute('SELECT body,revision FROM message_revisions WHERE message_id=%s', (source.db_id,))).fetchall()
         self.assertEqual(rows, facts)
-        self.assertEqual(revisions, [{'body': 'I have five independent durable preferences.', 'revision': 1}])
-        exhausted = (await memory.fetch_profiles(self.session, ['telegram:user:7'],
-            include_agent_preferences=False, before_fact_id=facts[0]['id']))['profiles'][0]
-        self.assertEqual(exhausted['status'], 'no_more_facts')
+        self.assertEqual(revisions, [{'body': 'I have several durable preferences.', 'revision': 1}])
 
     async def test_profile_fetch_retains_soft_reset_history_but_never_crosses_chat_or_full_reset(self):
         source = await self.ingest('I prefer jasmine tea.')
@@ -145,18 +151,18 @@ class MemoryBusinessTests(BusinessTestCase):
             claim='A future preference', source_ids=[correction.db_id], valid_from='2099-01-01T00:00:00Z')
         profile = (await self.memory.fetch_profiles(self.session, ['telegram:user:7']))['profiles'][0]
         self.assertEqual([fact['id'] for fact in profile['facts']], [new['id']])
-        self.assertEqual(profile['facts'][0]['supersedes'], old['id'])
-        self.assertEqual(profile['facts'][0]['source_revisions'], {str(correction.db_id): 1})
+        self.assertEqual(profile['facts'][0]['source_ids'], [correction.db_id])
+        self.assertEqual(new['supersedes'], old['id'])
+        self.assertEqual(new['source_revisions'], {str(correction.db_id): 1})
         await self.store.hide_message_ids(self.session, [correction.db_id])
         restored = (await self.memory.fetch_profiles(self.session, ['telegram:user:7']))['profiles'][0]
-        self.assertEqual([(fact['id'], fact['status']) for fact in restored['facts']], [(old['id'], 'active')])
+        self.assertEqual(restored['facts'], [], 'Restored evidence must be reconciled in a bounded batch')
         self.assertEqual(restored['identity']['last_message']['message_id'], original.db_id)
         await self.ingest('I have withdrawn that preference.', source_id=1)
         revised = (await self.memory.fetch_profiles(self.session, ['telegram:user:7']))['profiles'][0]
         self.assertEqual(revised['facts'], [])
         self.assertEqual(revised['status'], 'no_current_facts')
         self.assertEqual(revised['identity']['last_message']['source_revision'], 2)
-        self.assertIsNone(revised['latest_returned_evidence_at'])
 
     async def test_repeated_framework_snapshots_keep_original_evidence_searchable_and_context_replay_intact(self):
         await self.settings(mode=ChatMode.CHAT)
@@ -465,7 +471,7 @@ class MemoryBusinessTests(BusinessTestCase):
         self.assertEqual({row["actor_id"] for row in evidence["messages"]}, {"telegram:user:7", "telegram:user:8"})
         self.assertEqual({row["actor_name"] for row in evidence["messages"]}, {"Alex"})
         payload = await self.memory.fetch_profiles(self.session, ['telegram:user:8'], include_agent_preferences=False)
-        self.assertEqual([(fact["subject_actor_id"], fact["claim"]) for fact in payload["profiles"][0]['facts']],
+        self.assertEqual([(payload['profiles'][0]['actor_id'], fact['claim']) for fact in payload['profiles'][0]['facts']],
                          [("telegram:user:8", "Avoids coffee")])
         self.embeddings.embed_query.assert_not_awaited()
 

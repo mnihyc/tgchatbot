@@ -4,14 +4,21 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import os
 from pathlib import Path
 import time
 
-# Six missed five-second event-loop ticks marks an unhealthy process. This
-# tolerates brief scheduling delays while detecting a blocked polling loop.
+# Defaults tolerate brief scheduling delays while detecting a blocked loop.
 HEARTBEAT_INTERVAL_S = 5
 MAX_AGE_S = 30
+
+
+def _timing(name: str, default: float) -> float:
+    value = float(os.getenv(name, str(default)))
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f'{name} must be a positive finite duration')
+    return value
 
 
 def health_path() -> Path:
@@ -19,13 +26,14 @@ def health_path() -> Path:
 
 
 async def _heartbeat(application) -> None:
+    interval = _timing('APP_HEALTH_INTERVAL_S', HEARTBEAT_INTERVAL_S)
     while True:
         if application.running and application.updater and application.updater.running:
             path = health_path()
             partial = path.with_suffix('.tmp')
             partial.write_text(json.dumps({'pid': os.getpid(), 'time': time.time()}))
             partial.replace(path)
-        await asyncio.sleep(HEARTBEAT_INTERVAL_S)
+        await asyncio.sleep(interval)
 
 
 async def start_heartbeat(application) -> None:
@@ -50,7 +58,7 @@ def healthy(path: Path | None = None, *, now: float | None = None) -> bool:
         payload = json.loads((path or health_path()).read_text())
         age = (time.time() if now is None else now) - float(payload['time'])
         pid = int(payload['pid'])
-        if pid <= 0 or not 0 <= age <= MAX_AGE_S:
+        if pid <= 0 or not 0 <= age <= _timing('APP_HEALTH_MAX_AGE_S', MAX_AGE_S):
             return False
         os.kill(pid, 0)
         return True

@@ -10,7 +10,7 @@ import numpy as np
 from psycopg.types.json import Jsonb
 
 from tests.business_helpers import BusinessTestCase
-from tgchatbot.domain.models import ConversationMessage, MessagePart, MessageRole, PartKind
+from tgchatbot.domain.models import ConversationMessage, MessagePart, MessageRole, PartKind, ProviderResponse
 from tgchatbot.embeddings import EmbeddingConfig
 from tgchatbot.tools.memory import audit_records, audit_state_records, parser, rebuild, retry_failed, status_records, work
 
@@ -43,6 +43,18 @@ class MemoryOperationsTests(BusinessTestCase):
         self.assertFalse(result[0]['coverage']['measured'])
         self.assertNotIn('semantic_complete', result[0]['coverage'])
         self.assertIn('--coverage', result[0]['coverage']['reason'])
+        self.assertEqual(result[0]['pending_profile_material'], {'sources': 1, 'bytes': len('Unindexed source.')})
+
+    async def test_profile_work_and_operator_audit_do_not_require_embedding_credentials(self):
+        await self.original('I prefer tea.I like birds.', 1)
+        self.provider.responses = [ProviderResponse(final_text='{"additions": [], "removals": []}')]
+        with patch.dict(os.environ, {'MEMORY_WORKER_PROFILE_REQUEST_BYTES': '26'}, clear=True), \
+             patch('tgchatbot.providers.factory.build_providers', return_value={'openai': self.provider}):
+            result = await work(self.store, self.config, EmbeddingConfig(api_key=''), batch=False, once=True)
+        self.assertTrue(result['processed_dispatch'])
+        self.assertEqual(len(self.provider.requests), 1)
+        audit = [row async for row in audit_state_records(self.store, self.session)]
+        self.assertEqual(len([row for row in audit if row['type'] == 'profile_patch']), 1)
 
     async def test_status_exposes_retired_hosted_slot_blockers_without_reading_old_sources(self):
         source = await self.original('Private original is not status output.', 1)
@@ -182,6 +194,36 @@ class MemoryOperationsTests(BusinessTestCase):
         self.assertEqual(notes['semantic_eligible_originals'], 0)
         self.assertEqual(notes['semantic_eligible_characters'], 0)
         self.assertEqual(notes['semantic_covered_characters'], 0)
+
+    async def test_coverage_preserves_multisource_overlap_across_pages_and_source_corrections(self):
+        first = await self.original('abcdefghij', 1)
+        second = await self.original('ABCDEFGHIJ', 2, actor_id='telegram:user:8')
+        await self.store.create_excerpt(self.session, [first.db_id, second.db_id],
+            spans=[{'message_id': source.db_id, 'start': 0, 'end': 6} for source in (first, second)],
+            model=self.space, embedding=self.vector)
+        await self.store.create_excerpt(self.session, [first.db_id],
+            spans=[{'message_id': first.db_id, 'start': 4, 'end': 10}], model=self.space, embedding=self.vector)
+        await self.store.create_excerpt(self.session, [second.db_id], model=self.space, embedding=self.vector)
+
+        async def measured(page_size):
+            with patch.dict(os.environ, {'MEMORY_OPERATIONS_PAGE_SIZE': str(page_size)}):
+                return [row async for row in status_records(self.store, self.space, self.session,
+                    include_coverage=True)][0]['coverage']
+
+        together, separate = await measured(2), await measured(1)
+        self.assertEqual(together, separate, 'An excerpt crossing traversal pages keeps the same original coverage')
+        self.assertEqual(together['semantic_covered_characters'], 20,
+            'Multi-source matches and overlapping excerpts cannot count a character twice')
+        self.assertEqual(together['semantic_full_originals'], 2)
+
+        revised = await self.original('Corrected source', 1)
+        self.assertEqual(revised.db_id, first.db_id)
+        after = await measured(2)
+        self.assertEqual(after['semantic_full_originals'], 1)
+        self.assertEqual(after['semantic_uncovered_originals'], 1)
+        self.assertEqual(after['semantic_covered_characters'], 10,
+            'Old multi-source evidence cannot cover revised text; the other sender\'s independent excerpt remains')
+        self.assertFalse(after['semantic_complete'])
 
     async def test_status_pages_and_excludes_hidden_deleted_old_generations_and_synthetic(self):
         old = await self.original('old generation', 1)

@@ -28,7 +28,8 @@ class FileSendTool:
                 'type': 'object',
                 'properties': {
                     'scope': {'type': 'string', 'enum': ['outputs', 'inputs', 'workspace']},
-                    'paths': {'type': 'array', 'items': {'type': 'string'}, 'minItems': 1, 'maxItems': 8},
+                    'paths': {'type': 'array', 'items': {'type': 'string'}, 'minItems': 1,
+                              'maxItems': config.ssh_exec.max_output_files},
                 },
                 'required': ['scope', 'paths'],
                 'additionalProperties': False,
@@ -42,14 +43,15 @@ class FileSendTool:
             paths = self._normalize_paths(args.get('paths'))
             artifacts = await self.remote.fetch_files(
                 session_id=ctx.session_id,
-                remote_paths=paths or None,
+                remote_paths=paths,
                 scope=scope,
             )
             output = {
                 'ok': bool(artifacts),
                 'scope': scope,
                 'requested_paths': len(paths),
-                'sent_files': [artifact.filename for artifact in artifacts],
+                'prepared_files': [artifact.filename for artifact in artifacts],
+                'delivery_state': 'pending' if artifacts else 'unavailable',
                 'count': len(artifacts),
             }
             if not artifacts:
@@ -69,8 +71,6 @@ class FileSendTool:
 
     @staticmethod
     def _normalize_paths(value: Any) -> list[str]:
-        if not value:
-            return []
         if not isinstance(value, list):
             raise RuntimeError('paths must be an array of remote file paths')
         seen: set[str] = set()
@@ -81,4 +81,6 @@ class FileSendTool:
                 continue
             seen.add(item)
             normalized.append(item)
+        if not normalized:
+            raise ValueError('Select at least one remote file path')
         return normalized

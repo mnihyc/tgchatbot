@@ -12,7 +12,6 @@ from tgchatbot.domain.models import ConversationMessage, MessagePart, MessageRol
 from tgchatbot.providers.base import (ControlDescriptor, ProviderCapabilities, RequestTokenEstimate,
     estimate_json_schema_tokens, evidence_text, pending_image_tokens, tool_message_evidence)
 from tgchatbot.settings_schema import (
-    GEMINI_THINKING_BUDGET_MAX,
     GEMINI_THINKING_BUDGET_MIN,
     gemini_allowed_thinking_levels,
     gemini_supports_native_web_search,
@@ -309,7 +308,7 @@ class GeminiProvider:
 
     def _effective_thinking_budget(self, settings: SessionSettings) -> int | None:
         value = settings.thinking_budget if settings.thinking_budget is not None else self.config.thinking_budget
-        return normalize_optional_bounded_int(value, minimum=GEMINI_THINKING_BUDGET_MIN, maximum=GEMINI_THINKING_BUDGET_MAX)
+        return normalize_optional_bounded_int(value, minimum=GEMINI_THINKING_BUDGET_MIN)
 
     def _effective_thinking_level(self, settings: SessionSettings) -> str | None:
         raw = settings.thinking_level if settings.thinking_level is not None else self.config.thinking_level
@@ -319,18 +318,7 @@ class GeminiProvider:
         return normalized if normalized in gemini_allowed_thinking_levels(settings.model) else None
 
     def _thinking_budget_for_request(self, settings: SessionSettings) -> int | None:
-        value = self._effective_thinking_budget(settings)
-        if value is None:
-            return None
-        if settings.model.startswith('gemini-2.5'):
-            if 'flash-lite' in settings.model:
-                return value if value in {-1, 0} or 512 <= value <= 24576 else None
-            if 'pro' in settings.model:
-                return value if value == -1 or 128 <= value <= 32768 else None
-            return value if value == -1 or 0 <= value <= 24576 else None
-        if settings.model.startswith('gemini-3'):
-            return value
-        return None
+        return self._effective_thinking_budget(settings) if gemini_supports_thinking(settings.model) else None
 
     def _thinking_level_for_request(self, settings: SessionSettings) -> str | None:
         if not settings.model.startswith('gemini-3'):
@@ -339,20 +327,24 @@ class GeminiProvider:
 
     @staticmethod
     def _thinking_budget_note(model: str) -> str:
-        normalized = (model or '').strip().lower()
-        if normalized.startswith('gemini-2.5'):
-            if 'flash-lite' in normalized:
-                return 'Gemini 2.5 Flash-Lite accepts thinkingBudget=-1, 0, or 512..24576.'
-            if 'pro' in normalized:
-                return 'Gemini 2.5 Pro accepts thinkingBudget=-1 or 128..32768. It cannot fully disable thinking with 0.'
-            return 'Gemini 2.5 Flash accepts thinkingBudget=-1 or 0..24576.'
-        if normalized.startswith('gemini-3'):
-            return 'Gemini 3 prefers thinkingLevel over the legacy thinkingBudget field.'
+        if gemini_supports_thinking(model):
+            return 'Thinking-token allowance: -1 is automatic; 0 requests disabled thinking. The model API validates its capacity.'
         return 'This model family does not support Gemini thinking controls.'
 
     @staticmethod
     def _prepare_contents_for_request(contents: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return [copy.deepcopy(item) for item in contents if isinstance(item, dict)]
+        result = []
+        for original in contents:
+            if not isinstance(original, dict):
+                continue
+            item = copy.deepcopy(original)
+            if (result and item.get('role') == result[-1].get('role') == 'model'
+                    and all('functionCall' in part for part in item.get('parts', []))
+                    and all('functionCall' in part for part in result[-1].get('parts', []))):
+                result[-1]['parts'].extend(item.get('parts', []))
+            else:
+                result.append(item)
+        return result
 
     def _parse_response(self, body: dict[str, Any]) -> ProviderResponse:
         usage = body.get('usageMetadata') or {}
@@ -382,10 +374,17 @@ class GeminiProvider:
                 continue
             if 'text' in part:
                 text_parts.append(part.get('text', ''))
-            function_call = part.get('functionCall')
-            if function_call:
-                args = function_call.get('args') or {}
-                tool_calls.append(ToolCall(name=function_call.get('name', ''), call_id=function_call.get('id') or f'gemini-call-{index}', arguments=args))
+            if 'functionCall' in part:
+                function_call = part['functionCall']
+                if not isinstance(function_call, dict):
+                    raise ValueError('Function call must be an object')
+                args = function_call.get('args', {})
+                if not isinstance(args, dict):
+                    raise ValueError('Function call arguments must be a JSON object')
+                name = function_call.get('name')
+                if not isinstance(name, str) or not name.strip():
+                    raise ValueError('Function call requires a name')
+                tool_calls.append(ToolCall(name=name, call_id=function_call.get('id') or f'gemini-call-{index}', arguments=args))
             tool_call = part.get('toolCall')
             if tool_call:
                 native_tool_calls.append({
@@ -529,7 +528,7 @@ class GeminiProvider:
             provider_name = str(message.metadata.get('tool_provider') or '').strip().lower()
             payload = message.metadata.get('tool_payload') if isinstance(message.metadata.get('tool_payload'), dict) else {}
             framework_refresh = message.metadata.get('synthetic_role') == 'profile_refresh'
-            portable_evidence = bool(message.metadata.get('tool_evidence'))
+            portable_evidence = bool(message.metadata.get('tool_evidence') or message.metadata.get('portable_tool_history'))
             if (provider_name == self.name or framework_refresh or portable_evidence) and phase == 'call' and payload.get('call_id') and message.name:
                 part = {'functionCall': {'name': message.name, 'args': payload.get('arguments') or {}, 'id': str(payload['call_id'])}}
                 if framework_refresh or portable_evidence:

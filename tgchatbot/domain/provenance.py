@@ -45,6 +45,9 @@ def telegram_metadata(message: Any, *, is_edit: bool = False) -> dict[str, Any]:
         'media_group_id': getattr(message, 'media_group_id', None),
     }
     entities = getattr(message, 'entities', None) or getattr(message, 'caption_entities', None) or []
+    direct_topic = getattr(message, 'direct_messages_topic', None)
+    if direct_topic is not None:
+        metadata['direct_messages_topic_id'] = str(direct_topic.topic_id)
     metadata['entities'] = [item.to_dict() for item in entities]
     reply = getattr(message, 'reply_to_message', None)
     if reply is not None:
@@ -72,7 +75,7 @@ def attribution(message: ConversationMessage, *, message_id: int | None = None) 
     source = message.metadata or {}
     result = {key: source[key] for key in (
         'actor_id', 'actor_kind', 'actor_name', 'sent_at', 'source', 'source_chat_id',
-        'source_message_id', 'topic_id', 'reply_to_source_id', 'reply_to_source_chat_id', 'reply_to_actor', 'forward_origin', 'external_reply', 'quote',
+        'source_message_id', 'topic_id', 'direct_messages_topic_id', 'reply_to_source_id', 'reply_to_source_chat_id', 'reply_to_actor', 'forward_origin', 'external_reply', 'quote',
     ) if source.get(key) is not None}
     if message_id is not None:
         result['message_id'] = message_id
