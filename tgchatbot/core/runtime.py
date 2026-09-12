@@ -1283,8 +1283,7 @@ class AgentRuntime:
             return int(cached)
         raw_messages: list[ConversationMessage] = []
         for item in state.raw_messages:
-            mapped = self._history_message_for_provider(settings=settings, provider_name=provider.name, message=item.message)
-            if mapped is not None:
+            for mapped in self._history_messages_for_provider(settings=settings, provider_name=provider.name, message=item.message):
                 raw_messages.append(attributed_message(mapped, message_id=item.db_id, timezone=self.config.default_metadata_timezone))
         estimate = provider.estimate_request_tokens(
             settings=settings,
@@ -1313,7 +1312,7 @@ class AgentRuntime:
         mapped_messages = [
             mapped
             for item in messages
-            if (mapped := self._history_message_for_provider(settings=settings, provider_name=provider.name, message=item.message)) is not None
+            for mapped in self._history_messages_for_provider(settings=settings, provider_name=provider.name, message=item.message)
         ]
         estimate = provider.estimate_request_tokens(
             settings=settings,
@@ -1492,9 +1491,8 @@ class AgentRuntime:
             for block in self._select_blocks_for_prompt(state,settings=settings)]
         native_settings = replace(settings,tool_history_mode=ToolHistoryMode.NATIVE_SAME_PROVIDER)
         for position, stored in self._provider_history_rows(state.raw_messages):
-            mapped = self._history_message_for_provider(settings=native_settings if stored.db_id>=native_from_id else settings,
-                provider_name=provider.name,message=stored.message)
-            if mapped is not None:
+            for mapped in self._history_messages_for_provider(settings=native_settings if stored.db_id>=native_from_id else settings,
+                    provider_name=provider.name,message=stored.message):
                 entries.append(((position,1),attributed_message(mapped, message_id=stored.db_id, timezone=self.config.default_metadata_timezone)))
         history = [message for _,message in sorted(entries,key=lambda item:item[0])]
         return history
@@ -1503,35 +1501,36 @@ class AgentRuntime:
         # if any
         return [item for item in items if isinstance(item, dict)]
 
-    def _provider_visible_text_from_items(self, items: list[dict[str, Any]]) -> str:
+    @staticmethod
+    def _provider_visible_text_parts_from_items(items: list[dict[str, Any]]) -> list[str]:
+        """Read ordinary model text without altering it or exposing reasoning."""
         texts: list[str] = []
         for item in items:
             if not isinstance(item, dict):
                 continue
             item_type = str(item.get('type') or '').strip().lower()
-            if item.get('role') == 'assistant':
-                content = item.get('content')
-                if isinstance(content, str) and content.strip():
-                    texts.append(content.strip())
-                elif isinstance(content, list):
-                    texts.extend(str(part.get('text') or '').strip() for part in content if isinstance(part, dict) and part.get('type') == 'text' and part.get('text'))
             if item_type == 'message':
                 content_items = item.get('content') if isinstance(item.get('content'), list) else []
-                for content in content_items:
-                    if not isinstance(content, dict) or str(content.get('type') or '').strip().lower() != 'output_text':
-                        continue
-                    text = str(content.get('text') or '').strip()
-                    if text:
-                        texts.append(text)
-                continue
-            parts = item.get('parts') if isinstance(item.get('parts'), list) else []
-            for part in parts:
-                if not isinstance(part, dict) or part.get('thought') is True:
-                    continue
-                text = str(part.get('text') or '').strip()
-                if text:
-                    texts.append(text)
-        return '\n\n'.join(texts).strip()
+                texts.extend(str(part['text']) for part in content_items if isinstance(part, dict)
+                    and part.get('type') == 'output_text' and part.get('text'))
+            elif item.get('role') == 'assistant':
+                content = item.get('content')
+                if isinstance(content, str):
+                    texts.append(content)
+                elif isinstance(content, list):
+                    texts.extend(str(part['text']) for part in content if isinstance(part, dict)
+                        and part.get('type') == 'text' and part.get('text'))
+            elif item.get('role') == 'model':
+                parts = item.get('parts') if isinstance(item.get('parts'), list) else []
+                texts.extend(str(part['text']) for part in parts if isinstance(part, dict)
+                    and part.get('thought') is not True and part.get('text'))
+        return texts
+
+    def _provider_visible_text_from_items(self, items: list[dict[str, Any]]) -> str:
+        # Summaries retain their existing readable separators. History below
+        # uses raw text instead, preserving whitespace and repeated passages.
+        return '\n\n'.join(text.strip() for text in self._provider_visible_text_parts_from_items(items)
+            if text.strip())
 
     def _provider_native_visible_text(self, message: ConversationMessage) -> str:
         metadata = message.metadata if isinstance(message.metadata, dict) else {}
@@ -1539,7 +1538,7 @@ class AgentRuntime:
         items = provider_native.get('items') if isinstance(provider_native.get('items'), list) else []
         return self._provider_visible_text_from_items(items)
 
-    def _history_message_for_provider(self, *, settings: SessionSettings, provider_name: str, message: ConversationMessage) -> ConversationMessage | None:
+    def _history_messages_for_provider(self, *, settings: SessionSettings, provider_name: str, message: ConversationMessage) -> list[ConversationMessage]:
         metadata = message.metadata if isinstance(message.metadata, dict) else {}
         base_metadata = {key: value for key, value in metadata.items() if key not in {'provider_native', 'provider_native_skip_same_provider'}}
         if message.role == MessageRole.TOOL and metadata.get('tool_phase') == 'result':
@@ -1572,6 +1571,18 @@ class AgentRuntime:
             base_metadata['portable_tool_history'] = True
         prepared = self._clone_message(message, metadata=base_metadata)
         prepared.parts = [present_image_evidence(part, self.config.default_metadata_timezone) for part in prepared.parts]
+        visible_text = ''
+        if model_output and provider_native and not same_provider_native:
+            visible_text = ''.join(self._provider_visible_text_parts_from_items(provider_native.get('items') or []))
+            if message.role == MessageRole.ASSISTANT:
+                # Delivery can combine earlier tool-step text with this final
+                # reply. The model snapshots own each step exactly once; the
+                # complete delivered text remains the stored original.
+                return [ConversationMessage.assistant_text(visible_text)] if visible_text else []
+        # Native batches own their text when compatible. Otherwise retain it
+        # as ordinary assistant output before the call group, never as a tool
+        # result or an extra user message. No substring-based deduplication.
+        visible_messages = [ConversationMessage.assistant_text(visible_text)] if visible_text else []
         if metadata.get('synthetic_role') == 'reply_target':
             target = present_attribution(metadata.get('reply_target') or {}, self.config.default_metadata_timezone)
             prepared.metadata['reply_target'] = target
@@ -1580,24 +1591,24 @@ class AgentRuntime:
                 if part.kind == PartKind.TEXT and part.text and part.text.startswith('[Application reply target: ')
                 and '\n' in part.text else part for part in prepared.parts]
         if message.role != MessageRole.TOOL:
-            return prepared
+            return [prepared]
         if model_exchange and phase in {'call', 'result'}:
             if phase == 'call' and metadata.get('provider_native_skip_same_provider'):
-                return None
+                return []
             # Only the first call carries the original model batch. Results
             # remain projections of current DB-owned output and image evidence;
             # a native snapshot must never restore retired pixels or old dates.
-            return prepared
+            return [*visible_messages, prepared]
         if (metadata.get('synthetic_role') == 'profile_refresh' or metadata.get('tool_evidence')
                 or base_metadata.get('portable_tool_history')) and phase in {'call', 'result'}:
             if (settings.tool_history_mode == ToolHistoryMode.NATIVE_SAME_PROVIDER
                     and metadata.get('tool_provider') == provider_name
                     and metadata.get('tool_model') == settings.model
                     and metadata.get('provider_native_skip_same_provider')):
-                return None
+                return []
             # This is an application-executed function exchange. Every adapter
             # receives its portable call/result pair, including after a switch.
-            return prepared
+            return [*visible_messages, prepared]
         origin_provider = str(metadata.get('tool_provider') or '').strip().lower()
         if (
             settings.tool_history_mode == ToolHistoryMode.NATIVE_SAME_PROVIDER
@@ -1605,9 +1616,9 @@ class AgentRuntime:
             and bool(metadata.get('provider_native_skip_same_provider'))
             and phase in {'call', 'result'}
         ):
-            return None
+            return []
         if settings.tool_history_mode == ToolHistoryMode.NATIVE_SAME_PROVIDER and origin_provider == provider_name and phase in {'call', 'result'}:
-            return prepared
+            return [*visible_messages, prepared]
         if message.name in {'memory_search', 'memory_read', 'user_profile_fetch'} and phase in {'call', 'result'}:
             # Rebuild legacy terse observations from their durable structured
             # payload as well; old rows may contain only "ok=True" in parts.
@@ -1615,7 +1626,6 @@ class AgentRuntime:
             texts = [self._tool_observation_summary(name=message.name, phase=phase, payload=payload)]
         else:
             texts = [part.text.strip() for part in message.parts if part.text and part.text.strip()]
-        provider_visible_text = self._provider_native_visible_text(message)
         if not texts:
             name = message.name or 'tool'
             payload = metadata.get('tool_payload')
@@ -1623,10 +1633,8 @@ class AgentRuntime:
         translated_metadata = {'source_role': 'tool', 'tool_name': message.name, 'tool_phase': phase or 'event'}
         translated_text = '\n'.join(texts)
         if phase == 'call':
-            if provider_visible_text and provider_visible_text not in translated_text:
-                translated_text = f'{provider_visible_text}\n\n{translated_text}' if translated_text else provider_visible_text
-            return ConversationMessage.assistant_text(translated_text, metadata=translated_metadata)
-        return ConversationMessage.user_text(translated_text, metadata=translated_metadata)
+            return [*visible_messages, ConversationMessage.assistant_text(translated_text, metadata=translated_metadata)]
+        return [ConversationMessage.user_text(translated_text, metadata=translated_metadata)]
 
     def _build_provider_history(self, state: LiveConversationState, *, settings: SessionSettings, provider_name: str) -> list[ConversationMessage]:
         latest_id = state.raw_messages[-1].db_id if state.raw_messages else 0
@@ -1644,8 +1652,7 @@ class AgentRuntime:
         for block in selected_blocks:
             entries.append((self._history_position_for_block(block), block.render_as_message(timezone=self.config.default_metadata_timezone)))
         for position, item in self._provider_history_rows(state.raw_messages):
-            mapped = self._history_message_for_provider(settings=settings, provider_name=provider_name, message=item.message)
-            if mapped is not None:
+            for mapped in self._history_messages_for_provider(settings=settings, provider_name=provider_name, message=item.message):
                 mapped = attributed_message(mapped, message_id=item.db_id, timezone=self.config.default_metadata_timezone)
                 entries.append(((position, 1), mapped))
         messages = [message for _key, message in sorted(entries, key=lambda item: item[0])]

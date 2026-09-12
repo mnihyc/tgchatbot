@@ -429,12 +429,12 @@ class ChatCompletionsContractTests(unittest.IsolatedAsyncioTestCase):
         runtime = object.__new__(AgentRuntime)
         runtime.config = SimpleNamespace(default_metadata_timezone='Asia/Singapore')
         settings = replace(self.settings(provider), tool_history_mode=ToolHistoryMode.NATIVE_SAME_PROVIDER)
-        same = runtime._history_message_for_provider(settings=settings, provider_name='deepseek', message=message)
-        self.assertEqual(provider._message_to_input_items(same), native)
-        switched = runtime._history_message_for_provider(settings=settings, provider_name='openrouter', message=message)
-        self.assertNotIn('provider_native', switched.metadata)
-        self.assertIn('Visible introduction', switched.parts[0].text)
-        self.assertNotIn('private continuation', switched.parts[0].text)
+        same = runtime._history_messages_for_provider(settings=settings, provider_name='deepseek', message=message)
+        self.assertEqual([item for message in same for item in provider._message_to_input_items(message)], native)
+        switched = runtime._history_messages_for_provider(settings=settings, provider_name='openrouter', message=message)
+        self.assertFalse(any('provider_native' in message.metadata for message in switched))
+        self.assertEqual(switched[0].parts[0].text, 'Visible introduction')
+        self.assertFalse(any('private continuation' in (part.text or '') for message in switched for part in message.parts))
         self.assertTrue(runtime._message_has_tool_context(ConversationMessage.assistant_text('', metadata={'provider_native': {'provider': 'deepseek', 'items': native}})))
 
     async def test_token_estimate_counts_images_semantically_not_base64_size(self):
