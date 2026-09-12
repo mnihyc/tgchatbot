@@ -18,7 +18,6 @@ from psycopg import sql
 
 import tgchatbot.app as app
 from tgchatbot.healthcheck import healthy, start_heartbeat, stop_heartbeat
-from tgchatbot.storage.previews import PreviewCache
 
 
 dsn = os.environ['TEST_DATABASE_URL']
@@ -54,7 +53,7 @@ def check_startup(name: str, credentials: dict[str, str], *, fail_catalog=False,
             assert catalogs[-1].loaded
             assert catalogs[-1].store.store is bot.store
             assert catalogs[-1].delivery_store is bot.runtime.sticker_delivery
-            assert bot.runtime.preview_cache.root.is_dir()
+            assert bot.runtime.preview_cache.store is bot.store
             assert bot.config.artifact_dir.parent == bot.config.temp_dir
             assert bot.runtime.memory.embeddings.config.model == 'gemini-embedding-2'
             if operational_overrides:
@@ -120,10 +119,6 @@ def check_startup(name: str, credentials: dict[str, str], *, fail_catalog=False,
                 assert not healthy(), 'Startup failure or shutdown retained a stale healthy marker'
                 assert stores and all(store.pool.closed for store in stores), 'Startup left a PostgreSQL pool open'
                 assert all(loop.is_closed() for loop in loops), 'Shutdown left its event loop open'
-                assert not list((Path(directory) / 'tmp').glob('previews-*')), 'Shutdown retained temporary previews'
-                # The failed-startup branch also must release the exclusive lock.
-                cache = PreviewCache(Path(directory) / 'tmp')
-                cache.close()
         finally:
             with psycopg.connect(dsn) as connection:
                 connection.execute(sql.SQL('DROP SCHEMA IF EXISTS {} CASCADE').format(sql.Identifier(schema)))

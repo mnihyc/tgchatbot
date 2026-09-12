@@ -194,6 +194,8 @@ class OpenAIResponsesProvider:
         return [{'type': 'function_call_output', 'call_id': tool_call.call_id, 'output': output}]
 
     def _parse_response(self, body: dict[str, Any]) -> ProviderResponse:
+        if body.get('error') or body.get('status') == 'failed':
+            raise RuntimeError('OpenAI Responses returned an API error')
         output = body.get('output', [])
         tool_calls: list[ToolCall] = []
         native_tool_calls: list[dict[str, Any]] = []
@@ -231,6 +233,8 @@ class OpenAIResponsesProvider:
                 for content in item.get('content', []):
                     if content.get('type') == 'output_text':
                         final_text_parts.append(content.get('text', ''))
+                    elif content.get('type') == 'refusal':
+                        final_text_parts.append(content.get('refusal') or '')
         usage_block = body.get('usage', {}) or {}
         input_tokens = usage_block.get('input_tokens')
         output_tokens = usage_block.get('output_tokens')

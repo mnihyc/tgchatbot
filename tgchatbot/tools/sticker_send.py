@@ -149,7 +149,6 @@ def _selection_lens_schema() -> dict[str, Any]:
             'social_read': _param('string', 'How the sticker should read socially, for example gentle acknowledgement, teasing disbelief, or cool detachment.'),
             'subtext': _param('string', 'Hidden meaning or implication that should come through, for example ironic support or not-actually-angry refusal.'),
             'face_and_pose': _param('string', 'Precise face, mouth, eyes, and pose read that should carry the reaction.'),
-            'continuity_note': _param('string', 'Soft note about how close or different this should feel relative to recent stickers or the current persona.'),
             'avoid_misread_as': _param('string', 'Meaning or mood that this should not accidentally read as.'),
         },
         'additionalProperties': False,
