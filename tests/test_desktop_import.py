@@ -134,7 +134,8 @@ class DesktopImportWorkflows(unittest.IsolatedAsyncioTestCase):
         media = originals[2].message
         self.assertIn('notes.pdf', message_body(media))
         self.assertIn('unavailable', message_body(media))
-        self.assertTrue(all(part.kind == PartKind.TEXT and not part.remote_sync for part in media.parts))
+        self.assertTrue(all(not part.remote_sync for part in media.parts))
+        self.assertEqual([part.kind for part in media.parts], [PartKind.TEXT, PartKind.FILE])
         self.assertEqual(media.metadata['desktop']['mime_type'], 'application/pdf')
         jobs = await self.store.claim_jobs(10, kind='memory_ingest')
         self.assertEqual(len(jobs), 1)

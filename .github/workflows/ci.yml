@@ -37,8 +37,8 @@ jobs:
           version: '0.11.16'
           python-version: '3.13'
           enable-cache: true
-      - name: Install locked runtime dependencies
-        run: uv sync --frozen --no-dev
+      - name: Install locked test dependencies
+        run: uv sync --frozen
       - name: Business workflows with real PostgreSQL and mocked Telegram/model APIs
         run: uv run --frozen python -m unittest discover -s tests -v
       - name: Check deployment shell syntax

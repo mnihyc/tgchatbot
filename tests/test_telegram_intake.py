@@ -254,7 +254,7 @@ class TelegramIntakeTests(BusinessTestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]['message_id'], rows[1]['message_id'])
         self.assertIn('enrichment pending', rows[0]['body'])
-        self.assertIn('Synthetic document text.', rows[1]['body'])
+        self.assertNotIn('Synthetic document text.', rows[1]['body'])
         self.assertIn('Attachment synced to remote for tool use', rows[1]['body'])
         current = (await self.store.list_canonical_messages(self.session))[0]
         remote_parts = [part for part in current.message.parts if part.kind == PartKind.FILE]

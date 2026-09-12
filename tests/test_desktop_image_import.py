@@ -122,7 +122,7 @@ class DesktopImageImportTests(BusinessTestCase):
         self.assertEqual(originals[1].message.metadata['desktop']['sticker_emoji'], '🙂')
         self.assertIn('🙂', message_body(originals[1].message))
         self.assertEqual([row.message.parts[0].text for row in originals], ['', '', ''])
-        self.assertTrue(all(part.kind == PartKind.TEXT or part.preview_ref for row in originals for part in row.message.parts),
+        self.assertTrue(all(part.kind in {PartKind.TEXT, PartKind.FILE} or part.preview_ref for row in originals for part in row.message.parts),
                         'Successful import must not leave an extra unavailable visual placeholder')
         self.assertEqual(frames[0][0].preview_ref, frames[1][0].preview_ref)
         self.assertEqual(frames[1][0].preview_ref, frames[2][0].preview_ref)
@@ -164,7 +164,7 @@ class DesktopImageImportTests(BusinessTestCase):
             self.assertIn('unavailable', placeholders[0].text)
         self.assertEqual(originals[1].message.parts[1].kind, PartKind.STICKER)
         self.assertIn('🙂', message_body(originals[1].message))
-        self.assertTrue(all(part.kind == PartKind.TEXT for part in originals[-1].message.parts))
+        self.assertEqual([part.kind for part in originals[-1].message.parts], [PartKind.TEXT, PartKind.FILE])
         self.assertEqual(originals[-1].message.metadata['desktop']['file'], 'notes.pdf')
         self.assertEqual((self.bundle / 'notes.pdf').read_bytes(), b'%PDF synthetic unsupported import document')
 

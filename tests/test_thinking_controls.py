@@ -34,7 +34,7 @@ class ThinkingControlWorkflows(unittest.IsolatedAsyncioTestCase):
             self.requests.append(json.loads(request.content))
             if self.status != 200:
                 return httpx.Response(self.status, json={'error': {'message': 'Synthetic model capacity rejection'}})
-            return httpx.Response(200, json={'candidates': [{'content': {'parts': [{'text': 'Answer'}]}}]})
+            return httpx.Response(200, json={'candidates': [{'finishReason': 'STOP', 'content': {'parts': [{'text': 'Answer'}]}}]})
         provider = GeminiProvider(self.config.gemini)
         async with httpx.AsyncClient(transport=httpx.MockTransport(response)) as client:
             provider._client = client

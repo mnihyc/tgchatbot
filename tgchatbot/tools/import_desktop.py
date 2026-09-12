@@ -2,17 +2,20 @@
 
 Desktop's export uses bare peer IDs and mixed string/entity text. The explicit
 destination chat supplies the live Bot API namespace; original export metadata
-is retained. Import never invokes Telegram handlers, tools, or media uploads.
+is retained. Import never invokes Telegram handlers, agent tools, or model interpretation.
+Available ordinary files use the same remote upload path as live intake.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 import json
 import mimetypes
 from pathlib import Path
 import re
+import shutil
+import tempfile
 from types import SimpleNamespace
 from typing import Any, Callable, Iterator
 from datetime import datetime
@@ -24,6 +27,8 @@ from ijson.common import ObjectBuilder
 from tgchatbot.domain.models import ConversationMessage, MessagePart, MessageRole, PartKind, SessionSettings
 from tgchatbot.config import TelegramConfig
 from tgchatbot.domain.provenance import telegram_actor, telegram_metadata, utc_time
+from tgchatbot.media.attachments import sync_attachment_parts
+from tgchatbot.storage.artifacts import ArtifactStore
 from tgchatbot.operational import from_env
 from tgchatbot.settings_schema import DEFAULT_METADATA_TIMEZONE
 from tgchatbot.storage.postgres_store import PostgresStore, StaleScopeError
@@ -191,7 +196,8 @@ def _attachment(record: dict[str, Any]) -> tuple[str, str, str | None, PartKind]
     filename = str(record.get('file_name') or record.get('file') or record.get('photo') or kind)
     mime = record.get('mime_type') or mimetypes.guess_type(filename)[0]
     visual_kind = (PartKind.STICKER if kind == 'sticker' else PartKind.IMAGE
-                   if record.get('photo') or str(mime or '').startswith(('image/', 'video/')) else PartKind.TEXT)
+                   if record.get('photo') or (kind not in {'video_message', 'video_note', 'voice_message', 'audio_file'}
+                       and str(mime or '').startswith(('image/', 'video/'))) else PartKind.FILE)
     return str(kind), filename, mime, visual_kind
 
 
@@ -205,18 +211,13 @@ def _attachment_hint(record: dict[str, Any], kind: str, filename: str, *, availa
 def _import_visual(message: ConversationMessage, record: dict[str, Any], export_root: Path,
                    config: TelegramConfig) -> None:
     attachment = _attachment(record)
-    if attachment is None or attachment[3] == PartKind.TEXT:
+    if attachment is None or attachment[3] not in {PartKind.IMAGE, PartKind.STICKER}:
         return
     kind, filename, mime, _ = attachment
-    reference = record.get('photo') or record.get('file')
-    if not isinstance(reference, str):
+    source = _export_attachment_path(record, export_root)
+    if source is None:
         return
     try:
-        source = (export_root / reference).resolve()
-        # An exported relative reference owns only files inside its bundle.
-        # Absolute/traversing/symlink references cannot read unrelated local data.
-        if not source.is_relative_to(export_root) or not source.is_file():
-            return
         photo, sticker = bool(record.get('photo')), kind == 'sticker'
         if not photo and not sticker and (config.max_document_bytes <= 0
                 or source.stat().st_size > config.max_document_bytes):
@@ -246,10 +247,85 @@ def _import_visual(message: ConversationMessage, record: dict[str, Any], export_
     message.metadata['media_availability'] = 'imported'
 
 
+def _export_attachment_path(record: dict[str, Any], export_root: Path) -> Path | None:
+    reference = record.get('photo') or record.get('file')
+    if not isinstance(reference, str):
+        return None
+    try:
+        source = (export_root / reference).resolve()
+        # Export references own only files inside that bundle, including symlinks.
+        return source if source.is_relative_to(export_root) and source.is_file() else None
+    except (OSError, ValueError):
+        return None
+
+
+def _same_import_source(original: ConversationMessage, incoming: ConversationMessage) -> bool:
+    return (original.metadata.get('imported') and original.role == incoming.role
+        and original.name == incoming.name and original.parts[0].text == incoming.parts[0].text
+        and all(original.metadata.get(key) == value for key, value in incoming.metadata.items()
+                if key not in {'media_availability', 'source_revision'}))
+
+
+async def _sync_import_attachment(message: ConversationMessage, record: dict[str, Any], *,
+        session_id: str, export_root: Path, config: TelegramConfig,
+        remote_workspace, artifact_store: ArtifactStore | None, previous=None) -> None:
+    attachment = _attachment(record)
+    if attachment is None or record.get('photo') or attachment[0] == 'sticker':
+        return
+    _kind, filename, mime, _visual_kind = attachment
+    source = _export_attachment_path(record, export_root)
+    try:
+        size_bytes = source.stat().st_size if source is not None else None
+    except OSError:
+        source, size_bytes = None, None
+    descriptor = MessagePart(PartKind.FILE, filename=Path(filename).name,
+        mime_type=mime or 'application/octet-stream', size_bytes=size_bytes, remote_sync=False,
+        origin='attachment_reference')
+    previous_file = None
+    if previous is not None and _same_import_source(previous.message, message):
+        previous_file = next((part for part in previous.message.parts
+            if part.kind == PartKind.FILE and part.artifact_path and part.remote_sync), None)
+    if source is None:
+        descriptor.detail = 'remote copy unavailable: file was not included in this export'
+    elif config.max_document_bytes <= 0:
+        descriptor.detail = 'remote copy unavailable: attached file processing disabled by config'
+    elif size_bytes > config.max_document_bytes:
+        descriptor.detail = 'remote copy unavailable: file exceeds size limit'
+    elif not remote_workspace or not remote_workspace.enabled:
+        descriptor.detail = 'remote copy unavailable: SSH is disabled'
+    else:
+        if artifact_store is None:
+            raise ValueError('Remote import needs the configured artifact store for temporary copies')
+        # Only copies under the shared transfer store reach the sync/cleanup
+        # owner. A prior successful reference supplies its existing basename so
+        # reimport updates that remote file rather than creating another copy.
+        try:
+            with tempfile.TemporaryDirectory(prefix='import-', dir=artifact_store.root) as temporary:
+                staging = ArtifactStore(Path(temporary))
+                if previous_file is not None:
+                    staged = staging.root / Path(previous_file.artifact_path).name
+                else:
+                    staged = staging.save_bytes(chat_id=session_id, filename=filename, data=b'')
+                await asyncio.to_thread(shutil.copyfile, source, staged)
+                pending = replace(descriptor, artifact_path=str(staged), remote_sync=True,
+                    size_bytes=staged.stat().st_size)
+                synced = await sync_attachment_parts(session_id, [pending], remote_workspace)
+            descriptor = next(part for part in synced if part.kind == PartKind.FILE)
+            # Keep the shared live workflow's account of upload and rotation.
+            message.parts.extend(part for part in synced if part.kind == PartKind.TEXT)
+        except OSError:
+            descriptor.detail = 'remote copy unavailable: exported file could not be read'
+    message.parts = [part for part in message.parts
+        if not (part.origin == 'attachment_reference' and part.kind == PartKind.FILE)]
+    message.parts.append(descriptor)
+    if descriptor.remote_sync and message.metadata.get('media_availability') != 'imported':
+        message.metadata['media_availability'] = 'synced'
+
+
 async def _retained_import(store: PostgresStore, session_id: str, message: ConversationMessage, scope):
     """An unchanged export without its files cannot revoke retained visual evidence."""
-    if message.metadata.get('media_availability') != 'not_imported' or not any(
-            part.kind in {PartKind.IMAGE, PartKind.STICKER} for part in message.parts):
+    if not any(part.kind in {PartKind.IMAGE, PartKind.STICKER}
+            and not (part.preview_ref or part.data_b64) for part in message.parts):
         return None
     metadata = message.metadata
     previous = await store.read_message_by_source(session_id,
@@ -258,14 +334,26 @@ async def _retained_import(store: PostgresStore, session_id: str, message: Conve
     if previous is None:
         return None
     original = previous.message
-    if (not original.metadata.get('imported') or original.role != message.role or original.name != message.name
-            or original.parts[0].text != message.parts[0].text
-            or any(original.metadata.get(key) != value for key, value in metadata.items()
-                   if key not in {'media_availability', 'source_revision'})):
+    if not _same_import_source(original, message):
         return None
     images = (await store.describe_message_images(session_id, [previous.db_id],
         expected_scope={'generation': scope['generation']})).get(previous.db_id, [])
     if not images or not all(image['available'] for image in images):
+        return None
+    # File synchronization and retained pixels have independent ownership:
+    # preserve the original visual evidence while applying this attempt's file
+    # availability, instead of returning an older upload descriptor wholesale.
+    if any(part.kind == PartKind.FILE for part in message.parts):
+        retained = [replace(part) for part in original.parts if part.preview_ref or part.data_b64
+            or (part.origin == 'attachment_reference' and part.kind == PartKind.TEXT)]
+        restored = []
+        for part in message.parts:
+            if part.kind in {PartKind.IMAGE, PartKind.STICKER} and not (part.preview_ref or part.data_b64):
+                restored.extend(retained)
+            else:
+                restored.append(part)
+        message.parts = restored
+        message.metadata['media_availability'] = 'imported'
         return None
     # The no-op path needs the same full-reset boundary as an ordinary append.
     await store.assert_scope(session_id, scope, generation_only=True)
@@ -338,8 +426,7 @@ def desktop_message(record: dict[str, Any], chat: ExportChat, *, chat_id: int,
         media_kind, filename, mime, visual_kind = attachment
         parts.append(MessagePart(visual_kind,
             text=_attachment_hint(record, media_kind, filename),
-            filename=filename if visual_kind != PartKind.TEXT else None,
-            mime_type=mime if visual_kind != PartKind.TEXT else None,
+            filename=filename, mime_type=mime,
             origin='attachment_reference', remote_sync=False))
         metadata['media_availability'] = 'not_imported'
     if record.get('type') == 'service' and not text:
@@ -379,6 +466,7 @@ async def import_file(store: PostgresStore, path: Path, *, chat_id: int,
                       defaults: SessionSettings | None = None,
                       options: ImportConfig | None = None,
                       telegram_config: TelegramConfig | None = None,
+                      remote_workspace=None, artifact_store: ArtifactStore | None = None,
                       progress: Callable[[ImportResult], None] | None = None) -> ImportResult:
     options = options if options is not None else from_env(ImportConfig, 'IMPORT')
     session_id = f'telegram:{chat_id}'
@@ -392,11 +480,26 @@ async def import_file(store: PostgresStore, path: Path, *, chat_id: int,
         for record in batch:
             message = desktop_message(record, chat, chat_id=chat_id, bot_user_id=bot_user_id,
                 timezone=settings.metadata_timezone or DEFAULT_METADATA_TIMEZONE)
-            if any(part.kind in {PartKind.IMAGE, PartKind.STICKER} for part in message.parts):
+            previous = None
+            attachment = _attachment(record)
+            if attachment is not None:
                 if telegram_config is None:
                     from tgchatbot.config import load_config
                     telegram_config = load_config(require_telegram=False).telegram
+                is_file = not record.get('photo') and attachment[0] != 'sticker'
+                if is_file:
+                    previous = await store.read_message_by_source(session_id, source='telegram',
+                        source_chat_id=str(chat_id), source_message_id=message.metadata['source_message_id'],
+                        expected_scope=scope, generation_only=True)
+                    if remote_workspace and remote_workspace.enabled and (previous is None
+                            or not _same_import_source(previous.message, message)):
+                        # Commit source identity/text before any remote transfer.
+                        previous = await store.append_message(session_id, message,
+                            expected_scope=scope, generation_only=True)
                 await asyncio.to_thread(_import_visual, message, record, export_root, telegram_config)
+                await _sync_import_attachment(message, record, session_id=session_id, export_root=export_root,
+                    config=telegram_config, remote_workspace=remote_workspace,
+                    artifact_store=artifact_store, previous=previous)
             stored = await _retained_import(store, session_id, message, scope)
             if stored is None:
                 stored = await store.append_message(session_id, message, expected_scope=scope, generation_only=True)
@@ -419,6 +522,9 @@ async def _run(args: argparse.Namespace) -> None:
     config = load_config(require_telegram=False)
     options = from_env(ImportConfig, 'IMPORT')
     store = PostgresStore(config.database_url)
+    from tgchatbot.tools.remote_workspace import RemoteWorkspaceClient
+    remote_workspace = RemoteWorkspaceClient(config) if config.ssh_exec.enabled and config.ssh_exec.host else None
+    artifact_store = ArtifactStore(config.artifact_dir) if remote_workspace else None
     token_id = config.telegram.token.split(':', 1)[0]
     try:
         await store.initialize()
@@ -426,10 +532,12 @@ async def _run(args: argparse.Namespace) -> None:
             export_chat_id=args.export_chat_id,
             bot_user_id=int(token_id) if token_id.isdigit() else None,
             defaults=config.default_session_settings(),
-            telegram_config=config.telegram,
+            telegram_config=config.telegram, remote_workspace=remote_workspace, artifact_store=artifact_store,
             options=options,
             progress=lambda status: print(f'Processed {status.messages} messages in {status.batches} bounded batches.', flush=True))
     finally:
+        if remote_workspace is not None:
+            await remote_workspace.aclose()
         await store.close()
     print(f'Import complete: {result.messages} messages processed. New or changed messages are queued for memory processing.')
 

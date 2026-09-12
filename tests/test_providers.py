@@ -17,6 +17,7 @@ import httpx
 from tgchatbot.config import ChatCompletionsConfig, load_config
 from tgchatbot.core.compaction_schema import compaction_json_schema
 from tgchatbot.domain.models import ChatMode, ConversationMessage, MessagePart, MessageRole, PartKind, SessionSettings, ToolCall, ToolHistoryMode, ToolResult
+from tgchatbot.providers.base import ProviderOutcomeError
 from tgchatbot.providers.chat_completions import ChatCompletionsProvider
 from tgchatbot.providers.factory import build_provider, build_providers
 from tgchatbot.providers.gemini import GeminiProvider
@@ -98,16 +99,16 @@ class CachedUsageContractTests(unittest.TestCase):
     def test_reported_cache_reads_are_a_subset_of_input_not_added_to_totals(self):
         # Parse documented wire shapes without constructing an HTTP client.
         fixtures = (
-            (GeminiProvider, {'candidates': [{'content': {'parts': [{'text': 'done'}]}}]},
+            (GeminiProvider, {'candidates': [{'finishReason': 'STOP', 'content': {'parts': [{'text': 'done'}]}}]},
              'usageMetadata', {'promptTokenCount': 10000, 'candidatesTokenCount': 23, 'totalTokenCount': 10023},
              lambda value: {'cachedContentTokenCount': value}),
-            (OpenAIResponsesProvider, {'output': [{'type': 'message', 'content': [{'type': 'output_text', 'text': 'done'}]}]},
+            (OpenAIResponsesProvider, {'status': 'completed', 'output': [{'type': 'message', 'content': [{'type': 'output_text', 'text': 'done'}]}]},
              'usage', {'input_tokens': 10000, 'output_tokens': 23},
              lambda value: {'input_tokens_details': {'cached_tokens': value, 'cache_write_tokens': 500}}),
-            (ChatCompletionsProvider, {'choices': [{'message': {'role': 'assistant', 'content': 'done'}}]},
+            (ChatCompletionsProvider, {'choices': [{'finish_reason': 'stop', 'message': {'role': 'assistant', 'content': 'done'}}]},
              'usage', {'prompt_tokens': 10000, 'completion_tokens': 23},
              lambda value: {'prompt_tokens_details': {'cached_tokens': value, 'cache_write_tokens': 500}}),
-            (ChatCompletionsProvider, {'choices': [{'message': {'role': 'assistant', 'content': 'done'}}]},
+            (ChatCompletionsProvider, {'choices': [{'finish_reason': 'stop', 'message': {'role': 'assistant', 'content': 'done'}}]},
              'usage', {'prompt_tokens': 10000, 'completion_tokens': 23},
              lambda value: {'prompt_cache_hit_tokens': value, 'prompt_cache_miss_tokens': 10000 - value}),
         )
@@ -126,19 +127,19 @@ class CachedUsageContractTests(unittest.TestCase):
 
     def test_compatible_standard_zero_is_not_replaced_by_an_alias_counter(self):
         provider = object.__new__(ChatCompletionsProvider)
-        body = {'choices': [{'message': {'content': 'done'}}], 'usage': {
+        body = {'choices': [{'finish_reason': 'stop', 'message': {'content': 'done'}}], 'usage': {
             'prompt_tokens': 10000, 'completion_tokens': 23,
             'prompt_tokens_details': {'cached_tokens': 0}, 'prompt_cache_hit_tokens': 8192}}
         self.assertEqual(provider._parse_response(body).usage.cached_input_tokens, 0)
 
     def test_gemini_usage_survives_a_response_without_candidates(self):
         provider = object.__new__(GeminiProvider)
-        response = provider._parse_response({'usageMetadata': {
-            'promptTokenCount': 10000, 'cachedContentTokenCount': 8192, 'totalTokenCount': 10000}})
-        self.assertEqual(response.final_text, '')
-        self.assertEqual(response.usage.cached_input_tokens, 8192)
-        self.assertEqual(response.usage.input_tokens, 10000)
-        self.assertEqual(response.usage.total_tokens, 10000)
+        with self.assertRaises(ProviderOutcomeError) as failure:
+            provider._parse_response({'usageMetadata': {
+                'promptTokenCount': 10000, 'cachedContentTokenCount': 8192, 'totalTokenCount': 10000}})
+        self.assertEqual(failure.exception.usage.cached_input_tokens, 8192)
+        self.assertEqual(failure.exception.usage.input_tokens, 10000)
+        self.assertEqual(failure.exception.usage.total_tokens, 10000)
 
 
 class FrameworkProfileToolHistoryTests(unittest.TestCase):
@@ -282,12 +283,12 @@ class ServiceTierContractTests(unittest.IsolatedAsyncioTestCase):
                         if reject:
                             return httpx.Response(503, json={'error': {'message': 'Flex capacity unavailable'}})
                         if name == 'gemini':
-                            body = {'candidates': [{'content': {'role': 'model', 'parts': [{'text': 'done'}]}}],
+                            body = {'candidates': [{'finishReason': 'STOP', 'content': {'role': 'model', 'parts': [{'text': 'done'}]}}],
                                     'usageMetadata': {'promptTokenCount': 12, 'candidatesTokenCount': 3, 'totalTokenCount': 15, 'serviceTier': 'flex'}}
                         elif name == 'openai':
-                            body = {'output': [], 'usage': {'input_tokens': 12, 'output_tokens': 3, 'total_tokens': 15}, 'service_tier': 'flex'}
+                            body = {'status': 'completed', 'output': [], 'usage': {'input_tokens': 12, 'output_tokens': 3, 'total_tokens': 15}, 'service_tier': 'flex'}
                         else:
-                            body = {'choices': [{'message': {'role': 'assistant', 'content': 'done'}}],
+                            body = {'choices': [{'finish_reason': 'stop', 'message': {'role': 'assistant', 'content': 'done'}}],
                                     'usage': {'prompt_tokens': 12, 'completion_tokens': 3, 'total_tokens': 15}, 'service_tier': 'flex'}
                         return httpx.Response(200, json=body)
                     provider._client = httpx.AsyncClient(base_url='https://test.invalid/', transport=httpx.MockTransport(handle))
@@ -295,6 +296,11 @@ class ServiceTierContractTests(unittest.IsolatedAsyncioTestCase):
                         settings = replace(config.default_session_settings(), service_tier='flex', native_web_search_mode='off')
                         args = {'settings': settings, 'messages': [ConversationMessage.user_text('Synthetic annotation')], 'instructions': 'Describe.', 'tools': []}
                         result = await provider.generate(**args)
+                        if name == 'gemini':
+                            self.assertEqual({setting['category']: setting['threshold']
+                                for setting in requests[-1]['safetySettings']}, {
+                                    'HARM_CATEGORY_HARASSMENT': 'OFF', 'HARM_CATEGORY_HATE_SPEECH': 'OFF',
+                                    'HARM_CATEGORY_SEXUALLY_EXPLICIT': 'OFF', 'HARM_CATEGORY_DANGEROUS_CONTENT': 'OFF'})
                         self.assertEqual(requests[-1]['service_tier'], 'flex')
                         self.assertEqual(result.usage.service_tier, 'flex')
                         self.assertEqual(result.usage.input_tokens, 12)
@@ -329,7 +335,7 @@ class ChatCompletionsContractTests(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     def answer(text='done', **message):
-        return {'choices': [{'message': {'role': 'assistant', 'content': text, **message}}], 'usage': {'prompt_tokens': 11, 'completion_tokens': 7}}
+        return {'choices': [{'finish_reason': 'tool_calls' if message.get('tool_calls') else 'stop', 'message': {'role': 'assistant', 'content': text, **message}}], 'usage': {'prompt_tokens': 11, 'completion_tokens': 7}}
 
     @staticmethod
     def settings(provider):
@@ -392,14 +398,14 @@ class ChatCompletionsContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_malformed_tool_arguments_never_become_an_executable_empty_call(self):
         provider = await self.make_provider()
         for arguments in ('not json', '[]', 'null'):
-            with self.subTest(arguments=arguments), self.assertRaises((ValueError, TypeError)):
+            with self.subTest(arguments=arguments), self.assertRaises(ProviderOutcomeError):
                 provider._parse_response(self.answer(tool_calls=[{'id': 'call-1', 'function': {'name': 'delete', 'arguments': arguments}}]))
 
     async def test_error_envelope_does_not_become_a_successful_empty_reply(self):
         provider = await self.make_provider()
         with self.assertRaises(RuntimeError):
             provider._parse_response({'error': {'message': 'upstream unavailable'}})
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ProviderOutcomeError):
             provider._parse_response({'choices': []})
 
     async def test_extra_body_and_sampling_overrides_preserve_request_controls(self):
@@ -473,7 +479,7 @@ class AllAdaptersContractTests(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual([(call.name, call.arguments) for call in response.tool_calls],
                                 [('remember_style', {'style': 'quiet'})])
                         else:
-                            with self.assertRaisesRegex(ValueError, 'valid function call'):
+                            with self.assertRaisesRegex(ProviderOutcomeError, 'MALFORMED_FUNCTION_CALL'):
                                 await request
                     self.assertEqual(len(captured), retries + 1)
                     self.assertTrue(all(item == captured[0] for item in captured))
@@ -518,7 +524,7 @@ class AllAdaptersContractTests(unittest.IsolatedAsyncioTestCase):
                         if payload['contents'][-1]['role'] == 'model':
                             return httpx.Response(400, json={'error': {
                                 'message': 'Requests ending with a model turn are not supported.'}})
-                        return httpx.Response(200, json={'candidates': [{'content': {
+                        return httpx.Response(200, json={'candidates': [{'finishReason': 'STOP', 'content': {
                             'role': 'model', 'parts': [{'text': json.dumps(candidate)}]}}]})
 
                     provider = GeminiProvider(config.gemini)
@@ -538,8 +544,8 @@ class AllAdaptersContractTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn('telegram:user:7 prefers coffee', json.dumps(captured[0]))
                     self.assertIn('telegram:user:8 avoids coffee', json.dumps(captured[0]))
 
-    async def test_each_provider_can_generate_validated_compaction(self):
-        from tgchatbot.core.runtime import AgentRuntime
+    async def test_each_provider_requires_completed_output_for_validated_compaction(self):
+        from tgchatbot.core.runtime import AgentRuntime, CompactionModelRequestFailed
         schema = compaction_json_schema('episode')
         candidate = {name: [] for name in schema['properties']}
         candidate.update(scope='Preserve requested language', interaction_mode='chat_or_sharing', user_profile=['Use English'])
@@ -550,15 +556,18 @@ class AllAdaptersContractTests(unittest.IsolatedAsyncioTestCase):
                     provider = build_provider(config, name)
                     await provider.aclose()
                     captured = []
+                    completed = True
                     def handler(request):
                         captured.append(json.loads(request.content))
                         text = json.dumps(candidate)
                         if name == 'openai':
-                            body = {'output': [{'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': text}]}]}
+                            body = {'status': 'completed' if completed else 'incomplete', 'output': [{'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': text}]}]}
                         elif name == 'gemini':
-                            body = {'candidates': [{'content': {'role': 'model', 'parts': [{'text': text}]}}]}
+                            body = {'candidates': [{'finishReason': 'STOP' if completed else 'MAX_TOKENS', 'content': {'role': 'model', 'parts': [{'text': text}]}}]}
                         else:
                             body = ChatCompletionsContractTests.answer(text)
+                            if not completed:
+                                body['choices'][0]['finish_reason'] = 'length'
                         return httpx.Response(200, json=body)
                     provider._client = httpx.AsyncClient(base_url='https://example.invalid/', transport=httpx.MockTransport(handler))
                     try:
@@ -568,6 +577,12 @@ class AllAdaptersContractTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(result['user_profile'], ['Use English'])
                         payload = captured[0]
                         self.assertNotIn('tools', payload) if name in {'deepseek', 'openrouter'} else None
+                        completed = False
+                        with self.assertLogs('tgchatbot.core.runtime', level='ERROR'):
+                            with self.assertRaises(CompactionModelRequestFailed) as failed:
+                                await runtime._generate_structured_candidate(provider, config.default_session_settings(),
+                                    [ConversationMessage.user_text('Please use English')], mode='episode')
+                        self.assertIsInstance(failed.exception.__cause__, ProviderOutcomeError)
                     finally:
                         await provider.aclose()
 

@@ -169,7 +169,7 @@ class StorageLayoutTests(BusinessTestCase):
                 attachment = MessagePart(PartKind.FILE, filename=f'report{number}.pdf',
                     mime_type='application/pdf', size_bytes=len(original), artifact_path=str(local), remote_sync=True)
                 if enabled:
-                    with self.assertLogs('tgchatbot.transports.telegram_adapter', level='ERROR'):
+                    with self.assertLogs('tgchatbot.media.attachments', level='ERROR'):
                         parts = await app._sync_parts_to_remote(self.session, [attachment])
                     remote.sync_inputs.assert_awaited_once()
                 else:

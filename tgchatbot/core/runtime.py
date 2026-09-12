@@ -41,7 +41,7 @@ from tgchatbot.domain.models import (
 )
 from tgchatbot.logging_config import clip_for_log
 from tgchatbot.domain.provenance import attributed_message, attribution, evidence_part_spans, message_evidence
-from tgchatbot.providers.base import ModelProvider, RequestTokenEstimate
+from tgchatbot.providers.base import ModelProvider, ProviderOutcomeError, RequestTokenEstimate
 from tgchatbot.settings_schema import (
     COMPACT_KEEP_RECENT_RATIO_MAX,
     COMPACT_KEEP_RECENT_RATIO_MIN,
@@ -635,6 +635,11 @@ class AgentRuntime:
                                     user_display_name=user_display_name,
                                     scope=_turn_scope.get(),
                                     timezone=settings.metadata_timezone,
+                                    evidence_tokens=max(0, self._effective_compact_trigger_tokens(settings) - admitted_tokens),
+                                    evidence_images=(max(0, self._effective_max_input_images(provider, settings) - admitted_images)
+                                        if self._effective_max_input_images(provider, settings) is not None else None),
+                                    tool_images=(provider.supports_tool_evidence(settings) if hasattr(provider, 'supports_tool_evidence')
+                                        else getattr(provider.capabilities, 'multimodal_tool_results', False)),
                                 ),
                             )
                         except Exception as exc:
@@ -1075,14 +1080,19 @@ class AgentRuntime:
         payload_text = self._compact_json(payload)
         return f'[Tool event {name}: {payload_text}]'
 
-    async def _generate_with_retries(self, *, provider, settings: SessionSettings, messages: list[ConversationMessage], instructions: str, tools, extra_input_items):
+    async def _generate_with_retries(self, *, provider, settings: SessionSettings, messages: list[ConversationMessage], instructions: str, tools, extra_input_items, **request_options):
         retries = self._effective_provider_retry_count(settings)
         last_exc = None
         for attempt in range(retries + 1):
             try:
-                return await provider.generate(settings=settings, messages=messages, instructions=instructions, tools=tools, extra_input_items=extra_input_items)
+                return await provider.generate(settings=settings, messages=messages, instructions=instructions,
+                    tools=tools, extra_input_items=extra_input_items, **request_options)
             except Exception as exc:
                 last_exc = exc
+                if isinstance(exc, ProviderOutcomeError):
+                    logger.warning('provider.incomplete provider=%s model=%s attempt=%s/%s reason=%s usage=%s',
+                        settings.provider, settings.model, attempt + 1, retries + 1,
+                        exc.reason, self._usage_log_text(exc.usage))
                 if attempt >= retries:
                     raise
                 logger.warning('provider.retry provider=%s model=%s attempt=%s/%s err=%s', settings.provider, settings.model, attempt + 1, retries + 1, exc.__class__.__name__)
@@ -1395,6 +1405,18 @@ class AgentRuntime:
             return output, parts
         supports = (provider.supports_tool_evidence(settings) if hasattr(provider,'supports_tool_evidence')
             else getattr(provider.capabilities,'multimodal_tool_results',False))
+        if any(part.origin == 'file_read' for part in parts):
+            image_count = sum(part.kind == PartKind.IMAGE for part in parts)
+            image_limit = self._effective_max_input_images(provider, settings)
+            cost = TokenEstimator.estimate_message(ConversationMessage(role=MessageRole.TOOL, parts=parts))
+            if image_count and not supports:
+                reason = 'The selected API cannot receive images in tool results'
+            elif ((image_limit is not None and images + image_count > image_limit) or
+                    tokens + cost > self._effective_compact_trigger_tokens(settings)):
+                reason = 'Selection exceeds this request allowance; choose fewer lines or pages'
+            else:
+                return output, parts
+            return {**output, 'ok': False, 'error': reason}, []
         if isinstance(output.get('image_results'), list):
             # Source resolution owns availability; this request owns whether
             # selected pixels are actually shown to the model.
@@ -2793,7 +2815,8 @@ class AgentRuntime:
             # Attribution rejection never changes source ownership. The
             # operator controls how many corrections may be requested.
             for attempt in range(self.config.context.attribution_retries + 1):
-                response = await provider.generate(
+                response = await self._generate_with_retries(
+                    provider=provider,
                     settings=compaction_settings,
                     messages=working,
                     instructions=build_compaction_prompt(mode=mode),

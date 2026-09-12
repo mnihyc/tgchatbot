@@ -97,6 +97,13 @@ Configure SSH in `.env` before enabling remote tools. Keep an SSH identity under
 `data/`, for example `SSH_EXEC_IDENTITY_FILE=./data/your_key`. Known hosts are
 retained under `data/home/.ssh/known_hosts`.
 
+`read_doc` reads a selected workspace file through the remote host's `python3`.
+Install Pillow for images and pypdfium2 for PDFs in that Python environment
+(for example, `uv pip install --python python3 pillow pypdfium2`). Parsing and
+rendering run remotely; only selected text and compressed images return to the
+conversation. Text reads need no additional Python packages. Audio/video tool
+results report unsupported on the current API routes.
+
 The bot starts with an empty sticker catalog. Add original media and build it
 explicitly; normal updates do not regenerate it or make annotation requests.
 See [maintenance commands](https://github.com/mnihyc/tgchatbot/blob/main/scripts/README.md) for append, selected regeneration,

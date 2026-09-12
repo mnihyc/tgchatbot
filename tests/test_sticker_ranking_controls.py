@@ -123,9 +123,9 @@ class StickerImageAdmissionControlTests(BusinessTestCase):
                     compact_target_images=image_limit, compact_trigger_tokens=100000,
                     max_interaction_rounds=1)
                 provider = await self.make_provider([
-                    {'output': [{'type': 'function_call', 'name': 'sticker_query',
+                    {'status': 'completed', 'output': [{'type': 'function_call', 'name': 'sticker_query',
                                  'call_id': 'query', 'arguments': json.dumps(arguments)}]},
-                    {'output': [{'type': 'message', 'role': 'assistant', 'content': [
+                    {'status': 'completed', 'output': [{'type': 'message', 'role': 'assistant', 'content': [
                         {'type': 'output_text', 'text': 'I can examine these candidates.'}]}]},
                 ])
                 runtime = AgentRuntime(config=self.config, store=self.store,
@@ -157,7 +157,7 @@ class StickerImageAdmissionControlTests(BusinessTestCase):
             compact_target_images=3, compact_trigger_tokens=100000, max_interaction_rounds=1)
         provider = await self.make_provider([
             runtime_fixtures.function('sticker_query', 'query'),
-            {'output': [{'type': 'message', 'role': 'assistant', 'content': [
+            {'status': 'completed', 'output': [{'type': 'message', 'role': 'assistant', 'content': [
                 {'type': 'output_text', 'text': 'I will inspect the supplied candidates.'}]}]},
         ])
         candidates = [{'sticker_id': name} for name in ('a', 'b', 'c')]

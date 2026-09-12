@@ -17,6 +17,7 @@ from PIL import Image, UnidentifiedImageError
 from telegram import Message
 
 from tgchatbot.config import TelegramConfig
+from tgchatbot.media.image_encoding import compress_frame as _compress_frame
 from tgchatbot.domain.models import MessagePart, PartKind
 from tgchatbot.storage.artifacts import ArtifactStore
 
@@ -85,45 +86,6 @@ def _image_frames_from_bytes(data: bytes, split_frames: int, *, max_keyframe_can
         for frame in frames:
             frame.close()
         return _extract_keyframes(data, num_key_frames=split_frames, max_candidates=max_keyframe_candidates)
-
-
-def _compress_frame(frame: Image.Image, max_size: int) -> tuple[str, bytes]:
-    has_alpha = frame.mode in ("RGBA", "LA") or ("transparency" in frame.info)
-    if has_alpha:
-        mime = "image/png"
-        working = frame.convert("RGBA")
-        options = {"format": "PNG", "optimize": True}
-    else:
-        mime = "image/jpeg"
-        working = frame.convert("RGB")
-        options = {"format": "JPEG", "quality": 85, "optimize": True}
-
-    try:
-        buf = io.BytesIO()
-        working.save(buf, **options)
-        payload = buf.getvalue()
-        if len(payload) <= max_size:
-            return mime, payload
-
-        for _ in range(8):
-            new_w = max(1, int(working.width * 0.8))
-            new_h = max(1, int(working.height * 0.8))
-            if new_w == working.width and new_h == working.height:
-                break
-            resized = working.resize((new_w, new_h), Image.LANCZOS)
-            working.close()
-            working = resized
-            buf = io.BytesIO()
-            if mime == "image/jpeg":
-                working.save(buf, format="JPEG", quality=75, optimize=True)
-            else:
-                working.save(buf, format="PNG", optimize=True)
-            payload = buf.getvalue()
-            if len(payload) <= max_size:
-                break
-        return mime, payload
-    finally:
-        working.close()
 
 
 def _compress_frame_if_fits(frame: Image.Image, max_size: int) -> tuple[str, bytes] | None:
@@ -307,7 +269,7 @@ async def extract_message_parts(
         media = getattr(message, field, None)
         if media is not None:
             parts.extend(await _extract_file_message_parts(media, artifact_store, session_id, telegram_config,
-                fallback_name=fallback_name, fallback_mime=fallback_mime, visual=visual, excerpt=field == 'document'))
+                fallback_name=fallback_name, fallback_mime=fallback_mime, visual=visual))
     return parts
 
 
@@ -320,7 +282,6 @@ async def _extract_file_message_parts(
     fallback_name: str,
     fallback_mime: str,
     visual: bool,
-    excerpt: bool,
 ) -> list[MessagePart]:
     filename = getattr(media, 'file_name', None) or fallback_name
     if telegram_config.max_document_bytes <= 0:
@@ -336,25 +297,4 @@ async def _extract_file_message_parts(
     parts = [_file_part(filename=filename, mime=mime, artifact_path=str(path), size_bytes=len(raw))]
     if visual:
         parts.extend(_build_visual_preview_parts(raw=raw, mime=mime, filename=filename, telegram_config=telegram_config))
-    if excerpt:
-        text_excerpt = _try_text_excerpt(raw, mime, telegram_config.max_inline_text_chars)
-        if text_excerpt:
-            parts.append(MessagePart(kind=PartKind.TEXT, text=f"[Attached file excerpt: {filename} ({mime})]\n{text_excerpt}",
-                remote_sync=False, origin='attachment_excerpt'))
     return parts
-
-
-def _try_text_excerpt(raw: bytes, mime: str, limit: int) -> str | None:
-    text_like = mime.startswith('text/') or mime in {'application/json', 'application/xml', 'application/javascript'}
-    if not text_like:
-        return None
-    try:
-        text = raw.decode('utf-8', errors='replace')
-    except Exception:
-        return None
-    text = text.strip()
-    if not text:
-        return None
-    if len(text) > limit:
-        return text[:limit] + '\n[truncated]'
-    return text

@@ -808,7 +808,7 @@ class MemoryBusinessTests(BusinessTestCase):
                 return httpx.Response(400, json={'error': {
                     'message': 'Requests ending with a model turn are not supported.'}})
             candidate = self.compaction_candidate(owned=len(captured) > 1)
-            return httpx.Response(200, json={'candidates': [{'content': {
+            return httpx.Response(200, json={'candidates': [{'finishReason': 'STOP', 'content': {
                 'role': 'model', 'parts': [{'text': json.dumps(candidate)}]}}]})
 
         provider = GeminiProvider(replace(self.config.gemini, api_key='synthetic-key'))
@@ -858,7 +858,7 @@ class MemoryBusinessTests(BusinessTestCase):
 
         def handler(request):
             captured.append(json.loads(request.content))
-            return httpx.Response(200, json={'candidates': [{'content': {
+            return httpx.Response(200, json={'candidates': [{'finishReason': 'STOP', 'content': {
                 'role': 'model', 'parts': [{'text': json.dumps(candidate)}]}}]})
 
         provider = GeminiProvider(replace(self.config.gemini, api_key='synthetic-key'))

@@ -5,8 +5,16 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from tgchatbot.core.token_estimator import TokenEstimator
-from tgchatbot.domain.models import ConversationMessage, MessagePart, MessageRole, PartKind, ProviderResponse, SessionSettings, ToolCall
+from tgchatbot.domain.models import ConversationMessage, MessagePart, MessageRole, PartKind, ProviderResponse, SessionSettings, ToolCall, UsageInfo
 from tgchatbot.tools.base import ToolSpec
+
+
+class ProviderOutcomeError(RuntimeError):
+    """A received response did not complete the requested provider operation."""
+
+    def __init__(self, provider: str, reason: str, usage: UsageInfo) -> None:
+        self.provider, self.reason, self.usage = provider, reason, usage
+        super().__init__(f'{provider} request did not complete: {reason}')
 
 
 @dataclass(frozen=True)

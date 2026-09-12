@@ -1523,7 +1523,7 @@ class PostgresStore:
         """Read bounded documents and their internal evidence from one committed snapshot."""
         from psycopg import AsyncServerCursor
         from tgchatbot.domain.profiles import profile_document
-        from tgchatbot.storage.profiles import _identity
+        from tgchatbot.storage.profiles import _identity, add_source_dates
         async with self.pool.connection() as conn:
             await conn.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
             scope = await (await conn.execute('SELECT generation,context_id,revision FROM sessions '
@@ -1557,6 +1557,8 @@ class PostgresStore:
                             document = candidate
                 profiles.append(document)
                 facts.extend(accepted)
+            if for_learning:
+                await add_source_dates(conn, profiles)
         if expected_scope is not None:
             await self.assert_scope(session_id, expected_scope)
         return {'scope': dict(scope) if scope is not None else None, 'as_of': as_of,

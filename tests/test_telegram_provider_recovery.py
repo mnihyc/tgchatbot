@@ -24,6 +24,19 @@ from tgchatbot.transports.telegram_adapter import TelegramBotApp
 
 class TelegramProviderRecoveryTests(BusinessTestCase):
     async def test_exhausted_malformed_call_preserves_context_and_next_keyword_recovers(self):
+        await self.check_failure_recovery({'candidates': [{
+            'content': {}, 'finishReason': 'MALFORMED_FUNCTION_CALL',
+            'finishMessage': 'Function call is empty - no input to parse.'}]})
+
+    async def test_exhausted_truncated_reply_preserves_context_and_next_keyword_recovers(self):
+        await self.check_failure_recovery({'candidates': [{
+            'content': {'role': 'model', 'parts': [{'text': 'A plausible unfinished answer'}]},
+            'finishReason': 'MAX_TOKENS'}]})
+
+    async def test_exhausted_prompt_block_preserves_context_and_next_keyword_recovers(self):
+        await self.check_failure_recovery({'promptFeedback': {'blockReason': 'SAFETY'}})
+
+    async def check_failure_recovery(self, failed_response):
         self.config = replace(self.config,
             telegram=replace(self.config.telegram, keywords=('helper',), ignore_keywords=()),
             gemini=replace(self.config.gemini, api_key='mock-gemini-key', base_url='https://provider.invalid'))
@@ -39,9 +52,7 @@ class TelegramProviderRecoveryTests(BusinessTestCase):
         def respond(request):
             requests.append(json.loads(request.content))
             if malformed:
-                return httpx.Response(200, json={'candidates': [{
-                    'content': {}, 'finishReason': 'MALFORMED_FUNCTION_CALL',
-                    'finishMessage': 'Function call is empty - no input to parse.'}]})
+                return httpx.Response(200, json=failed_response)
             return httpx.Response(200, json={'candidates': [{
                 'content': {'role': 'model', 'parts': [{'text': 'The spare key is in the blue bag'}]},
                 'finishReason': 'STOP'}]})

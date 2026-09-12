@@ -9,7 +9,7 @@ import httpx
 from tgchatbot.config import GeminiConfig
 from tgchatbot.core.token_estimator import TokenEstimator
 from tgchatbot.domain.models import ConversationMessage, MessagePart, MessageRole, PartKind, ProviderResponse, SessionSettings, ToolCall, UsageInfo
-from tgchatbot.providers.base import (ControlDescriptor, ProviderCapabilities, RequestTokenEstimate,
+from tgchatbot.providers.base import (ControlDescriptor, ProviderCapabilities, ProviderOutcomeError, RequestTokenEstimate,
     estimate_json_schema_tokens, evidence_text, pending_image_tokens, tool_message_evidence)
 from tgchatbot.settings_schema import (
     GEMINI_THINKING_BUDGET_MIN,
@@ -210,6 +210,11 @@ class GeminiProvider:
             'systemInstruction': {'parts': [{'text': instructions}]},
             'contents': contents,
             'generationConfig': generation_config,
+            'safetySettings': [
+                {'category': category, 'threshold': 'OFF'}
+                for category in ('HARM_CATEGORY_HARASSMENT', 'HARM_CATEGORY_HATE_SPEECH',
+                                 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'HARM_CATEGORY_DANGEROUS_CONTENT')
+            ],
         }
         if request_tools:
             payload['tools'] = request_tools
@@ -355,12 +360,23 @@ class GeminiProvider:
             cached_input_tokens=usage.get('cachedContentTokenCount'),
             service_tier=usage.get('serviceTier'),
         )
+        if body.get('error'):
+            raise ProviderOutcomeError(self.name, 'API error', usage_info)
+        feedback = body.get('promptFeedback') or {}
+        prompt_block = feedback.get('blockReason')
+        if prompt_block and prompt_block != 'BLOCK_REASON_UNSPECIFIED':
+            raise ProviderOutcomeError(self.name, f'prompt blocked: {prompt_block}', usage_info)
+        if any(rating.get('blocked') for rating in feedback.get('safetyRatings') or []):
+            raise ProviderOutcomeError(self.name, 'prompt blocked', usage_info)
         candidates = body.get('candidates', [])
         if not candidates:
-            return ProviderResponse(usage=usage_info, raw=body)
+            raise ProviderOutcomeError(self.name, 'no completion candidate', usage_info)
         candidate = candidates[0] or {}
-        if candidate.get('finishReason') == 'MALFORMED_FUNCTION_CALL':
-            raise ValueError('Gemini could not generate a valid function call')
+        finish_reason = candidate.get('finishReason')
+        if finish_reason != 'STOP':
+            raise ProviderOutcomeError(self.name, f'finish reason: {finish_reason or "missing"}', usage_info)
+        if any(rating.get('blocked') for rating in candidate.get('safetyRatings') or []):
+            raise ProviderOutcomeError(self.name, 'candidate blocked', usage_info)
         content = candidate.get('content', {}) or {}
         parts = content.get('parts', []) or []
         text_parts: list[str] = []
@@ -379,13 +395,13 @@ class GeminiProvider:
             if 'functionCall' in part:
                 function_call = part['functionCall']
                 if not isinstance(function_call, dict):
-                    raise ValueError('Function call must be an object')
+                    raise ProviderOutcomeError(self.name, 'function call must be an object', usage_info)
                 args = function_call.get('args', {})
                 if not isinstance(args, dict):
-                    raise ValueError('Function call arguments must be a JSON object')
+                    raise ProviderOutcomeError(self.name, 'function call arguments must be an object', usage_info)
                 name = function_call.get('name')
                 if not isinstance(name, str) or not name.strip():
-                    raise ValueError('Function call requires a name')
+                    raise ProviderOutcomeError(self.name, 'function call requires a name', usage_info)
                 tool_calls.append(ToolCall(name=name, call_id=function_call.get('id') or f'gemini-call-{index}', arguments=args))
             tool_call = part.get('toolCall')
             if tool_call:

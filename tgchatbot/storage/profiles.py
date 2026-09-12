@@ -235,3 +235,16 @@ async def _identity(conn, session_id, generation, actor_id):
     return await (await conn.execute('''SELECT id AS message_id,source_revision,sent_at,actor_kind,actor_name
         FROM messages WHERE session_id=%s AND generation=%s AND actor_id=%s AND NOT hidden AND NOT deleted
         ORDER BY sent_at DESC,id DESC LIMIT 1''', (session_id, generation, actor_id))).fetchone()
+
+
+async def add_source_dates(conn, documents):
+    """Enrich only the selected learning facts inside their committed snapshot."""
+    facts = [fact for document in documents for fact in document['facts']]
+    if not facts:
+        return
+    rows = await (await conn.execute('''SELECT f.id,min(m.sent_at) AS first,max(m.sent_at) AS last
+        FROM profile_facts f JOIN messages m ON m.id=ANY(f.source_ids)
+        WHERE f.id=ANY(%s) GROUP BY f.id''', ([fact['id'] for fact in facts],))).fetchall()
+    dates = {row['id']: {'first': row['first'], 'last': row['last']} for row in rows}
+    for fact in facts:
+        fact['source_dates'] = dates[fact['id']]

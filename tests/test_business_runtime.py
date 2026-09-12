@@ -55,7 +55,7 @@ class RuntimeWorkflowTests(BusinessTestCase):
 
         def handler(request):
             wire.append(json.loads(request.content))
-            return httpx.Response(200, json={'candidates': [{'content': {
+            return httpx.Response(200, json={'candidates': [{'finishReason': 'STOP', 'content': {
                 'role': 'model', 'parts': [{'text': 'Continuation.'}]}}]})
 
         provider = GeminiProvider(replace(self.config.gemini, api_key='synthetic-key'))

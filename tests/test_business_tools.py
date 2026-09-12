@@ -57,7 +57,7 @@ class ToolWorkflowTests(BusinessTestCase):
         self.assertEqual(registry.list_tools(allow_python_exec=True, allow_stickers=True), [])
         remote.enabled = True
         names = {tool.name for tool in registry.list_tools(allow_python_exec=True, allow_stickers=False)}
-        self.assertEqual(names, {"shell_exec", "python_exec", "file_send"})
+        self.assertEqual(names, {"shell_exec", "python_exec", "file_send", "read_doc"})
         catalog.stats.return_value = {"stickers": 1}
         names = {tool.name for tool in registry.list_tools(allow_python_exec=False, allow_stickers=True)}
         self.assertEqual(names, {"sticker_query", "sticker_send_selected"})

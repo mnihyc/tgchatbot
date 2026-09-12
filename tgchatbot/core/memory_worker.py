@@ -171,13 +171,14 @@ Explicit claims must be direct assertions by the subject. Supported uncertain de
 Use subject_actor_id "agent" only for a human's explicit enduring preference about the agent's personality/style.
 Ignore transient requests, commands and incidental details. Empty additions and removals is a valid decision.
 Preserve contradictions with attribution. For a correction use supersedes with the supplied earlier fact ID.
+Compare message dates, not processing order: source_dates describes existing facts' supporting messages. Older evidence can clarify history or add independent facts without replacing a newer preference.
 For an explicit withdrawal use status "retracted" and supersedes; its evidence closes the earlier fact while retaining audit history.
 Use validity dates only if the original evidence establishes them; otherwise null.
 Retire facts through removals only when redundant or no longer useful in the compact profile, with a short reason.
 Do not retire a fact merely because this batch does not mention it. Preserve distinctive, actionable preferences over generic detail.
 Each entire per-actor profile object, including identity, IDs and attribution, must fit {profile_bytes} UTF-8 bytes.
 Prefer concise additions. Merge or retire redundant existing facts when space is needed; never accumulate an unlimited fact list.
-The current profile documents contain all supplied existing facts. Reasons are audit-only and are not inserted into chat context.
+The current profile documents contain all supplied existing facts. Reasons are audit-only and source_dates is learning-only; neither enters the bounded chat profile.
 Return only the requested structured patch; no tools or conversation reply.'''
 
 

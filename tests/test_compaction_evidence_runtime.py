@@ -10,12 +10,105 @@ import httpx
 from tests.business_helpers import BusinessTestCase
 from tgchatbot.core.compaction_schema import compaction_json_schema
 from tgchatbot.core.context_state import MemoryBlock
+from tgchatbot.core.runtime import AgentRuntime, CompactionModelRequestFailed
 from tgchatbot.domain.models import ConversationMessage, MessagePart, PartKind, ProviderResponse
 from tgchatbot.providers.gemini import GeminiProvider
 from tgchatbot.storage.postgres_store import message_body
+from tgchatbot.storage.previews import PreviewCache
 
 
 class CompactionEvidenceRuntimeTests(BusinessTestCase):
+    async def prepare_retry_compaction(self, statuses):
+        settings = await self.settings(provider='gemini', model='gemini-3.8-flash',
+            provider_retry_count=1, min_raw_messages_reserve=1, service_tier='flex')
+        earlier = await self.runtime.ingest_user_message(session_id=self.session,
+            incoming_message=ConversationMessage.user_text('The earlier plan is already settled.'))
+        prior_block = await self.store.create_memory_block(self.session,
+            summary_text='The earlier plan is settled.', estimated_tokens=12,
+            source_message_ids=[earlier.db_id], kind='episode', level=1)
+        sources = []
+        for text in ('Bring the blue ticket.', 'I will bring that ticket.', 'Latest question stays raw.'):
+            message = ConversationMessage.user_text(text, metadata={'actor_id': 'telegram:user:7'})
+            if not sources:
+                message.parts.append(MessagePart(PartKind.IMAGE, mime_type='image/png',
+                    data_b64='dGlja2V0LWltYWdl', remote_sync=False))
+            sources.append(await self.runtime.ingest_user_message(session_id=self.session, incoming_message=message))
+        candidate = {key: [] for key in compaction_json_schema('episode')['properties']}
+        candidate.update(scope='A ticket commitment.', interaction_mode='chat_or_sharing',
+            decisions=['Participant will bring the blue ticket.'])
+        wire = []
+
+        def respond(request):
+            wire.append(json.loads(request.content))
+            status = statuses.pop(0)
+            if status != 200:
+                return httpx.Response(status, json={'error': {'message': 'Temporary Flex capacity failure'}})
+            return httpx.Response(200, json={'candidates': [{'finishReason': 'STOP',
+                'content': {'role': 'model', 'parts': [{'text': json.dumps(candidate)}]}}]})
+
+        provider = GeminiProvider(replace(self.config.gemini, api_key='synthetic-key'))
+        provider._client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        self.addAsyncCleanup(provider.aclose)
+        self.runtime.providers['gemini'] = provider
+        self.runtime.invalidate_session(self.session)
+        state = await self.runtime._get_live_state(self.session)
+        return settings, provider, state, sources, prior_block, wire
+
+    async def test_temporary_compaction_http_error_retries_and_commits_one_episode(self):
+        settings, provider, state, sources, prior, wire = await self.prepare_retry_compaction([503, 200])
+        with self.assertLogs('tgchatbot', level='WARNING'):
+            changed = await self.runtime._compact_old_context(session_id=self.session,
+                settings=settings, provider=provider, state=state, pressure=True)
+        self.assertTrue(changed)
+        self.assertEqual(len(wire), 2)
+        self.assertEqual(wire[0], wire[1], 'Retry the same source batch, schema and service tier')
+        self.assertEqual(wire[0]['service_tier'], 'flex')
+        self.assertEqual(wire[0]['generationConfig']['responseJsonSchema'], compaction_json_schema('episode'))
+        blocks = await self.store.list_memory_blocks(self.session)
+        self.assertEqual(len(blocks), 2)
+        self.assertIn(prior.block_id, [block.block_id for block in blocks])
+        new = next(block for block in blocks if block.block_id != prior.block_id)
+        self.assertEqual((new.kind, new.level, new.validator_status), ('episode', 1, 'passed'))
+        self.assertEqual(new.structured_data['decisions'], ['Participant will bring the blue ticket.'])
+        self.assertNotIn(sources[0].db_id, [row.db_id for row in state.raw_messages])
+        self.assertEqual(state.raw_messages[-1].db_id, sources[-1].db_id)
+        originals = await self.store.read_messages(self.session, [row.db_id for row in sources])
+        self.assertEqual([message_body(row.message) for row in originals],
+            [message_body(row.message) for row in sources])
+
+    async def test_exhausted_compaction_retries_preserve_warm_and_rebuilt_context_then_recover(self):
+        statuses = [503, 503]
+        settings, provider, state, sources, prior, wire = await self.prepare_retry_compaction(statuses)
+        originals = await self.store.read_messages(self.session, [row.db_id for row in sources])
+        history = self.runtime._build_provider_history(state, settings=settings, provider_name='gemini')
+        pixels = await self.preview_cache.materialize_many(self.session, history, vision=True)
+        before = deepcopy(state)
+        with self.assertLogs('tgchatbot', level='WARNING'):
+            with self.assertRaises(CompactionModelRequestFailed):
+                await self.runtime._compact_old_context(session_id=self.session,
+                    settings=settings, provider=provider, state=state, pressure=True)
+        self.assertEqual(len(wire), 2)
+        self.assertEqual(wire[0], wire[1])
+        self.assertEqual(state, before)
+        self.assertEqual(await self.store.read_messages(self.session, [row.db_id for row in sources]), originals)
+        self.assertEqual([block.block_id for block in await self.store.list_memory_blocks(self.session)], [prior.block_id])
+        reader = await self.new_store()
+        cold_cache = PreviewCache(reader, max_bytes=0)
+        restarted = AgentRuntime(config=self.config, store=reader, tool_registry=self.tools,
+            providers={'gemini': provider}, preview_cache=cold_cache)
+        rebuilt = await restarted._get_live_state(self.session)
+        rebuilt_history = restarted._build_provider_history(rebuilt, settings=settings, provider_name='gemini')
+        self.assertEqual(rebuilt_history, history)
+        self.assertEqual(await cold_cache.materialize_many(self.session, rebuilt_history, vision=True), pixels)
+        statuses.append(200)
+        self.assertTrue(await self.runtime._compact_old_context(session_id=self.session,
+            settings=settings, provider=provider, state=state, pressure=True))
+        self.assertEqual(len(wire), 3)
+        self.assertEqual(wire[2], wire[0])
+        self.assertNotIn(sources[0].db_id, [row.db_id for row in state.raw_messages])
+        self.assertEqual(state.raw_messages[-1].db_id, sources[-1].db_id)
+        self.assertEqual(len(await self.store.list_memory_blocks(self.session)), 2)
+
     async def test_compaction_transmits_exact_source_slices_and_separate_annotations(self):
         name = 'Alex\nSpeaker: someone else'
         message = ConversationMessage.user_text('First line.\nKeep its newline.', metadata={
@@ -40,7 +133,7 @@ class CompactionEvidenceRuntimeTests(BusinessTestCase):
 
         def handler(request):
             wire.append(json.loads(request.content))
-            return httpx.Response(200, json={'candidates': [{'content': {
+            return httpx.Response(200, json={'candidates': [{'finishReason': 'STOP', 'content': {
                 'role': 'model', 'parts': [{'text': json.dumps(candidate)}]}}]})
 
         provider = GeminiProvider(replace(self.config.gemini, api_key='synthetic-key'))

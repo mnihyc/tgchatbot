@@ -10,7 +10,7 @@ from tgchatbot.config import ChatCompletionsConfig
 from tgchatbot.core.token_estimator import TokenEstimator
 from tgchatbot.domain.models import ConversationMessage, MessagePart, MessageRole, PartKind, ProviderResponse, SessionSettings, ToolCall, UsageInfo
 from tgchatbot.logging_config import dump_llm_exchange
-from tgchatbot.providers.base import (ControlDescriptor, ProviderCapabilities, RequestTokenEstimate,
+from tgchatbot.providers.base import (ControlDescriptor, ProviderCapabilities, ProviderOutcomeError, RequestTokenEstimate,
     estimate_json_schema_tokens, evidence_text, pending_image_tokens, tool_message_evidence)
 from tgchatbot.tools.base import ToolSpec
 
@@ -154,31 +154,6 @@ class ChatCompletionsProvider:
         return self._parse_response(response.json())
 
     def _parse_response(self, body: dict[str, Any]) -> ProviderResponse:
-        if body.get('error'):
-            raise RuntimeError(f'{self.name} returned an API error')
-        choices = body.get('choices')
-        if not isinstance(choices, list) or not choices or not isinstance(choices[0].get('message'), dict):
-            raise ValueError(f'{self.name} returned no completion message')
-        message = choices[0]['message']
-        # Keep provider reasoning fields intact for signed/opaque tool continuations.
-        # Visible response text is deliberately read only from content/refusal.
-        native = {key: copy.deepcopy(message[key]) for key in ('role', 'content', 'tool_calls', 'reasoning_content', 'reasoning', 'reasoning_details') if key in message}
-        native['role'] = 'assistant'
-        native.setdefault('content', None)
-        content = message.get('content')
-        if isinstance(content, list):
-            text = ''.join(str(part.get('text') or '') for part in content if isinstance(part, dict) and part.get('type') == 'text')
-        else:
-            text = str(content or message.get('refusal') or '')
-        tool_calls = []
-        for call in message.get('tool_calls') or []:
-            function = call.get('function') or {}
-            arguments = function.get('arguments', '{}')
-            if isinstance(arguments, str):
-                arguments = json.loads(arguments)
-            if not isinstance(arguments, dict) or not call.get('id') or not function.get('name'):
-                raise ValueError(f'{self.name} returned an invalid function call')
-            tool_calls.append(ToolCall(name=function['name'], call_id=call['id'], arguments=arguments))
         usage = body.get('usage') or {}
         input_tokens, output_tokens = usage.get('prompt_tokens'), usage.get('completion_tokens')
         cached_input_tokens = (usage.get('prompt_tokens_details') or {}).get('cached_tokens')
@@ -187,13 +162,48 @@ class ChatCompletionsProvider:
         total_tokens = usage.get('total_tokens')
         if total_tokens is None and (input_tokens is not None or output_tokens is not None):
             total_tokens = (input_tokens or 0) + (output_tokens or 0)
+        usage_info = UsageInfo(
+            input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=total_tokens,
+            cached_input_tokens=cached_input_tokens, service_tier=body.get('service_tier'),
+        )
+        if body.get('error'):
+            raise ProviderOutcomeError(self.name, 'API error', usage_info)
+        choices = body.get('choices')
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0].get('message'), dict):
+            raise ProviderOutcomeError(self.name, 'no completion message', usage_info)
+        finish_reason = choices[0].get('finish_reason')
+        if finish_reason not in {'stop', 'tool_calls'}:
+            raise ProviderOutcomeError(self.name, f'finish reason: {finish_reason or "missing"}', usage_info)
+        message = choices[0]['message']
+        if message.get('refusal') is not None:
+            raise ProviderOutcomeError(self.name, 'refusal', usage_info)
+        if finish_reason == 'tool_calls' and not message.get('tool_calls'):
+            raise ProviderOutcomeError(self.name, 'tool_calls completion without a tool call', usage_info)
+        # Keep provider reasoning fields intact for signed/opaque tool continuations.
+        # Visible response text is deliberately read only from content.
+        native = {key: copy.deepcopy(message[key]) for key in ('role', 'content', 'tool_calls', 'reasoning_content', 'reasoning', 'reasoning_details') if key in message}
+        native['role'] = 'assistant'
+        native.setdefault('content', None)
+        content = message.get('content')
+        if isinstance(content, list):
+            text = ''.join(str(part.get('text') or '') for part in content if isinstance(part, dict) and part.get('type') == 'text')
+        else:
+            text = str(content or '')
+        tool_calls = []
+        for call in message.get('tool_calls') or []:
+            function = call.get('function') or {}
+            arguments = function.get('arguments', '{}')
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except json.JSONDecodeError as exc:
+                    raise ProviderOutcomeError(self.name, 'invalid function call arguments', usage_info) from exc
+            if not isinstance(arguments, dict) or not call.get('id') or not function.get('name'):
+                raise ProviderOutcomeError(self.name, 'invalid function call', usage_info)
+            tool_calls.append(ToolCall(name=function['name'], call_id=call['id'], arguments=arguments))
         return ProviderResponse(
             final_text=text.strip(), tool_calls=tool_calls, continuation_items=[native],
-            usage=UsageInfo(
-                input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=total_tokens,
-                cached_input_tokens=cached_input_tokens,
-                service_tier=body.get('service_tier'),
-            ), raw=body,
+            usage=usage_info, raw=body,
         )
 
     def make_tool_result_items(self, tool_call: ToolCall, tool_output: dict,

@@ -34,11 +34,11 @@ class ContextReconstructionTests(BusinessTestCase):
                             item = ({'type': 'function_call', 'call_id': 'bad', 'name': 'shell_exec', 'arguments': arguments}
                                 if len(requests) == 1 else {'type': 'message', 'role': 'assistant',
                                     'content': [{'type': 'output_text', 'text': 'Please clarify the command.'}]})
-                            body = {'output': [item]}
+                            body = {'status': 'completed', 'output': [item]}
                         else:
                             part = ({'functionCall': {'name': 'shell_exec', 'args': arguments}}
                                 if len(requests) == 1 else {'text': 'Please clarify the command.'})
-                            body = {'candidates': [{'content': {'role': 'model', 'parts': [part]}}]}
+                            body = {'candidates': [{'finishReason': 'STOP', 'content': {'role': 'model', 'parts': [part]}}]}
                         return httpx.Response(200, json=body)
                     provider._client = httpx.AsyncClient(base_url='https://test.invalid/', transport=httpx.MockTransport(respond))
                     try:

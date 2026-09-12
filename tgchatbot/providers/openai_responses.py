@@ -9,7 +9,7 @@ import logging
 from tgchatbot.config import OpenAIConfig
 from tgchatbot.core.token_estimator import TokenEstimator
 from tgchatbot.domain.models import ChatMode, ConversationMessage, MessagePart, MessageRole, PartKind, ProviderResponse, SessionSettings, ToolCall, UsageInfo
-from tgchatbot.providers.base import (ControlDescriptor, ProviderCapabilities, RequestTokenEstimate,
+from tgchatbot.providers.base import (ControlDescriptor, ProviderCapabilities, ProviderOutcomeError, RequestTokenEstimate,
     estimate_json_schema_tokens, evidence_text, pending_image_tokens, tool_message_evidence)
 from tgchatbot.settings_schema import effective_optional_disabled_int, effective_reasoning_summary
 from tgchatbot.tools.base import ToolSpec
@@ -194,9 +194,28 @@ class OpenAIResponsesProvider:
         return [{'type': 'function_call_output', 'call_id': tool_call.call_id, 'output': output}]
 
     def _parse_response(self, body: dict[str, Any]) -> ProviderResponse:
-        if body.get('error') or body.get('status') == 'failed':
-            raise RuntimeError('OpenAI Responses returned an API error')
+        usage_block = body.get('usage', {}) or {}
+        input_tokens = usage_block.get('input_tokens')
+        output_tokens = usage_block.get('output_tokens')
+        total_tokens = usage_block.get('total_tokens')
+        if total_tokens is None and (input_tokens is not None or output_tokens is not None):
+            total_tokens = (input_tokens or 0) + (output_tokens or 0)
+        usage_info = UsageInfo(
+            input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=total_tokens,
+            cached_input_tokens=(usage_block.get('input_tokens_details') or {}).get('cached_tokens'),
+            service_tier=body.get('service_tier'),
+        )
+        if body.get('error'):
+            raise ProviderOutcomeError(self.name, 'API error', usage_info)
+        if body.get('status') != 'completed':
+            reason = (body.get('incomplete_details') or {}).get('reason') or body.get('status') or 'missing status'
+            raise ProviderOutcomeError(self.name, str(reason), usage_info)
         output = body.get('output', [])
+        for item in output:
+            if item.get('status') not in {None, 'completed'}:
+                raise ProviderOutcomeError(self.name, f'output status: {item["status"]}', usage_info)
+            if any(part.get('type') == 'refusal' for part in item.get('content') or []):
+                raise ProviderOutcomeError(self.name, 'refusal', usage_info)
         tool_calls: list[ToolCall] = []
         native_tool_calls: list[dict[str, Any]] = []
         final_text_parts: list[str] = []
@@ -207,12 +226,15 @@ class OpenAIResponsesProvider:
             continuation_items.append(item)
             if item_type == 'function_call':
                 args_raw = item.get('arguments')
-                args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                try:
+                    args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                except json.JSONDecodeError as exc:
+                    raise ProviderOutcomeError(self.name, 'invalid function call arguments', usage_info) from exc
                 if not isinstance(args, dict):
-                    raise ValueError('Function call arguments must be a JSON object')
+                    raise ProviderOutcomeError(self.name, 'function call arguments must be an object', usage_info)
                 name, call_id = item.get('name'), item.get('call_id')
                 if not isinstance(name, str) or not name.strip() or not isinstance(call_id, str) or not call_id.strip():
-                    raise ValueError('Function call requires a name and call_id')
+                    raise ProviderOutcomeError(self.name, 'function call requires a name and call_id', usage_info)
                 tool_calls.append(ToolCall(name=name, call_id=call_id, arguments=args))
             elif item_type == 'web_search_call':
                 native_tool_calls.append({
@@ -233,25 +255,13 @@ class OpenAIResponsesProvider:
                 for content in item.get('content', []):
                     if content.get('type') == 'output_text':
                         final_text_parts.append(content.get('text', ''))
-                    elif content.get('type') == 'refusal':
-                        final_text_parts.append(content.get('refusal') or '')
-        usage_block = body.get('usage', {}) or {}
-        input_tokens = usage_block.get('input_tokens')
-        output_tokens = usage_block.get('output_tokens')
-        total_tokens = usage_block.get('total_tokens')
-        if total_tokens is None and (input_tokens is not None or output_tokens is not None):
-            total_tokens = (input_tokens or 0) + (output_tokens or 0)
         return ProviderResponse(
             final_text=''.join(final_text_parts).strip(),
             reasoning_summaries=reasoning_summaries,
             tool_calls=tool_calls,
             native_tool_calls=native_tool_calls,
             continuation_items=continuation_items,
-            usage=UsageInfo(
-                input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=total_tokens,
-                cached_input_tokens=(usage_block.get('input_tokens_details') or {}).get('cached_tokens'),
-                service_tier=body.get('service_tier'),
-            ),
+            usage=usage_info,
             raw=body,
         )
 

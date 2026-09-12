@@ -37,7 +37,7 @@ def candidate_parts(sticker_id, frames=1):
 
 
 def function(name, call_id):
-    return {'output':[{'type':'function_call','name':name,'call_id':call_id,'arguments':'{}'}]}
+    return {'status':'completed','output':[{'type':'function_call','name':name,'call_id':call_id,'arguments':'{}'}]}
 
 
 class StickerEvidenceWorkflowTests(BusinessTestCase):
@@ -78,7 +78,7 @@ class StickerEvidenceWorkflowTests(BusinessTestCase):
         await self.settings(mode=ChatMode.ASSIST,max_input_images=3,compact_target_images=1,
             compact_trigger_tokens=100000,max_interaction_rounds=3)
         provider = await self.make_provider([function('sticker_query','first'),function('sticker_query','second'),
-            {'output':[{'type':'message','role':'assistant','content':[{'type':'output_text','text':'This expression fits.'}]}]}])
+            {'status':'completed','output':[{'type':'message','role':'assistant','content':[{'type':'output_text','text':'This expression fits.'}]}]}])
         query = SimpleNamespace(run=AsyncMock(side_effect=[
             ToolResult('','sticker_query',{'ok':True,'candidates':[{'sticker_id':'first'}]},evidence_parts=candidate_parts('first',2)),
             ToolResult('','sticker_query',{'ok':True,'candidates':[{'sticker_id':'second'}]},evidence_parts=candidate_parts('second',2))]))
@@ -121,7 +121,7 @@ class StickerEvidenceWorkflowTests(BusinessTestCase):
         await self.settings(mode=ChatMode.ASSIST,max_input_images=3,compact_target_images=3,
             compact_trigger_tokens=100000,max_interaction_rounds=1)
         provider = await self.make_provider([function('sticker_query','query'),
-            {'output':[{'type':'message','role':'assistant','content':[{'type':'output_text','text':'I found a possibility.'}]}]}])
+            {'status':'completed','output':[{'type':'message','role':'assistant','content':[{'type':'output_text','text':'I found a possibility.'}]}]}])
         runner = SimpleNamespace(run=AsyncMock(return_value=ToolResult('','sticker_query',
             {'ok':True,'candidates':[{'sticker_id':'a'},{'sticker_id':'b'}],'candidate_count':2},
             evidence_parts=candidate_parts('a',2)+candidate_parts('b',2))))
@@ -146,7 +146,7 @@ class StickerEvidenceWorkflowTests(BusinessTestCase):
             with self.subTest(timing=timing):
                 await self.settings(mode=ChatMode.ASSIST,max_interaction_rounds=1)
                 provider = await self.make_provider([function('sticker_send_selected','selected-'+timing.value),
-                    {'output':[{'type':'message','role':'assistant','content':[{'type':'output_text','text':'A warm reply.'}]}]}])
+                    {'status':'completed','output':[{'type':'message','role':'assistant','content':[{'type':'output_text','text':'A warm reply.'}]}]}])
                 sticker = OutboundSticker(asset,source_id=digest,content_sha256=digest,timing=timing)
                 runner = SimpleNamespace(run=AsyncMock(return_value=ToolResult('','sticker_send_selected',
                     {'ok':True,'status':'queued','sticker_id':digest,'caption':'A hug','action':'offers an embrace'},stickers=[sticker])))
@@ -186,7 +186,7 @@ class StickerEvidenceWorkflowTests(BusinessTestCase):
                 settings = await self.settings(mode=ChatMode.ASSIST, max_interaction_rounds=1,
                     process_visibility=ProcessVisibility.OFF)
                 provider = await self.make_provider([
-                    function('sticker_send_selected', 'sticker-only-' + timing.value), {'output': []}])
+                    function('sticker_send_selected', 'sticker-only-' + timing.value), {'status': 'completed', 'output': []}])
                 sticker = OutboundSticker(asset, source_id=digest, content_sha256=digest, timing=timing)
                 runner = SimpleNamespace(run=AsyncMock(return_value=ToolResult('', 'sticker_send_selected',
                     {'ok': True, 'status': 'queued', 'sticker_id': digest}, stickers=[sticker])))
@@ -216,9 +216,9 @@ class StickerEvidenceWorkflowTests(BusinessTestCase):
     async def test_explicit_retry_can_choose_a_different_sticker_with_reused_provider_call_id(self):
         await self.settings(mode=ChatMode.ASSIST,max_interaction_rounds=1)
         provider = await self.make_provider([function('sticker_send_selected','reused'),
-            {'output':[{'type':'message','role':'assistant','content':[{'type':'output_text','text':'First choice'}]}]},
+            {'status':'completed','output':[{'type':'message','role':'assistant','content':[{'type':'output_text','text':'First choice'}]}]},
             function('sticker_send_selected','reused'),
-            {'output':[{'type':'message','role':'assistant','content':[{'type':'output_text','text':'New choice'}]}]}])
+            {'status':'completed','output':[{'type':'message','role':'assistant','content':[{'type':'output_text','text':'New choice'}]}]}])
         deliveries = StickerDeliveryStore(self.store)
         await deliveries.initialize()
         selections=[]

@@ -32,3 +32,8 @@ include = ["tgchatbot*", "scripts*"]
 
 [tool.uv]
 package = true
+
+[dependency-groups]
+dev = [
+    "pypdfium2>=5,<6",
+]

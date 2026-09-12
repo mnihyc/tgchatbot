@@ -10,6 +10,7 @@ import os
 import posixpath
 import tempfile
 import re
+from importlib.resources import files
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -416,7 +417,31 @@ class RemoteWorkspaceClient:
             raise
         return artifacts
 
-    async def _run_ssh_command(self, command: str, *, timeout_s: int) -> dict[str, Any]:
+    async def inspect_file(self, *, session_id: str, scope: str, path: str,
+                           format: str, start: int | None, end: int | None,
+                           limits: dict[str, Any]) -> dict[str, Any]:
+        paths = await self.ensure_session_dirs(session_id)
+        selected = path if posixpath.isabs(path) else self._scope_to_path(paths, scope) + '/' + path
+        selected = self._validate_remote_path(paths, selected)
+        request = {'root': paths.root, 'path': selected, 'format': format,
+                   'start': start, 'end': end, 'limits': limits}
+        program = (files('tgchatbot.media').joinpath('image_encoding.py').read_text()
+                   + '\n' + files('tgchatbot.tools').joinpath('remote_reader.py').read_text())
+        result = await self._run_ssh_command(
+            f'python3 -c {shq(program)} {shq(json.dumps(request))}',
+            timeout_s=self.ssh.max_tool_timeout_s,
+            # Prepared binary evidence is base64 in this private transport, not
+            # shell stdout for the agent. Leave room for encoding and labels.
+            stdout_limit=2 * limits['bytes'] + self.ssh.max_stdout_chars)
+        if not result['ok']:
+            return {'ok': False, 'error': result['stderr'] or 'Remote file inspection failed'}
+        try:
+            return json.loads(result['stdout'])
+        except json.JSONDecodeError as exc:
+            raise RuntimeError('Remote reader did not return a complete result') from exc
+
+    async def _run_ssh_command(self, command: str, *, timeout_s: int,
+                               stdout_limit: int | None = None) -> dict[str, Any]:
         await self.ensure_master()
         cmd = self._ssh_base_args() + [command]
         proc = await asyncio.create_subprocess_exec(
@@ -427,7 +452,7 @@ class RemoteWorkspaceClient:
         )
         try:
             stdout, stderr, _ = await asyncio.wait_for(asyncio.gather(
-                self._read_output(proc.stdout, self.ssh.max_stdout_chars),
+                self._read_output(proc.stdout, self.ssh.max_stdout_chars if stdout_limit is None else stdout_limit),
                 self._read_output(proc.stderr, self.ssh.max_stderr_chars),
                 proc.wait()), timeout=timeout_s + self.ssh.connect_timeout_s)
         except asyncio.CancelledError:

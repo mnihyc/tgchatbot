@@ -13,6 +13,9 @@ class ToolContext:
     user_display_name: str
     scope: dict[str, int] | None = None
     timezone: str = DEFAULT_METADATA_TIMEZONE
+    evidence_tokens: int | None = None
+    evidence_images: int | None = None
+    tool_images: bool = True
 
 
 def _nullable_schema(schema: dict[str, Any]) -> dict[str, Any]:

@@ -161,7 +161,6 @@ class TelegramConfig:
     max_sticker_frames: int
     max_visual_file_frames: int
     max_video_keyframe_candidates: int
-    max_inline_text_chars: int
     link_prefetch_timeout_s: float
     link_prefetch_max_urls: int
     link_prefetch_max_chars: int
@@ -195,6 +194,12 @@ class ContextConfig:
 
 
 @dataclass(frozen=True)
+class ReadDocConfig:
+    pdf_scale: float = 2.0
+    max_image_pixels: int = 16777216
+
+
+@dataclass(frozen=True)
 class AppConfig:
     data_dir: Path
     temp_dir: Path
@@ -225,6 +230,7 @@ class AppConfig:
     context: ContextConfig
     chat_completions: tuple[ChatCompletionsConfig, ...] = ()
     memory: MemoryConfig = field(default_factory=lambda: from_env(MemoryConfig, 'MEMORY'))
+    read_doc: ReadDocConfig = field(default_factory=lambda: from_env(ReadDocConfig, 'READ_DOC'))
 
     @property
     def database_url(self) -> str:
@@ -373,7 +379,6 @@ def load_config(*, require_telegram: bool = True) -> AppConfig:
             max_sticker_frames=int(os.getenv("TGBOT_MAX_STICKER_FRAMES", "4")),
             max_visual_file_frames=int(os.getenv("TGBOT_MAX_VISUAL_FILE_FRAMES", "10")),
             max_video_keyframe_candidates=int(os.getenv("TGBOT_MAX_VIDEO_KEYFRAME_CANDIDATES", "300")),
-            max_inline_text_chars=int(os.getenv("TGBOT_MAX_INLINE_TEXT_CHARS", "8000")),
             link_prefetch_timeout_s=float(os.getenv("TGBOT_LINK_PREFETCH_TIMEOUT_S", "4.0")),
             link_prefetch_max_urls=int(os.getenv("TGBOT_LINK_PREFETCH_MAX_URLS", "2")),
             link_prefetch_max_chars=int(os.getenv("TGBOT_LINK_PREFETCH_MAX_CHARS", "1200")),

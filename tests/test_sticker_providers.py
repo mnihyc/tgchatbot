@@ -12,6 +12,7 @@ from PIL import Image
 
 from tgchatbot.config import load_config
 from tgchatbot.embeddings import EmbeddingClient, EmbeddingConfig, sticker_embedding_config
+from tgchatbot.providers.base import ProviderOutcomeError
 from tgchatbot.providers.factory import build_provider
 from tgchatbot.stickers.build import BuildConfig, CatalogBuilder
 from tgchatbot.stickers.catalog import StickerCatalog
@@ -46,7 +47,7 @@ class StickerProviderWorkflows(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(matches, [])
             self.assertEqual(catalog.stats()['stickers'], 0)
 
-    async def run_build_asset(self, embedding_backend, generation_backend='gemini', *, image_embeddings=True):
+    async def run_build_asset(self, embedding_backend, generation_backend='gemini', *, image_embeddings=True, completed=True):
         directory = TemporaryDirectory(dir=Path(__file__).resolve().parent)
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
@@ -65,10 +66,10 @@ class StickerProviderWorkflows(unittest.IsolatedAsyncioTestCase):
             requests.append(json.loads(request.content))
             if generation_backend == 'openai':
                 self.assertEqual(request.headers['Authorization'], 'Bearer annotation-key')
-                return httpx.Response(200, json={'output': [{'type': 'message', 'content': [{'type': 'output_text', 'text': json.dumps(CARD)}]}],
+                return httpx.Response(200, json={'status': 'completed' if completed else 'incomplete', 'output': [{'type': 'message', 'content': [{'type': 'output_text', 'text': json.dumps(CARD)}]}],
                     'usage': {'input_tokens': 70, 'output_tokens': 30, 'total_tokens': 100}, 'service_tier': 'flex'})
             self.assertEqual(request.headers['x-goog-api-key'], 'annotation-key')
-            return httpx.Response(200, json={'candidates': [{'content': {'role': 'model', 'parts': [{'text': json.dumps(CARD)}]}}],
+            return httpx.Response(200, json={'candidates': [{'finishReason': 'STOP' if completed else 'MAX_TOKENS', 'content': {'role': 'model', 'parts': [{'text': json.dumps(CARD)}]}}],
                 'usageMetadata': {'promptTokenCount': 70, 'candidatesTokenCount': 30, 'totalTokenCount': 100, 'serviceTier': 'flex'}})
         generation._client = httpx.AsyncClient(base_url='https://annotation.invalid/v1/',
                                                headers={'x-goog-api-key': generation.config.api_key} if generation_backend == 'gemini' else {'Authorization': 'Bearer ' + generation.config.api_key},
@@ -91,8 +92,21 @@ class StickerProviderWorkflows(unittest.IsolatedAsyncioTestCase):
         store = Mock(stage_asset=AsyncMock())
         builder = CatalogBuilder(store, generation, embeddings, config=BuildConfig(provider=generation_backend,
             model=app_config.default_model_for_provider(generation_backend), image_embeddings=image_embeddings), media_config=MediaConfig(max_frames=2))
-        await builder._process('new-staging-revision', root, asset)
+        if completed:
+            await builder._process('new-staging-revision', root, asset)
+        else:
+            with self.assertRaises(ProviderOutcomeError) as failed:
+                await builder._process('new-staging-revision', root, asset)
+            self.assertEqual(failed.exception.usage.total_tokens, 100)
         return requests, vector_requests, store.stage_asset.await_args_list, builder.recipe
+
+    async def test_incomplete_annotation_does_not_save_a_card_or_spend_on_embeddings(self):
+        for provider in ('gemini', 'openai'):
+            with self.subTest(provider=provider):
+                requests, vectors, stages, _ = await self.run_build_asset('gemini', provider, completed=False)
+                self.assertEqual(len(requests), 1)
+                self.assertEqual(vectors, [])
+                self.assertEqual(stages, [])
 
     async def test_annotation_and_image_embedding_share_prepared_pixels_without_a_second_annotation_call(self):
         requests, vectors, stages, recipe = await self.run_build_asset('gemini')

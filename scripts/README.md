@@ -6,6 +6,23 @@ with `./update.sh` before maintenance if it is stopped. For source development,
 replace `docker compose run --rm --no-deps bot python` with `uv run --frozen python`.
 Use each command's `--help` for its arguments.
 
+## Workspace file reading
+
+With remote tools enabled, the agent can use `read_doc(scope, path, format)`.
+Text and PDF reads optionally select an inclusive, one-based `start`/`end` line
+or page range. Ordinary attachments sync as files, with contents read on demand.
+Images and PDF pages require a provider supporting visual tool results; audio/video
+tool results are unsupported on the current API routes.
+The tool does not send files to Telegram; use `file_send` for delivery.
+
+The configured remote Python environment owns parsing dependencies; see
+[remote setup](../deploy/README.md#optional-features-and-maintenance).
+`READ_DOC_PDF_SCALE=2` renders two pixels per PDF point (144 dpi).
+`READ_DOC_MAX_IMAGE_PIXELS=16777216` limits one rendered image to 16 megapixels
+to bound remote rendering memory; set it to `0` to disable the pixel bound.
+Both settings affect prepared images, leaving original files intact. Existing
+SSH output-byte/time limits and the runtime's context/image allowance also apply.
+
 ## Sticker catalog
 
 Keep originals under `data/stickers/<pack>/`. The first directory below the
@@ -102,8 +119,10 @@ docker compose run --rm --no-deps bot python -m tgchatbot.tools.import_desktop \
 Replace the example with the destination Telegram chat ID. For a full export,
 `--export-chat-id` selects its source conversation. The importer preserves source
 identities and reply references, deduplicates unchanged messages on rerun, and
-queues memory work. It does not execute historical commands, call models or
-upload media. Parsable images included beside the export use the normal image
+queues memory work. It does not execute historical commands or call models.
+Available ordinary files sync through the configured remote workspace, like live
+attachments; import preserves the export originals. Rerunning retries unavailable
+transfers without duplicating messages. Parsable images included beside the export use the normal image
 compression path and remain available to memory reads. Missing image files and
 unsupported attachments remain references.
 
