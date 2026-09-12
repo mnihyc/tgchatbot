@@ -14,7 +14,7 @@ class ReadDocTool:
             parameters_schema={'type': 'object', 'properties': {
                 'scope': {'type': 'string', 'enum': ['inputs', 'outputs', 'workspace']},
                 'path': {'type': 'string'},
-                'format': {'type': 'string', 'enum': ['text', 'image', 'pdf', 'audio', 'video']},
+                'format': {'type': 'string', 'enum': ['text', 'image', 'pdf']},
                 'start': {'type': 'integer', 'description': 'First line (text) or page (PDF), one-based and inclusive.'},
                 'end': {'type': 'integer', 'description': 'Last line or page, inclusive. Omit the range to read the complete file.'},
             }, 'required': ['scope', 'path', 'format'], 'additionalProperties': False}, runner=self)
