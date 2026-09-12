@@ -143,10 +143,12 @@ class CatalogBuilder:
             selected = False
             for asset_id in sorted(known):
                 old = previous.get(asset_id)
-                # A reused filename now belongs to its new bytes. Missing originals
-                # remain catalog evidence; selection checks actual available aliases.
-                aliases = {alias.path: alias for alias in (old.aliases if old else ()) if paths.get(alias.path, asset_id) == asset_id}
-                aliases.update({alias.path: alias for alias in inventory.get(asset_id, ())})
+                # Present originals take their current locations and packs from the
+                # source tree. Prior revisions retain old locations after a move.
+                # Completely missing originals remain evidence, except when their
+                # filename now belongs to different bytes; retrieval checks availability.
+                aliases = {alias.path: alias for alias in inventory.get(asset_id, old.aliases if old else ())
+                           if paths.get(alias.path, asset_id) == asset_id}
                 regenerate = asset_id in regenerate_ids or any(alias.pack in regenerate_packs or alias.path in regenerate_files for alias in aliases.values())
                 selected = selected or regenerate
                 correction = corrections.get(asset_id, old.corrections if old else {})

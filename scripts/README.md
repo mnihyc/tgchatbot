@@ -8,8 +8,26 @@ Use each command's `--help` for its arguments.
 
 ## Sticker catalog
 
-Keep originals under `data/stickers/<pack>/`. Build new entries or update only
-selected content:
+Keep originals under `data/stickers/<pack>/`. The first directory below the
+sticker root defines the pack used by search, preferences, continuity and `--pack`.
+Group related source sets beneath one directory to make an explicit virtual pack:
+
+```text
+data/stickers/
+  Blue bird/
+    Blue bird_birdPack/
+      sticker.webp
+    Blue bird 2_birdPackV2/
+      webm/sticker.webm
+  Sleepy fox_foxPack/
+    sticker.webp
+```
+
+Nested source and media-format directories remain part of the file path; they do
+not create separate packs. Virtual packs express your grouping, not a claim that
+every sticker depicts the same character.
+
+Build new entries or regenerate selected content:
 
 ```sh
 docker compose run --rm --no-deps bot python -m scripts.build_sticker_index
@@ -19,8 +37,11 @@ docker compose run --rm --no-deps bot python -m scripts.build_sticker_index --as
 docker compose run --rm --no-deps bot python -m scripts.build_sticker_index --resume REVISION_ID
 ```
 
-The default operation appends new files and aliases, reusing completed compatible
-analysis. Unsupported files are listed in the result; supported files in the same
+The default operation adds new content and refreshes current file paths and pack
+membership, reusing completed compatible analysis. Run it after moving folders;
+use selection flags only when you want to regenerate analysis. Explicitly saved
+pack preferences use folder names, so update those preferences if you rename them.
+Unsupported files are listed in the result; supported files in the same
 source are still processed. Selection flags may repeat. `scripts.reset_sticker` is an alias for the
 same regeneration workflow. Neither command deletes original media. Failed work
 stays in a staging revision; only a complete revision replaces the active catalog.

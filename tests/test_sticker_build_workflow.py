@@ -22,8 +22,11 @@ from tgchatbot.providers.base import ProviderCapabilities
 from tgchatbot.providers.chat_completions import ChatCompletionsProvider
 from tgchatbot.storage.postgres_store import DatabaseConfig, PostgresStore
 from tgchatbot.storage.sticker_catalog import StickerCatalogStore, CatalogConflict
+from tgchatbot.storage.sticker_delivery import StickerDeliveryStore
 from tgchatbot.stickers.build import CatalogBuilder, BuildConfig
+from tgchatbot.stickers.catalog import StickerCatalog
 from tgchatbot.stickers.media import PreparedMedia, content_hash
+from tgchatbot.stickers.plan import StickerRetrievalPlan
 
 CARD = {'caption': 'Hello', 'appearance': 'A round blue bird', 'action': 'A raised wing',
         'readings': [{'meaning': 'Greeting', 'context': 'Opening a friendly conversation'}],
@@ -168,6 +171,92 @@ class StickerBuildWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first_asset.provenance, before.assets[0].provenance)
         self.assertEqual((await self.catalog.load_snapshot(first.revision_id)).assets[0].aliases[0].path, 'pack/one.png')
         self.assertNotEqual(first.revision_id, second.revision_id)
+
+    async def test_folder_aggregation_refreshes_delivery_continuity_without_rebuying_vectors(self):
+        first_id = self.picture('birdPack/one.png', 'red')
+        second_id = self.picture('birdPackV2/two.png', 'blue')
+        standalone_id = self.picture('独立作品_standalonePack/three.png', 'green')
+        first = await self.builder.build(self.root)
+        before = await self.catalog.get_asset(first_id)
+        vector_storage = await self.vector_bytes()
+        calls = len(self.provider.calls), len(self.embeddings.calls)
+        deliveries = StickerDeliveryStore(self.store)
+        await deliveries.initialize()
+        scope = await self.store.get_scope('chat')
+        await deliveries.queue('chat', first_id, operation_id='sent-before-reorganization',
+            expected_scope=scope, timing='send_now')
+        await deliveries.begin('sent-before-reorganization')
+        await deliveries.finish('sent-before-reorganization', 'sent', telegram_message_id=1)
+        self.embeddings.enabled = True
+        self.embeddings.config.space_id = self.embeddings.space_id
+        self.embeddings.embed_query = AsyncMock(return_value=before.image_vector)
+        runtime = StickerCatalog(self.catalog, self.root, delivery_store=deliveries,
+            embedding_client=self.embeddings)
+        plan = StickerRetrievalPlan.from_payload({'intent_core': 'A friendly greeting'})
+        await runtime.achoose(plan=plan, session_id='chat')
+        self.assertEqual((await runtime.adescribe_style_context('chat'))['recent_source_pack_ids'], ['birdPack'])
+
+        group = self.root / '蓝鸟系列'
+        group.mkdir()
+        (self.root / 'birdPack').rename(group / '蓝鸟_birdPack')
+        (self.root / 'birdPackV2').rename(group / '蓝鸟第二弹_birdPackV2')
+        result = await self.builder.build(self.root)
+
+        self.assertTrue(result.active)
+        self.assertEqual(result.completed, 0)
+        self.assertEqual((len(self.provider.calls), len(self.embeddings.calls)), calls)
+        self.assertEqual(await self.vector_bytes(), vector_storage)
+        current = await self.catalog.get_asset(first_id)
+        self.assertEqual([(alias.path, alias.pack) for alias in current.aliases],
+            [('蓝鸟系列/蓝鸟_birdPack/one.png', '蓝鸟系列')])
+        self.assertEqual(current.generated_card, before.generated_card)
+        self.assertEqual(current.provenance, before.provenance)
+        np.testing.assert_array_equal(current.image_vector, before.image_vector)
+        np.testing.assert_array_equal(current.reading_vectors, before.reading_vectors)
+        self.assertEqual((await self.catalog.get_asset(first_id, first.revision_id)).aliases, before.aliases)
+        self.assertEqual((await self.catalog.get_asset(standalone_id)).aliases[0].pack, '独立作品_standalonePack')
+
+        matches = await runtime.achoose(plan=plan, session_id='chat')
+        preferred = {match.entry.sticker_id for match in matches
+            if 'preferred_family_or_pack' in match.channels}
+        self.assertEqual(preferred, {first_id, second_id})
+        context = await runtime.adescribe_style_context('chat')
+        self.assertEqual(context['recent_source_pack_ids'], ['蓝鸟系列'])
+        restarted = StickerCatalog(self.catalog, self.root, delivery_store=StickerDeliveryStore(self.store))
+        await restarted.aensure_loaded()
+        self.assertEqual(await restarted.adescribe_style_context('chat'), context)
+        required = StickerRetrievalPlan.from_payload({'intent_core': 'Hello', 'required_pack': '蓝鸟系列'})
+        self.assertEqual({match.entry.sticker_id for match in await restarted.achoose(plan=required)},
+            {first_id, second_id})
+
+    async def test_reorganization_keeps_real_copies_and_completely_missing_original_evidence(self):
+        source = self.root / 'source'
+        target = self.picture('source/pack/one.png', 'red')
+        self.picture('source/other/alias.png', 'red')
+        missing_id = self.picture('source/missing/two.png', 'blue')
+        first = await self.builder.build(source)
+        old_target = await self.catalog.get_asset(target)
+        old_missing = await self.catalog.get_asset(missing_id)
+        calls = len(self.provider.calls), len(self.embeddings.calls)
+        group = source / '鸟系列'
+        group.mkdir()
+        (source / 'pack').rename(group / '小鸟_pack')
+        (source / 'missing').rename(self.root / 'unavailable')
+
+        result = await self.builder.build(source)
+
+        self.assertTrue(result.active)
+        self.assertEqual((len(self.provider.calls), len(self.embeddings.calls)), calls)
+        self.assertEqual({(alias.path, alias.pack) for alias in (await self.catalog.get_asset(target)).aliases},
+            {('鸟系列/小鸟_pack/one.png', '鸟系列'), ('other/alias.png', 'other')})
+        self.assertEqual((await self.catalog.get_asset(target, first.revision_id)).aliases, old_target.aliases)
+        missing = await self.catalog.get_asset(missing_id)
+        self.assertEqual(missing.aliases, old_missing.aliases)
+        self.assertEqual(missing.generated_card, old_missing.generated_card)
+        np.testing.assert_array_equal(missing.image_vector, old_missing.image_vector)
+        runtime = StickerCatalog(self.catalog, source)
+        self.assertIsNone(await runtime.aget_available(missing_id))
+        self.assertIsNotNone(await runtime.aget_available(target))
 
     async def test_embedding_failure_keeps_active_and_resume_reuses_successful_annotation(self):
         self.picture('pack/one.png', 'red')
