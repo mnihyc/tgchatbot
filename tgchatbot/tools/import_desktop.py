@@ -200,10 +200,13 @@ def _attachment(record: dict[str, Any]) -> tuple[str, str, str | None, PartKind]
     return str(kind), filename, mime, visual_kind
 
 
-def _attachment_hint(record: dict[str, Any], kind: str, filename: str, *, available: bool = False) -> str:
+def _attachment_hint(record: dict[str, Any], kind: str, filename: str, *, available: bool = False,
+                     thumbnail: bool = False) -> str:
     emoji = record.get('sticker_emoji') if kind == 'sticker' else None
     emoji_hint = f'; emoji={json.dumps(emoji, ensure_ascii=False)}' if emoji else ''
     state = 'image available' if available else 'media unavailable in bot workspace'
+    if thumbnail:
+        state += '; export thumbnail only (one still image; animation unavailable)'
     return f'[Imported attachment: {kind}{emoji_hint}; reference={json.dumps(filename, ensure_ascii=False)}; {state}]'
 
 
@@ -214,32 +217,46 @@ def _import_visual(message: ConversationMessage, record: dict[str, Any], export_
         return
     kind, filename, mime, _ = attachment
     source = _export_attachment_path(record, export_root)
-    if source is None:
-        return
-    try:
-        photo, sticker = bool(record.get('photo')), kind == 'sticker'
-        if not photo and not sticker and (config.max_document_bytes <= 0
-                or source.stat().st_size > config.max_document_bytes):
-            return
-        raw = source.read_bytes()
-    except (OSError, ValueError):
-        return
+    photo, sticker = bool(record.get('photo')), kind == 'sticker'
     from tgchatbot.media.ingest import _build_visual_preview_parts, visual_parts_from_bytes
-    if photo or sticker:
-        parts = visual_parts_from_bytes(raw=raw, filename=filename,
-            max_frames=1 if photo else config.max_sticker_frames,
-            max_bytes=config.max_photo_bytes if photo else config.max_sticker_bytes,
-            max_keyframe_candidates=config.max_video_keyframe_candidates,
-            detail='auto' if photo else 'low')
-    else:
-        parts = _build_visual_preview_parts(raw=raw, mime=mime or 'application/octet-stream',
-            filename=filename, telegram_config=config)
+    parts = []
+    if source is not None:
+        try:
+            if not photo and not sticker and (config.max_document_bytes <= 0
+                    or source.stat().st_size > config.max_document_bytes):
+                return
+            raw = source.read_bytes()
+            if photo or sticker:
+                parts = visual_parts_from_bytes(raw=raw, filename=filename,
+                    max_frames=1 if photo else config.max_sticker_frames,
+                    max_bytes=config.max_photo_bytes if photo else config.max_sticker_bytes,
+                    max_keyframe_candidates=config.max_video_keyframe_candidates,
+                    detail='auto' if photo else 'low')
+            else:
+                parts = _build_visual_preview_parts(raw=raw, mime=mime or 'application/octet-stream',
+                    filename=filename, telegram_config=config)
+        except (OSError, ValueError):
+            pass
+    thumbnail = False
+    if not parts and sticker:
+        # Desktop supplies a raster thumbnail even for stickers whose original
+        # format cannot be decoded here. It is preview evidence, not a replacement
+        # original or a claim that the complete animation was observed.
+        source = _export_media_path(record.get('thumbnail'), export_root)
+        if source is not None:
+            try:
+                parts = visual_parts_from_bytes(raw=source.read_bytes(), filename=source.name,
+                    max_frames=min(1, config.max_sticker_frames), max_bytes=config.max_sticker_bytes,
+                    max_keyframe_candidates=config.max_video_keyframe_candidates, detail='low')
+            except (OSError, ValueError):
+                pass
+            thumbnail = bool(parts)
     if not parts:
         return
     for index, part in enumerate(message.parts):
         if part.origin == 'attachment_reference':
             message.parts[index] = MessagePart(PartKind.TEXT,
-                text=_attachment_hint(record, kind, filename, available=True),
+                text=_attachment_hint(record, kind, filename, available=True, thumbnail=thumbnail),
                 origin='attachment_reference', remote_sync=False)
             break
     message.parts.extend(parts)
@@ -247,7 +264,10 @@ def _import_visual(message: ConversationMessage, record: dict[str, Any], export_
 
 
 def _export_attachment_path(record: dict[str, Any], export_root: Path) -> Path | None:
-    reference = record.get('photo') or record.get('file')
+    return _export_media_path(record.get('photo') or record.get('file'), export_root)
+
+
+def _export_media_path(reference: Any, export_root: Path) -> Path | None:
     if not isinstance(reference, str):
         return None
     try:

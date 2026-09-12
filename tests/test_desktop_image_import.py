@@ -183,6 +183,66 @@ class DesktopImageImportTests(BusinessTestCase):
         for row in after:
             self.assertEqual(len(await self.store.list_message_revisions(self.session, row.db_id)), 1)
 
+    async def test_sticker_thumbnail_is_retained_when_original_cannot_be_shown(self):
+        (self.bundle / 'animated.tgs').write_bytes(b'Unsupported sticker animation')
+        self.image('thumbnails/sticker.jpg', format='JPEG')
+        records = [record(1, 'Original caption.', file='animated.tgs', media_type='sticker',
+                          thumbnail='thumbnails/sticker.jpg', sticker_emoji='🙂'),
+                   record(2, '', file='missing.tgs', media_type='sticker',
+                          thumbnail='thumbnails/sticker.jpg', sticker_emoji='🙂')]
+        await self.ingest(records)
+        before, payloads = await self.images()
+        self.assertEqual(len(payloads), 1)
+        for row, original in zip(before, records):
+            self.assertEqual(row.message.metadata['desktop']['file'], original['file'])
+            self.assertEqual(row.message.parts[0].text, original['text'])
+            self.assertIn('🙂', message_body(row.message))
+            self.assertIn('export thumbnail only', message_body(row.message))
+            self.assertIn('animation unavailable', message_body(row.message))
+            self.assertEqual(len([part for part in row.message.parts if part.preview_ref]), 1)
+            self.assertFalse(any(part.remote_sync for part in row.message.parts))
+        await self.ingest(records)
+        after, reloaded = await self.images()
+        self.assertEqual([row.db_id for row in after], [row.db_id for row in before])
+        self.assertEqual([row.message for row in after], [row.message for row in before])
+        self.assertEqual(payloads, reloaded)
+        for row in after:
+            self.assertEqual(len(await self.store.list_message_revisions(self.session, row.db_id)), 1)
+        await self.store.retire_context_images(self.session, target_images=0)
+        await self.store.close()
+        self.store = await self.new_store()
+        canonical, retained = await self.images()
+        self.assertEqual([row.message for row in canonical], [row.message for row in before])
+        self.assertEqual(retained, payloads)
+
+    async def test_sticker_thumbnails_do_not_override_originals_limits_or_export_boundary(self):
+        self.image('original.webp', format='WEBP', color='red')
+        self.image('thumbnail.png', color='blue')
+        (self.bundle / 'corrupt.png').write_bytes(b'Corrupt thumbnail')
+        with Image.new('RGB', (16, 16), 'green') as image:
+            image.save(self.path / 'outside.png')
+        (self.bundle / 'outside-link.png').symlink_to(self.path / 'outside.png')
+        records = [record(1, '', file='original.webp', media_type='sticker', thumbnail='thumbnail.png')]
+        for number, thumbnail in enumerate(('missing.png', '../outside.png', 'outside-link.png', 'corrupt.png'), 2):
+            records.append(record(number, '', file='missing.tgs', media_type='sticker', thumbnail=thumbnail))
+        await self.ingest(records)
+        originals, payloads = await self.images()
+        self.assertEqual(len(payloads), 1)
+        self.assertNotIn('export thumbnail only', message_body(originals[0].message))
+        with Image.open(io.BytesIO(next(iter(payloads.values())))) as decoded:
+            red, _, blue = decoded.convert('RGB').getpixel((0, 0))
+            self.assertGreater(red, blue, 'The original must remain the preferred visual evidence')
+        for row in originals[1:]:
+            self.assertFalse(any(part.preview_ref for part in row.message.parts))
+            self.assertIn('unavailable', message_body(row.message))
+        limited = [record(6, '', file='missing.tgs', media_type='sticker', thumbnail='thumbnail.png')]
+        await self.ingest(limited, max_sticker_frames=0)
+        limited += [record(7, '', file='missing.tgs', media_type='sticker', thumbnail='thumbnail.png')]
+        await self.ingest(limited, max_sticker_bytes=1)
+        originals, limited_payloads = await self.images()
+        self.assertEqual(limited_payloads, payloads)
+        self.assertTrue(all(not any(part.preview_ref for part in row.message.parts) for row in originals[-2:]))
+
     async def test_configured_visual_limits_keep_unavailable_occurrence_without_discarding_caption(self):
         self.image('photo.png')
         self.animation('sticker.gif')
