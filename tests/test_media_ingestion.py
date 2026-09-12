@@ -103,12 +103,16 @@ class MediaIngestionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(parts[0].text, 'Please look at this.')
                 decoder.assert_not_called()
 
-    async def test_video_note_keeps_original_when_preview_is_disabled(self):
-        raw = b'synthetic video note'
+    async def test_video_note_is_file_only_even_when_visual_previews_are_enabled(self):
+        raw = self.animation()
         media = self.attachment(raw)
         del media.file_name
         del media.mime_type
-        parts = await self.ingest('video_note', media, max_visual_file_frames=0)
+        with patch('tgchatbot.media.ingest.Image.open') as image_decoder, \
+             patch('tgchatbot.media.ingest.av.open') as video_decoder:
+            parts = await self.ingest('video_note', media, max_visual_file_frames=3)
+        image_decoder.assert_not_called()
+        video_decoder.assert_not_called()
         self.assert_original(parts, raw)
         self.assertEqual([part.kind for part in parts], [PartKind.TEXT, PartKind.FILE])
         self.assertEqual(parts[-1].mime_type, 'video/mp4')

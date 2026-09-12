@@ -383,7 +383,9 @@ class TelegramBotApp:
         self.application.add_handler(CommandHandler('param', self.param_command))
         self.application.add_handler(CommandHandler('retry', self.retry_command))
         self.application.add_handler(CommandHandler('rollback', self.rollback_command))
-        all_messages = (filters.TEXT | filters.PHOTO | filters.Sticker.ALL | filters.Document.ALL | filters.VIDEO | filters.ANIMATION | filters.CAPTION) & ~filters.COMMAND
+        all_messages = (filters.TEXT | filters.PHOTO | filters.Sticker.ALL | filters.Document.ALL
+                        | filters.VIDEO | filters.ANIMATION | filters.AUDIO | filters.VOICE
+                        | filters.VIDEO_NOTE | filters.CAPTION) & ~filters.COMMAND
         fresh_messages = filters.UpdateType.MESSAGE & all_messages
         edited_messages = filters.UpdateType.EDITED_MESSAGE & all_messages
         self.application.add_handler(MessageHandler(fresh_messages & filters.ChatType.PRIVATE, self.private_message))

@@ -299,7 +299,7 @@ async def extract_message_parts(
     for field, fallback_name, fallback_mime, visual in (
         ('animation', 'animation.mp4', 'video/mp4', True),
         ('video', 'video.mp4', 'video/mp4', True),
-        ('video_note', 'video-note.mp4', 'video/mp4', True),
+        ('video_note', 'video-note.mp4', 'video/mp4', False),
         ('audio', 'audio.mp3', 'audio/mpeg', False),
         ('voice', 'voice.ogg', 'audio/ogg', False),
         ('document', 'document', 'application/octet-stream', True),

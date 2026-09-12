@@ -8,7 +8,6 @@ VISUAL_IDENTITY_FIELDS = (
     'rendering_style',
     'palette_mood',
     'prefer_pack',
-    'prefer_cluster',
 )
 AFFECT_PROFILE_FIELDS = (
     'default_tone',

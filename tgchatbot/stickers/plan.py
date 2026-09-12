@@ -111,14 +111,12 @@ class StyleFocus:
     style_goal: str = 'preserve'
     style_hints: list[str] = field(default_factory=list)
     prefer_pack: str = ''
-    prefer_cluster: str = ''
 
     def as_dict(self) -> dict[str, Any]:
         return {
             'style_goal': self.style_goal,
             'style_hints': list(self.style_hints),
             'prefer_pack': self.prefer_pack,
-            'prefer_cluster': self.prefer_cluster,
         }
 
     def display_dict(self) -> dict[str, Any]:
@@ -126,7 +124,6 @@ class StyleFocus:
             'style_goal': self.style_goal,
             'style_hints': list(self.style_hints),
             'preferred_pack': self.prefer_pack,
-            'preferred_style_cluster': self.prefer_cluster,
         }
 
 
@@ -197,7 +194,6 @@ class PersonaVisualIdentity:
     palette_mood: str = ''
     style_hints: list[str] = field(default_factory=list)
     prefer_pack: str = ''
-    prefer_cluster: str = ''
 
     def as_dict(self) -> dict[str, Any]:
         return build_persona_dict(visual_identity={
@@ -206,7 +202,6 @@ class PersonaVisualIdentity:
             'palette_mood': self.palette_mood,
             'style_hints': list(self.style_hints),
             'prefer_pack': self.prefer_pack,
-            'prefer_cluster': self.prefer_cluster,
         }).get('visual_identity', {})
 
     def active_fields(self) -> dict[str, str]:
@@ -223,7 +218,6 @@ class PersonaVisualIdentity:
             'palette_mood': self.palette_mood,
             'style_hints': list(self.style_hints),
             'preferred_pack': self.prefer_pack,
-            'preferred_style_cluster': self.prefer_cluster,
         }
 
 
@@ -289,7 +283,6 @@ class SelectionLens:
     social_read: str = ''
     subtext: str = ''
     face_and_pose: str = ''
-    continuity_note: str = ''
     avoid_misread_as: str = ''
 
     def as_dict(self) -> dict[str, Any]:
@@ -297,7 +290,6 @@ class SelectionLens:
             'social_read': self.social_read,
             'subtext': self.subtext,
             'face_and_pose': self.face_and_pose,
-            'continuity_note': self.continuity_note,
             'avoid_misread_as': self.avoid_misread_as,
         }
 
@@ -393,7 +385,6 @@ class StickerRetrievalPlan:
             style_goal=raw_style_goal,
             style_hints=style_hints,
             prefer_pack=_norm_text(_first_present(style_source.get('preferred_pack'), style_source.get('prefer_pack'), data.get('preferred_pack'), data.get('prefer_pack'))),
-            prefer_cluster=_norm_text(_first_present(style_source.get('preferred_style_cluster'), style_source.get('prefer_cluster'), data.get('preferred_style_cluster'), data.get('prefer_cluster'))),
         )
         must_include = _norm_text_list(text_source.get('must_include'))
         avoid_text_meanings = _norm_text_list(text_source.get('avoid_text_meanings'))
@@ -418,7 +409,6 @@ class StickerRetrievalPlan:
                 palette_mood=_norm_text(persona_visual_source.get('palette_mood')),
                 style_hints=persona_style_hints,
                 prefer_pack=_norm_text(_first_present(persona_visual_source.get('preferred_pack'), persona_visual_source.get('prefer_pack'))),
-                prefer_cluster=_norm_text(_first_present(persona_visual_source.get('preferred_style_cluster'), persona_visual_source.get('prefer_cluster'))),
             ),
             affect_profile=PersonaAffectProfile(
                 default_tone=_norm_text(persona_affect_source.get('default_tone')),
@@ -432,7 +422,6 @@ class StickerRetrievalPlan:
             social_read=_norm_text(selection_lens_source.get('social_read')),
             subtext=_norm_text(selection_lens_source.get('subtext')),
             face_and_pose=_norm_text(selection_lens_source.get('face_and_pose')),
-            continuity_note=_norm_text(selection_lens_source.get('continuity_note')),
             avoid_misread_as=_norm_text(selection_lens_source.get('avoid_misread_as')),
         )
 
@@ -508,10 +497,6 @@ class StickerRetrievalPlan:
     @property
     def prefer_pack(self) -> str:
         return self.style_focus.prefer_pack
-
-    @property
-    def prefer_cluster(self) -> str:
-        return self.style_focus.prefer_cluster
 
 
 def _normalize_diversity_preference(value: Any) -> str:

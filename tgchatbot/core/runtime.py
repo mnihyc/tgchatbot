@@ -3308,9 +3308,6 @@ class AgentRuntime:
         preferred_pack = self._clip_inline(arguments.get('preferred_pack', arguments.get('prefer_pack')), 48)
         if preferred_pack:
             details.append(f'pack={preferred_pack!r}')
-        preferred_cluster = self._clip_inline(arguments.get('preferred_style_cluster', arguments.get('prefer_cluster')), 48)
-        if preferred_cluster:
-            details.append(f'cluster={preferred_cluster!r}')
         candidate_budget = arguments.get('candidate_budget')
         if candidate_budget is not None:
             details.append(f'candidate_budget={candidate_budget}')

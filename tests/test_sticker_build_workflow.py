@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest.mock import AsyncMock, patch
 import uuid
 
 import numpy as np
@@ -16,10 +17,13 @@ from PIL import Image
 from psycopg import AsyncConnection, sql
 
 from tgchatbot.domain.models import ProviderResponse
+from tgchatbot.config import ChatCompletionsConfig
+from tgchatbot.providers.base import ProviderCapabilities
+from tgchatbot.providers.chat_completions import ChatCompletionsProvider
 from tgchatbot.storage.postgres_store import DatabaseConfig, PostgresStore
 from tgchatbot.storage.sticker_catalog import StickerCatalogStore, CatalogConflict
 from tgchatbot.stickers.build import CatalogBuilder, BuildConfig
-from tgchatbot.stickers.media import content_hash
+from tgchatbot.stickers.media import PreparedMedia, content_hash
 
 CARD = {'caption': 'Hello', 'appearance': 'A round blue bird', 'action': 'A raised wing',
         'readings': [{'meaning': 'Greeting', 'context': 'Opening a friendly conversation'}],
@@ -27,6 +31,7 @@ CARD = {'caption': 'Hello', 'appearance': 'A round blue bird', 'action': 'A rais
 
 
 class FakeProvider:
+    capabilities = ProviderCapabilities(multimodal_input=True)
     def __init__(self):
         self.calls = []
         self.card = copy.deepcopy(CARD)
@@ -81,6 +86,69 @@ class StickerBuildWorkflowTests(unittest.IsolatedAsyncioTestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         Image.new('RGB', (20, 20), color).save(path)
         return 'sha256:' + content_hash(path)
+
+    async def test_annotation_without_provider_vision_fails_before_generation_and_keeps_active_catalog(self):
+        first_id = self.picture('pack/one.png', 'red')
+        first = await self.builder.build(self.root)
+        added_id = self.picture('pack/two.png', 'blue')
+        provider = ChatCompletionsProvider(ChatCompletionsConfig(name='custom', api_key='synthetic',
+            base_url='https://fixture.invalid/', model='fixture-model', multimodal_input=False))
+        await provider.aclose()
+        provider.generate = AsyncMock(return_value=ProviderResponse(final_text=json.dumps(CARD)))
+        before_embeddings = len(self.embeddings.calls)
+        result = await CatalogBuilder(self.catalog, provider, self.embeddings,
+            config=replace(BuildConfig(), provider='custom', model='fixture-model', service_tier='')).build(self.root)
+        self.assertFalse(result.active)
+        self.assertEqual(await self.catalog.active_revision_id(), first.revision_id)
+        provider.generate.assert_not_awaited()
+        self.assertEqual(len(self.embeddings.calls), before_embeddings)
+        self.assertEqual([failure['asset_id'] for failure in result.failed], [added_id])
+        self.assertIn('image input', result.failed[0]['error'])
+        failed = await self.catalog.get_asset(added_id, result.revision_id)
+        self.assertEqual(failed.state, 'failed')
+        self.assertIsNone(failed.generated_card)
+        self.assertIsNotNone(await self.catalog.get_asset(first_id))
+
+    async def test_empty_prepared_frames_fail_without_calling_generation_or_embedding(self):
+        asset_id = self.picture('pack/one.png', 'red')
+        empty = PreparedMedia(asset_id.removeprefix('sha256:'), {'supplied_frames': 0}, ())
+        with patch('tgchatbot.stickers.build.prepare_media', return_value=empty):
+            result = await self.builder.build(self.root)
+        self.assertFalse(result.active)
+        self.assertIsNone(await self.catalog.active_revision_id())
+        self.assertIn('usable image frames', result.failed[0]['error'])
+        self.assertEqual(self.provider.calls, [])
+        self.assertEqual(self.embeddings.calls, [])
+        self.assertIsNone((await self.catalog.get_asset(asset_id, result.revision_id)).generated_card)
+
+    async def test_invalid_source_fails_without_replacing_active_catalog_or_buying_annotation(self):
+        self.picture('pack/one.png', 'red')
+        first = await self.builder.build(self.root)
+        bad = self.root / 'pack' / 'broken.png'
+        original = b'This file is not a decodable image.'
+        bad.write_bytes(original)
+        before_calls = len(self.provider.calls), len(self.embeddings.calls)
+        result = await self.builder.build(self.root)
+        self.assertFalse(result.active)
+        self.assertEqual(await self.catalog.active_revision_id(), first.revision_id)
+        self.assertEqual((len(self.provider.calls), len(self.embeddings.calls)), before_calls)
+        self.assertEqual(bad.read_bytes(), original)
+        self.assertEqual(len(result.failed), 1)
+        self.assertIsNone((await self.catalog.get_asset(result.failed[0]['asset_id'], result.revision_id)).generated_card)
+
+    async def test_existing_cards_reembed_with_text_only_embeddings_without_requiring_generation_vision(self):
+        asset_id = self.picture('pack/one.png', 'red')
+        await self.builder.build(self.root)
+        self.provider.capabilities = ProviderCapabilities(multimodal_input=False)
+        embeddings = FakeEmbeddings('text-only-next-space')
+        embeddings.supports_media = False
+        result = await CatalogBuilder(self.catalog, self.provider, embeddings).build(self.root)
+        self.assertTrue(result.active)
+        self.assertEqual(len(self.provider.calls), 1, 'Reusing an existing visual card does not annotate again')
+        current = await self.catalog.get_asset(asset_id)
+        self.assertEqual(current.generated_card, CARD)
+        self.assertEqual(current.provenance['visual_embedding_source'], 'description')
+        self.assertTrue(all(not document.media for batch in embeddings.calls for document in batch))
 
     async def test_append_same_bytes_and_aliases_do_not_rebuy_completed_work(self):
         self.assertEqual((await self.catalog.load_snapshot()).assets, ())

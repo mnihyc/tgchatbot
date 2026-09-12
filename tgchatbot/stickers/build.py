@@ -205,6 +205,8 @@ class CatalogBuilder:
         return BuildResult(revision_id, not failures, completed, tuple(failures), unsupported)
 
     async def _process(self, revision_id, root, asset):
+        if asset.generated_card is None and not self.provider.capabilities.multimodal_input:
+            raise ValueError('Sticker annotation requires a provider with image input')
         prepared = None
         if asset.generated_card is None or (self.recipe['image_embeddings'] and asset.image_vector is None):
             for alias in asset.aliases:
@@ -216,6 +218,8 @@ class CatalogBuilder:
                     break
             if prepared is None:
                 raise ValueError('No original alias with matching content remains available')
+            if not prepared.frames:
+                raise ValueError('Sticker media preparation produced no usable image frames')
         provenance = dict(asset.provenance)
         if asset.generated_card is None:
             parts = [MessagePart(PartKind.TEXT, text='Observed media facts: ' + json.dumps(prepared.facts, ensure_ascii=False))]

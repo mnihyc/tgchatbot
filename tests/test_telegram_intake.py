@@ -6,6 +6,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from PIL import Image
+from telegram import Audio, Chat, Message, Update, User, VideoNote, Voice
+from telegram.ext import MessageHandler
 
 from tests.business_helpers import BusinessTestCase
 from tgchatbot.domain.models import PartKind
@@ -48,6 +50,63 @@ class TelegramIntakeTests(BusinessTestCase):
         file = SimpleNamespace(download_to_memory=AsyncMock(side_effect=download))
         return SimpleNamespace(file_id='synthetic-photo-file', file_unique_id='unique-photo', width=2,
                                height=2, file_size=80, get_file=AsyncMock(return_value=file))
+
+    async def test_registered_audio_voice_and_video_note_enter_file_history_without_reply_or_previews(self):
+        handlers = []
+        self.app.application = SimpleNamespace(add_handler=handlers.append)
+        self.app._register_handlers()
+        transferred = []
+
+        async def sync(_session, paths):
+            transferred.extend((path.name, path.read_bytes()) for path in paths)
+            return SimpleNamespace(kept_paths=[f'/remote/inputs/{path.name}' for path in paths], rotated_paths=[])
+
+        self.app.remote_workspace = SimpleNamespace(enabled=True,
+            session_paths=lambda _session: SimpleNamespace(inputs='/remote/inputs'),
+            sync_inputs=AsyncMock(side_effect=sync))
+        raw = b'Original media bytes; no automatic interpretation.'
+        async def download(buffer):
+            buffer.write(raw)
+        file = SimpleNamespace(download_to_memory=AsyncMock(side_effect=download))
+        source_id = 900
+        for chat_type in ('private', 'group'):
+            for media_type, media_class, kwargs in (
+                ('audio', Audio, {'duration': 1, 'file_name': 'recording.mp3', 'mime_type': 'audio/mpeg'}),
+                ('voice', Voice, {'duration': 1, 'mime_type': 'audio/ogg'}),
+                ('video_note', VideoNote, {'length': 64, 'duration': 1}),
+            ):
+                source_id += 1
+                with self.subTest(chat=chat_type, media=media_type):
+                    media = media_class(file_id=f'file-{source_id}', file_unique_id=f'unique-{source_id}',
+                        file_size=len(raw), **kwargs)
+                    message = Message(message_id=source_id, date=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                        chat=Chat(100, chat_type), from_user=User(7, 'Participant', False), **{media_type: media})
+                    update = Update(source_id, message=message)
+                    matching = [handler for handler in handlers
+                        if isinstance(handler, MessageHandler) and handler.check_update(update)]
+                    self.assertEqual(len(matching), 1, 'Live media must reach exactly one registered intake handler')
+                    with patch.object(media_class, 'get_file', AsyncMock(return_value=file)) as get_file, \
+                         patch('tgchatbot.media.ingest.Image.open') as image_decoder, \
+                         patch('tgchatbot.media.ingest.av.open') as video_decoder:
+                        await matching[0].callback(update, SimpleNamespace(bot=SimpleNamespace(id=999)))
+                    get_file.assert_awaited_once()
+                    image_decoder.assert_not_called()
+                    video_decoder.assert_not_called()
+        originals = await self.store.list_canonical_messages(self.session)
+        self.assertEqual(len(originals), 6)
+        for original in originals:
+            files = [part for part in original.message.parts if part.kind == PartKind.FILE]
+            self.assertEqual(len(files), 1)
+            self.assertTrue(files[0].artifact_path.startswith('/remote/inputs/'))
+            self.assertFalse(any(part.kind == PartKind.IMAGE for part in original.message.parts))
+            self.assertEqual(original.message.metadata['actor_id'], 'telegram:user:7')
+            self.assertEqual(original.message.metadata['telegram_intake_stage'], 'complete')
+        self.assertEqual([data for _, data in transferred], [raw] * 6)
+        self.assertFalse([path for path in self.artifact_store.root.rglob('*') if path.is_file()])
+        self.app._promote_candidate_after_delay.assert_not_awaited()
+        self.app._promote_spontaneous_candidate_after_delay.assert_not_awaited()
+        self.app._notify_user_error.assert_not_awaited()
+        self.assertFalse(self.provider.requests)
 
     async def _reset_during_download(self, *, full):
         entered, release = asyncio.Event(), asyncio.Event()
