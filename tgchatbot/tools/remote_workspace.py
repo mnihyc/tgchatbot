@@ -290,7 +290,8 @@ class RemoteWorkspaceClient:
             "    rows = rows[-limit:]\n"
             "print(json.dumps({'kept': [p for _mtime, _name, p in rows], 'rotated': rotated}, ensure_ascii=False))\n"
         )
-        result = await self._run_ssh_command(f"python3 - <<'PY'\n{py}PY", timeout_s=max(5, self.ssh.connect_timeout_s + 10))
+        result = await self._run_ssh_command(f"python3 - <<'PY'\n{py}PY",
+            timeout_s=max(5, self.ssh.connect_timeout_s + 10), full_stdout=True)
         if result['returncode'] != 0:
             raise RuntimeError(result['stderr'] or 'Failed to prune remote input files')
         try:
@@ -349,7 +350,7 @@ class RemoteWorkspaceClient:
             "            rows.append({'name': name, 'size_bytes': os.path.getsize(p), 'path': p})\n"
             "print(json.dumps(rows, ensure_ascii=False))\n"
         )
-        result = await self._run_ssh_command(f"python3 - <<'PY'\n{py}PY", timeout_s=20)
+        result = await self._run_ssh_command(f"python3 - <<'PY'\n{py}PY", timeout_s=20, full_stdout=True)
         if result['returncode'] != 0:
             raise RuntimeError(result['stderr'] or 'Failed to list remote files')
         try:

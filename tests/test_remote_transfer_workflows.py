@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 from dataclasses import replace
@@ -113,6 +114,38 @@ class RemoteTransferWorkflows(unittest.IsolatedAsyncioTestCase):
             for artifact in result.artifacts:
                 artifact.discard()
 
+    async def test_large_input_inventory_preserves_upload_and_rotation_receipts(self):
+        paths = self.process_workspace()
+        self.remote.ssh = replace(self.remote.ssh, max_stdout_chars=16000, max_input_files=180)
+        originals = []
+        for number in range(180):
+            original = Path(paths.inputs, f'{number:03d}-' + '历史附件' * 12 + '.txt')
+            original.write_bytes(b'previous attachment')
+            os.utime(original, ns=(number + 1, number + 1))
+            originals.append(str(original))
+        incoming = self.root / '新的附件.txt'
+        incoming.write_bytes(b'new attachment')
+        expected = str(Path(paths.inputs, incoming.name))
+        # The retained files fit the operator's inventory policy, while their
+        # JSON receipt exceeds the independent shell-display allowance.
+        self.assertGreater(len(json.dumps({'kept': originals[1:] + [expected],
+            'rotated': originals[:1]}, ensure_ascii=False)), self.remote.ssh.max_stdout_chars)
+        self.remote._scp_base_args = unittest.mock.Mock(return_value=[sys.executable, '-c',
+            'import shutil,sys; shutil.copy(sys.argv[1],sys.argv[2].split(":",1)[1])'])
+        result = await self.remote.sync_inputs('telegram:1', [incoming])
+        self.assertEqual(result.kept_paths, [expected])
+        self.assertEqual(result.rotated_paths, originals[:1])
+        self.assertEqual(Path(expected).read_bytes(), incoming.read_bytes())
+        self.assertFalse(Path(originals[0]).exists())
+        self.assertTrue(all(Path(path).is_file() for path in originals[1:]))
+        repeated = await self.remote.sync_inputs('telegram:1', [incoming])
+        self.assertEqual(repeated.kept_paths, [expected])
+        self.assertEqual(repeated.rotated_paths, [])
+        self.remote._scp_base_args.assert_called_once()
+        displayed = await self.remote.run_shell(session_id='telegram:1',
+            command='python3 -c "print(chr(22909) * 20000)"', timeout_s=10)
+        self.assertEqual(displayed['stdout'], '好' * self.remote.ssh.max_stdout_chars)
+
     async def test_file_send_skips_a_missing_file_without_losing_available_files(self):
         paths = self.process_workspace()
         original = Path(paths.outputs, 'available.txt')
@@ -130,6 +163,16 @@ class RemoteTransferWorkflows(unittest.IsolatedAsyncioTestCase):
             for artifact in result.artifacts:
                 artifact.discard()
         self.assertFalse(list(self.config.artifact_dir.rglob('fetch-*')))
+
+    async def test_file_inventory_respects_file_selection_independently_of_shell_display(self):
+        paths = self.process_workspace()
+        self.remote.ssh = replace(self.remote.ssh, max_stdout_chars=1)
+        for name in ('一份报告.txt', '另一份报告.txt'):
+            Path(paths.outputs, name).write_bytes(b'report')
+        selected = await self.remote.list_files(session_id='telegram:1', max_files=1)
+        self.assertEqual(selected, [{'name': '一份报告.txt', 'size_bytes': 6,
+                                    'path': str(Path(paths.outputs, '一份报告.txt'))}])
+        self.assertEqual(len(list(Path(paths.outputs).iterdir())), 2)
 
     async def test_python_source_with_shell_delimiter_executes_unchanged(self):
         paths = RemoteSessionPaths(str(self.root), str(self.root / 'inputs'), str(self.root / 'outputs'))
