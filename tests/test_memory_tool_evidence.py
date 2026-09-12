@@ -29,7 +29,7 @@ class MemoryToolEvidenceTests(BusinessTestCase):
     async def search_ids(self, query='saffron', limit=20):
         self.memory.config = replace(self.memory.config, search_results=limit)
         result = await self.tool('memory_search', {'query': query})
-        return [row['source_ids'][0] for row in result['results']]
+        return [row['message_ids'][0] for row in result['matches']]
 
     async def test_repeated_lookups_do_not_displace_originals_or_external_observations(self):
         fact = await self.runtime.ingest_user_message(session_id=self.session,
@@ -43,13 +43,13 @@ class MemoryToolEvidenceTests(BusinessTestCase):
                 'stdout': 'Saffron supplier status: awaiting pickup.'}})
         original_ids = [row.db_id for row in (fact, question, answer, external)]
         self.assertCountEqual(await self.search_ids(limit=4), original_ids)
+        search_snapshot = await self.tool('memory_search', {'query': 'saffron'})
+        read_snapshot = await self.tool('memory_read', {'message_ids': [fact.db_id]})
 
         derived = []
         for name, arguments, output in (
-            ('memory_search', {'query': 'saffron'}, {'ok': True, 'results': [{
-                'text': message_body(fact.message), 'source_ids': [fact.db_id]}]}),
-            ('memory_read', {'message_ids': [fact.db_id]}, {'ok': True, 'messages': [{
-                'message_id': fact.db_id, 'text': message_body(fact.message)}], 'unavailable_ids': []}),
+            ('memory_search', {'query': 'saffron'}, search_snapshot),
+            ('memory_read', {'message_ids': [fact.db_id]}, read_snapshot),
             ('user_profile_fetch', {'actor_ids': ['telegram:user:101']}, {'ok': True, 'profiles': [{
                 'actor_id': 'telegram:user:101', 'facts': [{'text': 'Prefers saffron dishes.',
                     'source_ids': [fact.db_id]}]}]}),
@@ -68,8 +68,8 @@ class MemoryToolEvidenceTests(BusinessTestCase):
         all_rows = [fact, question, answer, external, *derived]
         read = await self.tool('memory_read', {'message_ids': [row.db_id for row in all_rows]})
         self.assertEqual(read['unavailable_ids'], [])
-        self.assertEqual({row['message_id']: row['text'] for row in read['messages']},
-            {row.db_id: message_body(row.message) for row in all_rows})
+        self.assertEqual({row['message_id']: row['fragments'] for row in read['messages']},
+            {row.db_id: [{'offset': 0, 'text': message_body(row.message)}] for row in all_rows})
         # Search eligibility does not change append-only tool history or DB reconstruction.
         live = await self.runtime._get_live_state(self.session)
         hot = copy.deepcopy(live.raw_messages)
@@ -115,7 +115,7 @@ class MemoryToolEvidenceTests(BusinessTestCase):
         self.assertEqual(derived.db_id, initial.db_id)
         self.assertEqual(await self.search_ids(), [], 'The previous lexical projection must be replaced')
         read = await self.tool('memory_read', {'message_ids': [initial.db_id]})
-        self.assertEqual(read['messages'][0]['text'], 'Saffron status is pending.')
+        self.assertEqual(read['messages'][0]['fragments'], [{'offset': 0, 'text': 'Saffron status is pending.'}])
         restored = await revise('event')
         self.assertEqual(restored.db_id, initial.db_id)
         self.assertEqual(await self.search_ids(), [initial.db_id])

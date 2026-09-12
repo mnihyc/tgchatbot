@@ -437,6 +437,54 @@ class ChatCompletionsContractTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AllAdaptersContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_gemini_invalid_generated_call_uses_existing_request_retry_policy(self):
+        from tgchatbot.core.runtime import AgentRuntime
+        invalid = {'candidates': [{'content': {}, 'finishReason': 'MALFORMED_FUNCTION_CALL'}]}
+        valid = {'candidates': [{'content': {'role': 'model', 'parts': [
+            {'functionCall': {'name': 'remember_style', 'args': {'style': 'quiet'}}}]},
+            'finishReason': 'STOP'}]}
+        tool = ToolSpec(name='remember_style', description='Remember a recurring visual style.',
+            parameters_schema={'type': 'object', 'properties': {'style': {'type': 'string'}}}, runner=None)
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as directory, patch.dict(
+            os.environ, {'APP_DATA_DIR': directory, 'TGBOT_TOKEN': 'mock', 'GEMINI_API_KEY': 'mock'}, clear=True
+        ):
+            config = load_config()
+            for retries, recover in ((1, True), (0, True), (1, False)):
+                with self.subTest(retries=retries, recover=recover):
+                    captured = []
+
+                    def handler(request):
+                        captured.append(json.loads(request.content))
+                        body = valid if recover and len(captured) > 1 else invalid
+                        return httpx.Response(200, json=body)
+
+                    provider = GeminiProvider(config.gemini)
+                    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                        provider._client = client
+                        runtime = object.__new__(AgentRuntime)
+                        runtime.config = config
+                        request = runtime._generate_with_retries(provider=provider,
+                            settings=replace(config.default_session_settings(), provider_retry_count=retries),
+                            messages=[ConversationMessage.user_text('Keep a quiet visual style from now on.')],
+                            instructions='Use the available tool to save continuing preferences.',
+                            tools=[tool], extra_input_items=None)
+                        if retries and recover:
+                            response = await request
+                            self.assertEqual([(call.name, call.arguments) for call in response.tool_calls],
+                                [('remember_style', {'style': 'quiet'})])
+                        else:
+                            with self.assertRaisesRegex(ValueError, 'valid function call'):
+                                await request
+                    self.assertEqual(len(captured), retries + 1)
+                    self.assertTrue(all(item == captured[0] for item in captured))
+
+    async def test_gemini_normal_empty_completion_remains_valid_for_sticker_only_turns(self):
+        provider = object.__new__(GeminiProvider)
+        response = provider._parse_response({'candidates': [
+            {'content': {'role': 'model', 'parts': []}, 'finishReason': 'STOP'}]})
+        self.assertEqual(response.final_text, '')
+        self.assertEqual(response.tool_calls, [])
+
     async def test_gemini_compaction_layers_request_a_summary_without_assistant_prefill(self):
         from tgchatbot.core.runtime import AgentRuntime
         actors = ['telegram:user:7', 'telegram:user:8']

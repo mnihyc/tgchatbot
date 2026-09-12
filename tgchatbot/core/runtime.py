@@ -40,7 +40,7 @@ from tgchatbot.domain.models import (
     ToolResult,
 )
 from tgchatbot.logging_config import clip_for_log
-from tgchatbot.domain.provenance import attributed_message, attribution
+from tgchatbot.domain.provenance import attributed_message, attribution, evidence_part_spans, message_evidence
 from tgchatbot.providers.base import ModelProvider, RequestTokenEstimate
 from tgchatbot.settings_schema import (
     COMPACT_KEEP_RECENT_RATIO_MAX,
@@ -62,7 +62,7 @@ from tgchatbot.settings_schema import (
     effective_optional_disabled_int,
     format_optional_disabled_int,
 )
-from tgchatbot.storage.postgres_store import PostgresStore
+from tgchatbot.storage.postgres_store import PostgresStore, StaleScopeError, message_body
 from tgchatbot.tools.base import ToolContext, ToolSpec
 from tgchatbot.tools.registry import ToolRegistry
 
@@ -479,10 +479,9 @@ class AgentRuntime:
             current_tools = [] if final_iteration or not provider.capabilities.function_tools else tools
             iteration_instructions = instructions
             if final_iteration and tools:
-                # The last round intentionally disables tools. This keeps multi-step turns bounded and,
-                # forces a best-effort final reply instead of letting the
-                # model extend the same user turn forever with more tool calls.
-                iteration_instructions = instructions + "\n\n[Internal control note]: this is the final interaction round for this turn. Keep the established personality and preset voice exactly as intended by the system prompt. This note is not a user message. Do not call any more tools. Use the conversation so far and give the best final reply now."
+                # End tool interaction without requiring extra prose when an
+                # already selected sticker fulfills the request.
+                iteration_instructions = instructions + "\n\n[Internal control note]: this is the final interaction round for this turn. Keep the established personality and preset voice exactly as intended by the system prompt. This note is not a user message. Do not call any more tools. Finish the current reply in the requested form using the available results. A selected sticker can be the entire reply; add text only when it fits the request."
             raw_request_estimate = provider.estimate_request_tokens(
                 settings=settings,
                 messages=history,
@@ -1346,9 +1345,11 @@ class AgentRuntime:
     async def _refresh_profiles_after_compaction(self, *, session_id, state, settings, provider,
                                                   instructions, tools, emit, trigger, reserved='',native_from_id=None):
         observed_compaction = await self.store.get_compaction_version(session_id)
-        actor_ids = state.active_participant_ids(trigger.message if trigger is not None else None)
-        arguments = {'actor_ids': actor_ids, 'include_agent_preferences': True}
+        trigger_message = trigger.message if trigger is not None else None
+        actor_ids = state.active_participant_ids([], trigger_message)
         try:
+            recent = await self.store.list_recent_participant_messages(session_id, expected_scope=_turn_scope.get())
+            actor_ids = state.active_participant_ids(recent, trigger_message)
             output = await self.memory.fetch_profiles(session_id, actor_ids,
                 scope=_turn_scope.get(), timezone=settings.metadata_timezone)
         except QueryCanceled:
@@ -1358,6 +1359,7 @@ class AgentRuntime:
             logger.warning('memory.profile_refresh_query_canceled')
             output = {'ok': False, 'profiles': [],
                 'coverage': 'unavailable: profile refresh timed out; do not infer that profiles are empty'}
+        arguments = {'actor_ids': actor_ids, 'include_agent_preferences': True}
         call_id = 'profile-refresh-' + uuid4().hex
         call_payload = {'call_id': call_id, 'arguments': arguments}
         result_payload = {'call_id': call_id, 'output': output}
@@ -1853,7 +1855,8 @@ class AgentRuntime:
                 sequence_token_cache=sequence_token_cache,
             )
             if tool_slice:
-                candidate = await self._make_toolspan_block_candidate(provider, settings, tool_slice)
+                candidate = await self._make_toolspan_block_candidate(provider, settings, tool_slice,
+                    session_id=session_id)
                 if candidate is None:
                     skipped_ids = {item.db_id for item in tool_slice}
                     skipped_message_ids.update(skipped_ids)
@@ -1914,7 +1917,9 @@ class AgentRuntime:
                 sequence_token_cache=sequence_token_cache,
             )
             if history_slice:
-                candidate = await self._make_episode_block_candidate(provider, settings, history_slice['source_messages'], history_slice['raw_messages'], history_slice['parent_blocks'])
+                candidate = await self._make_episode_block_candidate(provider, settings,
+                    history_slice['source_messages'], history_slice['raw_messages'], history_slice['parent_blocks'],
+                    session_id=session_id)
                 if candidate is None:
                     skipped_ids = {item.db_id for item in history_slice['raw_messages']}
                     skipped_blocks = {block.block_id for block in history_slice['parent_blocks']}
@@ -2659,9 +2664,11 @@ class AgentRuntime:
                     return shard
         return []
 
-    async def _make_toolspan_block_candidate(self, provider: ModelProvider, settings: SessionSettings, raw_messages: list[StoredConversationMessage]) -> dict[str, Any] | None:
+    async def _make_toolspan_block_candidate(self, provider: ModelProvider, settings: SessionSettings,
+            raw_messages: list[StoredConversationMessage], *, session_id: str) -> dict[str, Any] | None:
         source_messages = [self._compaction_source_message(item) for item in raw_messages]
-        normalized = self._normalize_compaction_messages(source_messages)
+        originals = await self._compaction_originals(session_id, raw_messages)
+        normalized = self._normalize_compaction_messages(source_messages, originals=originals)
         time_start, time_end = self._raw_message_time_bounds(raw_messages, settings.metadata_timezone)
         metadata_message = self._compaction_metadata_message(
             mode='toolspan',
@@ -2690,9 +2697,13 @@ class AgentRuntime:
         source_messages: list[ConversationMessage],
         raw_messages: list[StoredConversationMessage],
         parent_blocks: list[MemoryBlock],
+        *,
+        session_id: str,
     ) -> dict[str, Any] | None:
         source_lookup = {id(item.message): self._compaction_source_message(item) for item in raw_messages}
-        normalized = self._normalize_compaction_messages([source_lookup.get(id(message), message) for message in source_messages])
+        originals = await self._compaction_originals(session_id, raw_messages)
+        normalized = self._normalize_compaction_messages(
+            [source_lookup.get(id(message), message) for message in source_messages], originals=originals)
         raw_start, raw_end = self._raw_message_time_bounds(raw_messages, settings.metadata_timezone)
         block_start, block_end = self._block_time_bounds(parent_blocks)
         time_start = min((value for value in (raw_start, block_start) if value), default=None)
@@ -2745,6 +2756,20 @@ class AgentRuntime:
     @staticmethod
     def _compaction_source_message(item: StoredConversationMessage) -> ConversationMessage:
         return replace(item.message, metadata={**item.message.metadata, 'compaction_source_message_id': item.db_id})
+
+    async def _compaction_originals(self, session_id: str,
+            messages: list[StoredConversationMessage]) -> dict[int, ConversationMessage]:
+        # Only the already selected batch is read. Presentation projections can
+        # retire images/change labels; original revisions own text coordinates.
+        # Preview references are retained here without loading any image bytes.
+        ids = list(dict.fromkeys(item.db_id for item in messages))
+        if not ids:
+            return {}
+        rows = await self.store.read_messages(session_id, ids, current_context=True, limit=len(ids))
+        originals = {item.db_id: item.message for item in rows}
+        if len(originals) != len(ids):
+            raise StaleScopeError('A selected compaction original is no longer available')
+        return originals
 
     @staticmethod
     def _compaction_profile_has_owners(candidate: dict[str, Any], actor_ids: list[str]) -> bool:
@@ -2898,15 +2923,9 @@ class AgentRuntime:
         # truncate identifiers or drop later people at an arbitrary actor count.
         return list(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
     def _render_memory_block_text(self, kind: str, data: dict[str, Any], *, time_start: str | None = None, time_end: str | None = None) -> str:
-        def emit_list(title: str, items: Any, default: str | None = None) -> list[str]:
-            lines = ['', title]
-            values = items if isinstance(items, list) else []
-            if values:
-                for item in values[:12]:
-                    lines.append(f'- {str(item).strip()}')
-            elif default is not None:
-                lines.append(f'- {default}')
-            return lines
+        def emit_list(title: str, items: Any) -> list[str]:
+            values = [str(item).strip() for item in items if item is not None and str(item).strip()] if isinstance(items, list) else []
+            return ['', title, *(f'- {item}' for item in values)] if values else []
 
         def time_line(start: str | None, end: str | None) -> str | None:
             if start and end and start != end:
@@ -2927,17 +2946,17 @@ class AgentRuntime:
             if data.get('participants'):
                 lines.append('- Participants: ' + ', '.join(str(item).strip() for item in data.get('participants', [])))
             if data.get('topics'):
-                lines.append('- Topics: ' + ', '.join(str(item).strip() for item in data.get('topics', [])[:8]))
-            lines.extend(emit_list('## User profile', data.get('user_profile', []), 'None recorded'))
-            lines.extend(emit_list('## User intent / shared context', data.get('user_intent_or_shared_context', []), 'None recorded'))
-            lines.extend(emit_list('## Why it mattered', data.get('why_it_mattered', []), 'None recorded'))
-            lines.extend(emit_list('## Assistant strategy', data.get('assistant_strategy', []), 'None recorded'))
-            lines.extend(emit_list('## Tool timeline', data.get('tool_timeline', []), 'None recorded'))
-            lines.extend(emit_list('## Results / takeaways', data.get('results_or_takeaways', []), 'None recorded'))
-            lines.extend(emit_list('## Decisions', data.get('decisions', []), 'None recorded'))
-            lines.extend(emit_list('## Open loops', data.get('open_loops', []), 'None recorded'))
-            lines.extend(emit_list('## Artifacts', data.get('artifacts', []), 'None recorded'))
-            lines.extend(emit_list('## Uncertainties', data.get('uncertainties', []), 'None recorded'))
+                lines.append('- Topics: ' + ', '.join(str(item).strip() for item in data.get('topics', [])))
+            lines.extend(emit_list('## User profile', data.get('user_profile', [])))
+            lines.extend(emit_list('## User intent / shared context', data.get('user_intent_or_shared_context', [])))
+            lines.extend(emit_list('## Why it mattered', data.get('why_it_mattered', [])))
+            lines.extend(emit_list('## Assistant strategy', data.get('assistant_strategy', [])))
+            lines.extend(emit_list('## Tool timeline', data.get('tool_timeline', [])))
+            lines.extend(emit_list('## Results / takeaways', data.get('results_or_takeaways', [])))
+            lines.extend(emit_list('## Decisions', data.get('decisions', [])))
+            lines.extend(emit_list('## Open loops', data.get('open_loops', [])))
+            lines.extend(emit_list('## Artifacts', data.get('artifacts', [])))
+            lines.extend(emit_list('## Uncertainties', data.get('uncertainties', [])))
             excerpts = data.get('retained_raw_excerpts', []) if isinstance(data.get('retained_raw_excerpts', []), list) else []
             if excerpts:
                 lines.extend(emit_list('## Retained raw excerpts', excerpts))
@@ -2952,17 +2971,17 @@ class AgentRuntime:
             if data.get('participants'):
                 lines.append('- Participants: ' + ', '.join(str(item).strip() for item in data.get('participants', [])))
             if data.get('topics'):
-                lines.append('- Topics: ' + ', '.join(str(item).strip() for item in data.get('topics', [])[:8]))
-            lines.extend(emit_list('## User profile', data.get('user_profile', []), 'None recorded'))
-            lines.extend(emit_list('## User intent / shared context', data.get('user_intent_or_shared_context', []), 'None recorded'))
-            lines.extend(emit_list('## Why it mattered', data.get('why_it_mattered', []), 'None recorded'))
-            lines.extend(emit_list('## Tool usage', data.get('tool_usage', []), 'None recorded'))
-            lines.extend(emit_list('## Interaction timeline', data.get('interaction_timeline', []), 'None recorded'))
-            lines.extend(emit_list('## Results / takeaways', data.get('results_or_takeaways', []), 'None recorded'))
-            lines.extend(emit_list('## Decisions', data.get('decisions', []), 'None recorded'))
-            lines.extend(emit_list('## Open loops', data.get('open_loops', []), 'None recorded'))
-            lines.extend(emit_list('## Artifacts', data.get('artifacts', []), 'None recorded'))
-            lines.extend(emit_list('## Uncertainties', data.get('uncertainties', []), 'None recorded'))
+                lines.append('- Topics: ' + ', '.join(str(item).strip() for item in data.get('topics', [])))
+            lines.extend(emit_list('## User profile', data.get('user_profile', [])))
+            lines.extend(emit_list('## User intent / shared context', data.get('user_intent_or_shared_context', [])))
+            lines.extend(emit_list('## Why it mattered', data.get('why_it_mattered', [])))
+            lines.extend(emit_list('## Tool usage', data.get('tool_usage', [])))
+            lines.extend(emit_list('## Interaction timeline', data.get('interaction_timeline', [])))
+            lines.extend(emit_list('## Results / takeaways', data.get('results_or_takeaways', [])))
+            lines.extend(emit_list('## Decisions', data.get('decisions', [])))
+            lines.extend(emit_list('## Open loops', data.get('open_loops', [])))
+            lines.extend(emit_list('## Artifacts', data.get('artifacts', [])))
+            lines.extend(emit_list('## Uncertainties', data.get('uncertainties', [])))
             excerpts = data.get('retained_raw_excerpts', []) if isinstance(data.get('retained_raw_excerpts', []), list) else []
             if excerpts:
                 lines.extend(emit_list('## Retained raw excerpts', excerpts))
@@ -2973,21 +2992,21 @@ class AgentRuntime:
             if span:
                 lines.append(span)
             if data.get('interaction_modes_seen'):
-                lines.append('- Interaction modes seen: ' + ', '.join(str(item).strip() for item in data.get('interaction_modes_seen', [])[:8]))
+                lines.append('- Interaction modes seen: ' + ', '.join(str(item).strip() for item in data.get('interaction_modes_seen', [])))
             if data.get('participants'):
                 lines.append('- Participants: ' + ', '.join(str(item).strip() for item in data.get('participants', [])))
             if data.get('topics'):
-                lines.append('- Topics: ' + ', '.join(str(item).strip() for item in data.get('topics', [])[:8]))
-            lines.extend(emit_list('## User profile', data.get('user_profile', []), 'None recorded'))
-            lines.extend(emit_list('## Recurring requests / shared threads', data.get('recurring_requests_or_shared_threads', []), 'None recorded'))
-            lines.extend(emit_list('## Why history matters now', data.get('why_history_matters_now', []), 'None recorded'))
-            lines.extend(emit_list('## Durable state', data.get('durable_state', []), 'None recorded'))
-            lines.extend(emit_list('## Important changes', data.get('important_changes', []), 'None recorded'))
-            lines.extend(emit_list('## Decisions', data.get('decisions', []), 'None recorded'))
-            lines.extend(emit_list('## Open loops', data.get('open_loops', []), 'None recorded'))
-            lines.extend(emit_list('## Artifacts', data.get('artifacts', []), 'None recorded'))
-            lines.extend(emit_list('## Uncertainties', data.get('uncertainties', []), 'None recorded'))
-            lines.extend(emit_list('## Parent refs', data.get('parent_refs', []), 'None recorded'))
+                lines.append('- Topics: ' + ', '.join(str(item).strip() for item in data.get('topics', [])))
+            lines.extend(emit_list('## User profile', data.get('user_profile', [])))
+            lines.extend(emit_list('## Recurring requests / shared threads', data.get('recurring_requests_or_shared_threads', [])))
+            lines.extend(emit_list('## Why history matters now', data.get('why_history_matters_now', [])))
+            lines.extend(emit_list('## Durable state', data.get('durable_state', [])))
+            lines.extend(emit_list('## Important changes', data.get('important_changes', [])))
+            lines.extend(emit_list('## Decisions', data.get('decisions', [])))
+            lines.extend(emit_list('## Open loops', data.get('open_loops', [])))
+            lines.extend(emit_list('## Artifacts', data.get('artifacts', [])))
+            lines.extend(emit_list('## Uncertainties', data.get('uncertainties', [])))
+            lines.extend(emit_list('## Parent refs', data.get('parent_refs', [])))
         return '\n'.join(line for line in lines if line is not None).strip()
     async def _summarize_messages(
         self,
@@ -3003,7 +3022,8 @@ class AgentRuntime:
         if isinstance(candidate, dict):
             return self._render_memory_block_text(mode, candidate)
         raise RuntimeError(f'Compaction summary generation failed for mode={mode}')
-    def _normalize_compaction_messages(self, messages: list[ConversationMessage]) -> list[ConversationMessage]:
+    def _normalize_compaction_messages(self, messages: list[ConversationMessage], *,
+            originals: dict[int, ConversationMessage] | None = None) -> list[ConversationMessage]:
         normalized: list[ConversationMessage] = []
         index = 0
         while index < len(messages):
@@ -3017,7 +3037,9 @@ class AgentRuntime:
                             'Agent-side tool exchange:\n' + text, metadata={'source_role': 'tool'}))
                     index += 2
                     continue
-            single = self._normalize_compaction_message(message)
+            original = (originals.get(message.metadata.get('compaction_source_message_id'))
+                if originals is not None else None)
+            single = self._normalize_compaction_message(message, original=original)
             if single is not None:
                 normalized.append(single)
             index += 1
@@ -3032,7 +3054,8 @@ class AgentRuntime:
     def _is_matching_tool_result(call_message: ConversationMessage, result_message: ConversationMessage) -> bool:
         return matching_tool_result(call_message, result_message)
 
-    def _normalize_compaction_message(self, message: ConversationMessage) -> ConversationMessage | None:
+    def _normalize_compaction_message(self, message: ConversationMessage, *,
+            original: ConversationMessage | None = None) -> ConversationMessage | None:
         if message.role == MessageRole.TOOL:
             return self._normalize_single_tool_message(message)
         metadata = message.metadata if isinstance(message.metadata, dict) else {}
@@ -3046,23 +3069,38 @@ class AgentRuntime:
         if is_auto_note:
             text = self._normalize_auto_note_message(message)
             return ConversationMessage.assistant_text(text, metadata={'source_role': 'transport'}) if text else None
-        text = self._normalize_regular_message_text(message)
-        if not text:
-            return None
-        source = attribution(message, message_id=metadata.get('compaction_source_message_id'))
+        original = original or message
+        source = attribution(original, message_id=metadata.get('compaction_source_message_id'))
         if message.name and not source.get('actor_name'):
             source['actor_name'] = message.name
-        if source:
-            # Keep the speaker next to the quoted body. Short alternating
-            # messages lose ownership when buried behind repetitive metadata.
-            details = dict(source)
-            actor = details.pop('actor_id', None)
-            name = details.pop('actor_name', None)
-            speaker = actor or (json.dumps(name, ensure_ascii=False) if name else message.role.value)
-            if actor and name:
-                speaker += ' (' + json.dumps(name, ensure_ascii=False) + ')'
-            text = (f'Speaker: {speaker}\nMessage: ' + json.dumps(text, ensure_ascii=False)
-                    + '\nSource: ' + json.dumps(details, ensure_ascii=False, default=str))
+        if (source or message.role == MessageRole.USER) and not synthetic_role:
+            # Offsets refer to the canonical original body, including its
+            # separators. Typed application notes remain annotations rather
+            # than becoming words attributed to the participant.
+            body = message_body(original)
+            evidence = message_evidence({**source, 'parts': evidence_part_spans(original)},
+                message_id=metadata.get('compaction_source_message_id'), role=message.role,
+                fragments=[{'offset': 0, 'text': body}], total_characters=len(body))
+            annotation_parts = [part for part in message.parts
+                if (part.origin or '').strip().lower() != 'provenance'
+                and (part.kind != PartKind.TEXT
+                    or (part.origin or '').strip().lower() in {
+                        'auto_note', 'attachment_reference', 'attachment_excerpt', 'image_compacted'})]
+            annotations = self._normalize_regular_message_text(replace(message, parts=annotation_parts))
+            if not evidence['fragments'] and not annotations:
+                return None
+            # Source coordinates come from the original; the current
+            # presentation alone owns admitted/retired attachment context.
+            evidence.pop('annotations', None)
+            if annotations:
+                evidence['annotations'] = [{'kind': 'context', 'text': annotations}]
+            text = json.dumps(evidence, ensure_ascii=False, default=str)
+        else:
+            # Derived blocks and application events have no original-message
+            # identity; preserve their existing meaning and representation.
+            text = self._normalize_regular_message_text(message)
+            if not text:
+                return None
         normalized_metadata = {**source, 'source_role': message.role.value}
         if message.role == MessageRole.USER:
             return ConversationMessage.user_text(text, metadata=normalized_metadata)

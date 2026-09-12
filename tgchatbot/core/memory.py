@@ -9,7 +9,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from tgchatbot.domain.models import ToolResult
-from tgchatbot.domain.provenance import attribution
+from tgchatbot.domain.provenance import evidence_part_spans, message_evidence
 from tgchatbot.tools.base import ToolContext, ToolSpec
 from tgchatbot.storage.postgres_store import message_body
 from tgchatbot.operational import MemoryConfig, from_env
@@ -18,17 +18,22 @@ from tgchatbot.settings_schema import DEFAULT_METADATA_TIMEZONE
 logger = logging.getLogger(__name__)
 
 
-def search_attribution(row: dict) -> dict:
-    metadata = row.get('metadata') or {}
-    result = {key: row.get(key, metadata.get(key)) for key in (
-        'id', 'role', 'actor_id', 'actor_kind', 'actor_name', 'sent_at', 'source',
-        'source_chat_id', 'source_message_id', 'topic_id', 'reply_to_source_id', 'reply_to_source_chat_id')}
-    for key in ('reply_to_actor', 'forward_origin', 'external_reply', 'quote'):
-        if metadata.get(key):
-            result[key] = metadata[key]
-    if metadata.get('quote'):
-        result['contains_quote'] = True
-    return result
+def _unseen_fragments(fragment: dict, displayed: list[dict]):
+    """Only newly displayed original characters consume the shared allowance."""
+    start = fragment['offset']
+    end = start + len(fragment['text'])
+    cursor = start
+    for previous in sorted(displayed, key=lambda item: item['offset']):
+        if previous['offset'] >= end:
+            break
+        previous_end = previous['offset'] + len(previous['text'])
+        if previous_end <= cursor:
+            continue
+        if previous['offset'] > cursor:
+            yield {'offset': cursor, 'text': fragment['text'][cursor - start:previous['offset'] - start]}
+        cursor = max(cursor, previous_end)
+    if cursor < end:
+        yield {'offset': cursor, 'text': fragment['text'][cursor - start:]}
 
 
 class MemoryService:
@@ -115,36 +120,49 @@ class MemoryService:
             limit=self.config.search_results if limit is None else min(self.config.search_results, max(1, int(limit))))
         if scope is not None:
             await self.store.assert_scope(session_id, scope)
-        # Keep provider requests independent of archive size. Full source text is
-        # available through memory_read; truncation is explicit in each result.
-        results, remaining = [], self.config.response_chars
+        # The store owns ranked sources and exact slices. Bound displayed text
+        # here, then project originals once; rank and chronological order have
+        # different purposes. Computational fields never enter the tool output.
+        matches, selected, remaining = [], {}, self.config.response_chars
         for row in rows:
-            text = str(row.get('text', ''))
             allowance = min(self.config.search_result_chars, remaining)
             if allowance <= 0:
                 break
-            item = {key: value for key, value in row.items()
-                    if key not in {'embedding', 'source_revisions', 'metadata', 'sources', 'text'}}
-            item.update(text=text[:allowance], truncated=len(text) > allowance)
-            item.update(search_attribution(row))
-            if 'sources' in row:
-                item['sources'] = [search_attribution(source) for source in row['sources']]
-            results.append(item)
-            remaining -= len(item['text'])
-        source_ids = list(dict.fromkeys(source_id for item in results for source_id in item['source_ids']))
+            sources = row.get('sources', [row])
+            match = {'message_ids': [source['id'] for source in sources]}
+            for source in sources:
+                entry = selected.setdefault(source['id'], {'source': source, 'fragments': []})
+                for fragment in source['fragments']:
+                    for unseen in list(_unseen_fragments(fragment, entry['fragments'])):
+                        text = unseen['text'][:allowance]
+                        allowance -= len(text)
+                        remaining -= len(text)
+                        if len(text) < len(unseen['text']):
+                            match['truncated'] = True
+                        if text:
+                            entry['fragments'].append({'offset': unseen['offset'], 'text': text})
+            matches.append(match)
+        source_ids = list(selected)
         images = await self.store.describe_message_images(session_id, source_ids, expected_scope=scope)
-        for item in results:
-            attributed_sources = item['sources'] if 'sources' in item else [item]
-            for source in attributed_sources:
-                source['images'] = images.get(source['id'], [])
-                remaining -= len(json.dumps(source['images'], ensure_ascii=False))
+        messages = []
+        for message_id, entry in selected.items():
+            source_images = images.get(message_id, [])
+            remaining -= len(json.dumps(source_images, ensure_ascii=False))
+            source = entry['source']
+            messages.append(message_evidence(source, message_id=message_id, role=source['role'],
+                fragments=entry['fragments'], total_characters=source['total_characters'], images=source_images))
         # These originals provide conversational context, not additional ranked
         # matches or extensions of an excerpt's exact source spans.
         related = await self._related_context(session_id, [source_id for source_id in source_ids if source_id in images], source_ids,
             remaining=remaining, scope=scope)
+        messages.extend(related)
+        messages.sort(key=lambda item: (item.get('sent_at') or '', item['message_id']))
         if scope is not None:
             await self.store.assert_scope(session_id, scope)
-        return {'ok': True, 'coverage': status, 'results': results, 'related_context': related}
+        output = {'ok': True, 'coverage': status, 'matches': matches, 'messages': messages}
+        if related:
+            output['related_context'] = [item['message_id'] for item in related]
+        return output
 
     async def _related_context(self, session_id, seeds, ranked_ids, *, remaining, scope):
         if not seeds or remaining <= 2:
@@ -164,19 +182,18 @@ class MemoryService:
                 continue
             stored = by_id[message_id]
             text = message_body(stored.message)
-            item = {**attribution(stored.message, message_id=message_id),
-                'role': stored.message.role.value, 'images': images[message_id],
-                'text': text[:min(self.config.search_result_chars, remaining)],
-                'truncated': False, 'total_characters': len(text)}
+            shown = text[:min(self.config.search_result_chars, remaining)]
             # Charge attribution, descriptors and JSON escaping as well as text.
             # Ranked text keeps its existing allowance; related context uses only
             # what remains, with complete originals available via memory_read.
             while True:
-                item['truncated'] = len(item['text']) < len(text)
+                item = message_evidence({**stored.message.metadata, 'parts': evidence_part_spans(stored.message)}, message_id=message_id,
+                    role=stored.message.role, fragments=[{'offset': 0, 'text': shown}],
+                    total_characters=len(text), images=images[message_id])
                 size = len(json.dumps(item, ensure_ascii=False, default=str)) + (2 if result else 0)
-                if size <= remaining or not item['text']:
+                if size <= remaining or not shown:
                     break
-                item['text'] = item['text'][:max(0, len(item['text']) - (size - remaining))]
+                shown = shown[:max(0, len(shown) - (size - remaining))]
             if size <= remaining:
                 result.append(item)
                 remaining -= size
@@ -190,7 +207,8 @@ class MemoryService:
             raise ValueError(f'Offset must be nonnegative; length must be 1–{self.config.read_chars} characters')
         if scope is not None:
             await self.store.assert_scope(session_id, scope)
-        requested = list(message_ids)
+        requested = list(dict.fromkeys(message_ids))
+        message_ids = requested
         if include_neighbors:
             from tgchatbot.storage.relationships import expand_message_ids
             message_ids = await expand_message_ids(self.store, session_id, message_ids,
@@ -204,17 +222,20 @@ class MemoryService:
             text = message_body(item.message)
             end = offset + min(length, remaining)
             excerpt = text[offset:end]
-            results.append({**attribution(item.message, message_id=item.db_id), 'text': excerpt,
-                'role': item.message.role.value,
-                'offset': offset, 'next_offset': end if end < len(text) else None,
-                'total_characters': len(text)})
+            record = message_evidence({**item.message.metadata, 'parts': evidence_part_spans(item.message)}, message_id=item.db_id,
+                role=item.message.role, fragments=[{'offset': offset, 'text': excerpt}],
+                total_characters=len(text))
+            if end < len(text):
+                record['next_offset'] = end
+            results.append(record)
             remaining -= len(excerpt)
             if remaining <= 0:
                 break
         images = await self.store.describe_message_images(session_id,
             [item['message_id'] for item in results], expected_scope=scope)
         for item in results:
-            item['images'] = images.get(item['message_id'], [])
+            if images.get(item['message_id']):
+                item['images'] = images[item['message_id']]
         if scope is not None:
             await self.store.assert_scope(session_id, scope)
         return {'ok': True, 'messages': results,
@@ -228,8 +249,9 @@ class MemorySearchTool:
         self.memory = memory
         self.spec = ToolSpec('memory_search',
             'Find earlier messages in this chat, including history before /reset. Use a natural-language query and optional participant or time filters. '
-            'Results include attributed sources and original message IDs. Follow source_ids with memory_read for exact text or selected images. '
-            'Image references belong to their attributed originals; related_context is nearby evidence, not another ranked match. '
+            'Ordered matches identify contributing message_ids; messages contains their exact fragments in chronological order, each with its speaker and time. '
+            'Use memory_read for omitted text, nearby context or selected images; the returned fragments may already suffice. '
+            'Image references belong to their originals; related_context lists nearby originals separately from ranked matches. '
             'Earlier /reset_full history is unavailable.',
             {'type': 'object', 'properties': {
                 'query': {'type': 'string', 'description': 'Describe the event, fact or exchange you need; include distinctive words when known.'},
@@ -252,14 +274,14 @@ class MemoryReadTool:
     def __init__(self, memory: MemoryService) -> None:
         self.memory = memory
         self.spec = ToolSpec('memory_read',
-            'Read exact original messages using IDs from source_ids, attributed sources or related_context, not an excerpt\'s id. '
+            'Read selected original message_ids, returning the same message records as memory_search. '
             'Paginate long text with offset and length; include_neighbors adds reply and nearby context. '
             'Images remain descriptions unless image_ids selects them for visual examination. '
             'Each selected image must belong to an explicitly requested original, not an incidental neighbor. '
             'Results report unavailable or omitted evidence.',
             {'type': 'object', 'properties': {
                 'message_ids': {'type': 'array', 'items': {'type': 'integer'},
-                    'description': 'Original message IDs from memory results or provenance. An excerpt ID is not an original message ID.'},
+                    'description': 'Original message_id values from evidence records or provenance.'},
                 'image_ids': {'type': 'array', 'items': {'type': 'string'},
                     'description': 'Optional image references beside those originals; include each owning original in message_ids. Absent or empty keeps the read text-only.'},
                 'offset': {'type': 'integer'}, 'length': {'type': 'integer'},

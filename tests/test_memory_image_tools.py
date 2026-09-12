@@ -62,17 +62,20 @@ class MemoryImageToolTests(BusinessTestCase):
         baseline = await self.store.search_excerpts(self.session, 'cobalt', limit=20)
         result = await self.tool('memory_search', {'query': 'cobalt', 'actor_id': 'telegram:user:101'})
         output = result.output
-        self.assertEqual([row['id'] for row in output['results']], [caption.db_id])
-        match = output['results'][0]
-        self.assertEqual((match['source_ids'], match['score'], match['text']),
-            (baseline[0]['source_ids'], baseline[0]['score'], baseline[0]['text']))
-        self.assertEqual(match['images'], [])
-        self.assertEqual([row['message_id'] for row in output['related_context']], [photo.db_id])
-        neighbor = output['related_context'][0]
-        self.assertEqual(neighbor['actor_id'], 'telegram:user:102')
-        self.assertEqual(neighbor['text'], message_body(photo.message))
+        self.assertEqual([row['message_ids'] for row in output['matches']],
+            [row['source_ids'] for row in baseline])
+        records = {row['message_id']: row for row in output['messages']}
+        self.assertEqual(records[caption.db_id]['fragments'], [{'offset': 0, 'text': baseline[0]['text']}])
+        self.assertNotIn('images', records[caption.db_id])
+        self.assertEqual(output['related_context'], [photo.db_id])
+        neighbor = records[photo.db_id]
+        self.assertEqual(neighbor['speaker']['id'], 'telegram:user:102')
+        self.assertEqual(neighbor['fragments'], [], 'A captionless photo has no words spoken by its sender')
+        self.assertEqual(neighbor['annotations'], [{'kind': 'attachment', 'text': message_body(photo.message)}])
+        self.assertNotIn('partial', neighbor, 'Attachment annotations retain the complete selected evidence')
         self.assertTrue(neighbor['images'][0]['available'])
-        self.assertNotIn(unrelated.db_id, [row['message_id'] for row in output['related_context']])
+        self.assertNotIn(unrelated.db_id, output['related_context'])
+        self.assertEqual([row['message_id'] for row in output['messages']], [photo.db_id, caption.db_id])
         self.assertFalse(result.evidence_parts)
         self.assertNotIn(PIXEL, json.dumps(output, default=str))
 
@@ -89,22 +92,30 @@ class MemoryImageToolTests(BusinessTestCase):
         await self.store.create_excerpt(self.session, [question.db_id, answer.db_id], spans=spans,
             embedding=vector, model=self.embeddings.space_id)
         output = (await self.tool('memory_search', {'query': 'semantic-control'})).output
-        self.assertEqual(len(output['results']), 1)
-        match = output['results'][0]
-        self.assertEqual(match['source_ids'], [question.db_id, answer.db_id])
-        self.assertEqual(match['spans'], spans)
+        self.assertEqual(len(output['matches']), 1)
+        match = output['matches'][0]
+        self.assertEqual(match['message_ids'], [question.db_id, answer.db_id])
         self.assertNotIn('images', match, 'An excerpt does not own its participants\' images')
-        self.assertEqual(match['sources'][0]['images'], [])
-        self.assertTrue(match['sources'][1]['images'][0]['available'])
-        self.assertEqual(match['sources'][1]['actor_id'], 'telegram:user:102')
-        self.assertEqual(match['sources'][1]['forward_origin']['sender_user']['id'], 900)
-        self.assertEqual(output['related_context'], [])
+        self.assertEqual([row['message_id'] for row in output['messages']], [question.db_id, answer.db_id])
+        self.assertEqual([row['fragments'] for row in output['messages']],
+            [[{'offset': 0, 'text': text}] for text in ('Which suitcase?', 'This one.')])
+        self.assertEqual(output['messages'][1]['annotations'],
+            [{'kind': 'attachment', 'text': answer.message.parts[-1].text}])
+        self.assertFalse(any(row.get('partial') for row in output['messages']))
+        self.assertNotIn('images', output['messages'][0])
+        self.assertTrue(output['messages'][1]['images'][0]['available'])
+        self.assertEqual(output['messages'][1]['speaker']['id'], 'telegram:user:102')
+        self.assertEqual(output['messages'][1]['forward_origin']['sender_user']['id'], 900)
+        self.assertEqual(output.get('related_context', []), [])
 
     async def test_read_defaults_are_text_only_and_explicit_selection_has_attributed_evidence(self):
         photo = await self.original(1, 'My packed suitcase.', image=True)
         for optional in ({}, {'image_ids': []}, {'image_ids': None}):
             result = await self.tool('memory_read', {'message_ids': [photo.db_id], **optional})
-            self.assertEqual(result.output['messages'][0]['text'], message_body(photo.message))
+            record = result.output['messages'][0]
+            self.assertEqual(record['fragments'], [{'offset': 0, 'text': 'My packed suitcase.'}])
+            self.assertEqual(record['annotations'], [{'kind': 'attachment', 'text': photo.message.parts[-1].text}])
+            self.assertNotIn('partial', record)
             self.assertFalse(result.evidence_parts)
             self.assertNotIn('image_results', result.output)
         image_id = result.output['messages'][0]['images'][0]['image_id']
@@ -139,11 +150,11 @@ class MemoryImageToolTests(BusinessTestCase):
         reply = await self.original(2, image=True, actor=102, topic='other', reply=1)
         seed = await self.original(3, 'cobalt suitcase', reply=2)
         result = (await self.tool('memory_search', {'query': 'cobalt'})).output
-        self.assertEqual([row['message_id'] for row in result['related_context']], [reply.db_id])
-        self.assertNotIn(old.db_id, [row['message_id'] for row in result['related_context']])
+        self.assertEqual(result['related_context'], [reply.db_id])
+        self.assertNotIn(old.db_id, result['related_context'])
         self.assertEqual(await expand_message_ids(self.store, self.session, [seed.db_id]), [seed.db_id, reply.db_id])
         self.memory.config = replace(self.memory.config, read_messages=1)
-        self.assertEqual([row['message_id'] for row in (await self.tool('memory_search', {'query': 'cobalt'})).output['related_context']],
+        self.assertEqual((await self.tool('memory_search', {'query': 'cobalt'})).output['related_context'],
             [reply.db_id], 'A full ranked seed window must not consume its separate one-hop context window')
 
     async def test_related_context_deduplicates_originals_without_deduplicating_people(self):
@@ -152,8 +163,11 @@ class MemoryImageToolTests(BusinessTestCase):
         first = await self.original(2, 'cobalt question', actor=101, reply=1)
         second = await self.original(3, 'cobalt question', actor=103, reply=1)
         output = (await self.tool('memory_search', {'query': 'cobalt'})).output
-        self.assertEqual({row['id'] for row in output['results']}, {first.db_id, second.db_id})
-        self.assertEqual([row['message_id'] for row in output['related_context']], [photo.db_id])
+        self.assertEqual({row['message_ids'][0] for row in output['matches']}, {first.db_id, second.db_id})
+        self.assertEqual(output['related_context'], [photo.db_id])
+        self.assertEqual([row['message_id'] for row in output['messages']], [photo.db_id, first.db_id, second.db_id])
+        self.assertEqual([row['speaker']['id'] for row in output['messages']],
+            ['telegram:user:102', 'telegram:user:101', 'telegram:user:103'])
 
     async def test_small_context_window_follows_ranked_evidence_instead_of_import_order(self):
         self.store.config = replace(self.store.config, relationship_neighbors=0)
@@ -169,29 +183,35 @@ class MemoryImageToolTests(BusinessTestCase):
             embedding=vector, model=self.embeddings.space_id)
         self.memory.config = replace(self.memory.config, read_messages=1)
         output = (await self.tool('memory_search', {'query': 'cobalt'})).output
-        self.assertEqual([row['source_ids'] for row in output['results']],
+        self.assertEqual([row['message_ids'] for row in output['matches']],
             [[recent_caption.db_id], [old_caption.db_id]])
-        self.assertEqual([row['message_id'] for row in output['related_context']], [recent_photo.db_id])
-        self.assertNotIn(old_photo.db_id, [row['message_id'] for row in output['related_context']])
+        self.assertEqual(output['related_context'], [recent_photo.db_id])
+        self.assertNotIn(old_photo.db_id, output['related_context'])
+        self.assertEqual([row['message_id'] for row in output['messages']],
+            [old_caption.db_id, recent_photo.db_id, recent_caption.db_id])
 
     async def test_context_budget_charges_its_attribution_and_keeps_ranked_text_allowance(self):
         neighbor = await self.original(1, 'Quoted \\" caption 照片. ' * 100, image=True, actor=102)
         source = await self.original(2, 'cobalt match ' * 20)
         self.memory.config = replace(self.memory.config, response_chars=850, search_result_chars=300)
         output = (await self.tool('memory_search', {'query': 'cobalt'})).output
-        self.assertEqual(output['results'][0]['text'], message_body(source.message))
-        related = output['related_context']
-        self.assertEqual([row['message_id'] for row in related], [neighbor.db_id])
-        self.assertTrue(related[0]['truncated'])
-        self.assertLess(len(related[0]['text']), len(message_body(neighbor.message)))
-        ranked_text = sum(len(row['text']) for row in output['results'])
-        descriptors = sum(len(json.dumps(row['images'], ensure_ascii=False)) for row in output['results'])
+        records = {row['message_id']: row for row in output['messages']}
+        self.assertEqual(records[source.db_id]['fragments'], [{'offset': 0, 'text': message_body(source.message)}])
+        self.assertEqual(output['related_context'], [neighbor.db_id])
+        related = [records[neighbor.db_id]]
+        self.assertTrue(related[0]['partial'])
+        self.assertEqual(related[0]['total_characters'], len(message_body(neighbor.message)))
+        self.assertLess(len(related[0]['fragments'][0]['text']), len(message_body(neighbor.message)))
+        ranked_text = len(message_body(source.message))
+        descriptors = len(json.dumps(records[source.db_id].get('images', []), ensure_ascii=False))
         self.assertLessEqual(ranked_text + descriptors + len(json.dumps(related, ensure_ascii=False)),
             self.memory.config.response_chars)
         self.memory.config = replace(self.memory.config, response_chars=100)
         exhausted = (await self.tool('memory_search', {'query': 'cobalt'})).output
-        self.assertEqual(exhausted['results'][0]['text'], message_body(source.message)[:100])
-        self.assertEqual(exhausted['related_context'], [])
+        self.assertEqual(exhausted['matches'], [{'message_ids': [source.db_id], 'truncated': True}])
+        self.assertEqual(exhausted['messages'][0]['fragments'], [{'offset': 0, 'text': message_body(source.message)[:100]}])
+        self.assertTrue(exhausted['messages'][0]['partial'])
+        self.assertEqual(exhausted.get('related_context', []), [])
 
     async def test_recalled_copies_stay_out_of_discovery_but_external_observations_remain(self):
         photo = await self.original(1, image=True, actor=102)
@@ -204,25 +224,26 @@ class MemoryImageToolTests(BusinessTestCase):
             name='shell_exec', tool_phase='result')
         await self.original(2, 'cobalt suitcase')
         search = (await self.tool('memory_search', {'query': 'cobalt'})).output
-        discovered = [row['message_id'] for row in search['related_context']]
+        discovered = search['related_context']
         self.assertNotIn(derived.db_id, discovered)
         self.assertIn(photo.db_id, discovered)
         self.assertIn(external.db_id, discovered)
         copied = await self.tool('memory_read', {'message_ids': [derived.db_id], 'image_ids': [image_id]})
-        self.assertEqual(copied.output['messages'][0]['images'], [])
+        self.assertEqual(copied.output['messages'][0].get('images', []), [])
         self.assertEqual(copied.output['image_results'][0]['status'], 'unavailable')
         self.assertFalse(copied.evidence_parts)
 
     async def test_soft_reset_keeps_image_recall_and_full_reset_removes_discovery_and_selection(self):
         source = await self.original(1, 'cobalt suitcase', image=True)
-        descriptor = (await self.tool('memory_search', {'query': 'cobalt'})).output['results'][0]['images'][0]
+        descriptor = (await self.tool('memory_search', {'query': 'cobalt'})).output['messages'][0]['images'][0]
         await self.store.reset_context(self.session)
         retained = await self.tool('memory_read', {'message_ids': [source.db_id], 'image_ids': [descriptor['image_id']]})
         self.assertEqual(retained.output['image_results'][0]['status'], 'selected')
         await self.store.reset_full(self.session, self.config.default_session_settings())
         search = (await self.tool('memory_search', {'query': 'cobalt'})).output
-        self.assertEqual(search['results'], [])
-        self.assertEqual(search['related_context'], [])
+        self.assertEqual(search['matches'], [])
+        self.assertEqual(search['messages'], [])
+        self.assertEqual(search.get('related_context', []), [])
         denied = await self.tool('memory_read', {'message_ids': [source.db_id], 'image_ids': [descriptor['image_id']]})
         self.assertEqual(denied.output['unavailable_ids'], [source.db_id])
         self.assertEqual(denied.output['image_results'][0]['status'], 'unavailable')

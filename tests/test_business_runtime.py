@@ -88,8 +88,12 @@ class RuntimeWorkflowTests(BusinessTestCase):
             peer_turn = next(item for item in payload['contents']
                 if any(part.get('text') == 'The train leaves at eleven.' for part in item['parts']))
             self.assertEqual(peer_turn['role'], 'user')
-            self.assertIn('telegram:user:888', json.dumps(peer_turn))
-            self.assertIn('"actor_kind": "bot"', '\n'.join(part.get('text', '') for part in peer_turn['parts']))
+            headers = [part['text'] for part in peer_turn['parts']
+                if part.get('text', '').startswith('[Message provenance: ')]
+            self.assertEqual(len(headers), 1)
+            identity = json.loads(headers[0].removeprefix('[Message provenance: ').removesuffix(']'))
+            self.assertEqual(identity['message_id'], peer.db_id)
+            self.assertEqual(identity['speaker'], {'id': 'telegram:user:888', 'name': 'Helper', 'kind': 'bot'})
 
         await self.store.close()
         restarted_store = await self.new_store()
@@ -105,12 +109,12 @@ class RuntimeWorkflowTests(BusinessTestCase):
         self.assertEqual([row.message for row in rows], [row.message for row in original_rows])
         recalled = {item['message_id']: item for item in
             (await memory.read(self.session, [peer.db_id, own.db_id]))['messages']}
-        self.assertEqual(recalled[own.db_id]['text'], own_text)
-        self.assertEqual(recalled[own.db_id]['actor_id'], 'telegram:user:999')
+        self.assertEqual(recalled[own.db_id]['fragments'], [{'offset': 0, 'text': own_text}])
+        self.assertEqual(recalled[own.db_id]['speaker']['id'], 'telegram:user:999')
         self.assertEqual(recalled[own.db_id]['reply_to_source_id'], '81')
         self.assertEqual(recalled[own.db_id]['sent_at'], '2026-01-02T03:04:05+00:00')
         self.assertEqual(recalled[own.db_id]['topic_id'], '77')
-        self.assertEqual(recalled[peer.db_id]['actor_id'], 'telegram:user:888')
+        self.assertEqual(recalled[peer.db_id]['speaker']['id'], 'telegram:user:888')
 
         settings.tool_history_mode = ToolHistoryMode.NATIVE_SAME_PROVIDER
         await restarted_store.save_session(self.session, settings)
@@ -353,7 +357,8 @@ class MemoryWorkflowTests(BusinessTestCase):
     async def test_invalid_compaction_output_preserves_original_messages(self):
         stored = await self.runtime.ingest_user_message(session_id=self.session, incoming_message=ConversationMessage.user_text("must survive"))
         self.provider.responses = [ProviderResponse(final_text='{"scope":"incomplete"}')]
-        candidate = await self.runtime._make_episode_block_candidate(self.provider, await self.settings(), [stored.message], [stored], [])
+        candidate = await self.runtime._make_episode_block_candidate(self.provider, await self.settings(),
+            [stored.message], [stored], [], session_id=self.session)
         self.assertIsNone(candidate)
         self.assertEqual(len(await self.store.list_uncompacted_messages(self.session)), 1)
         self.assertEqual(await self.store.list_memory_blocks(self.session), [])
@@ -362,7 +367,8 @@ class MemoryWorkflowTests(BusinessTestCase):
         stored = await self.runtime.ingest_user_message(session_id=self.session, incoming_message=ConversationMessage.user_text("must survive"))
         self.provider.responses = [TimeoutError("model unavailable")]
         with self.assertRaises(CompactionModelRequestFailed):
-            await self.runtime._make_episode_block_candidate(self.provider, await self.settings(), [stored.message], [stored], [])
+            await self.runtime._make_episode_block_candidate(self.provider, await self.settings(),
+                [stored.message], [stored], [], session_id=self.session)
         self.assertEqual(len(await self.store.list_uncompacted_messages(self.session)), 1)
         self.assertEqual(await self.store.list_memory_blocks(self.session), [])
 

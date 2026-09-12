@@ -123,6 +123,12 @@ class TelegramIntakeTests(BusinessTestCase):
         self.assertEqual(rows[0]['revision'], 1)
         self.assertEqual(rows[0]['body'].count('[Message metadata:'), 1)
         self.assertEqual(rows[0]['body'].count('Plain text with stable metadata.'), 1)
+        original = (await self.store.list_canonical_messages(self.session))[0].message
+        self.assertEqual([part.origin for part in original.parts], ['provenance', None])
+        self.assertEqual(original.metadata['actor_id'], 'telegram:user:7')
+        self.assertEqual(original.metadata['actor_name'], 'Alex')
+        self.assertEqual(original.metadata['source_message_id'], '1')
+        self.assertEqual(original.parts[1].text, 'Plain text with stable metadata.')
         self.app._promote_candidate_after_delay.assert_awaited_once()
         candidate = self.app._promote_candidate_after_delay.await_args.args[2]
         self.assertEqual(candidate.stored_message_id, rows[0]['message_id'])
@@ -130,6 +136,15 @@ class TelegramIntakeTests(BusinessTestCase):
         self.assertEqual(len([row async for row in audit_records(self.store, self.session)]), 1,
                          'Telegram redelivery must not create a second original revision')
         self.app._ensure_reply_worker.assert_awaited_once()
+
+    async def test_metadata_option_off_preserves_literal_user_metadata_text_and_identity(self):
+        await self.settings(metadata_injection_mode='off')
+        text = '[Message metadata: this is what I typed, not an application header]'
+        await self.ingest(self.update(text), reply=False)
+        original = (await self.store.list_canonical_messages(self.session))[0].message
+        self.assertEqual([(part.text, part.origin) for part in original.parts], [(text, None)])
+        self.assertEqual(original.metadata['actor_id'], 'telegram:user:7')
+        self.assertEqual(original.metadata['source_message_id'], '1')
 
     async def test_unrelated_actor_edit_between_scope_capture_and_initial_save_does_not_drop_new_input(self):
         await self.ingest(self.update('Alice original.', source_id=1, actor=7), reply=False)
@@ -244,4 +259,9 @@ class TelegramIntakeTests(BusinessTestCase):
         self.assertIn('Attachment reference', rows[-1]['body'])
         self.assertIn('media content unavailable', rows[-1]['body'])
         self.assertEqual(rows[-1]['metadata']['telegram_attachments'][0]['file_id'], 'synthetic-photo-file')
+        original = (await self.store.list_canonical_messages(self.session))[0].message
+        self.assertEqual([part.origin for part in original.parts
+                          if part.text and part.text.startswith('[Attachment download failed:')], ['auto_note'])
+        self.assertEqual([part.origin for part in original.parts
+                          if part.text and part.text.startswith('[Message metadata:')], ['provenance'])
         self.app._promote_candidate_after_delay.assert_awaited_once()

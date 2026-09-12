@@ -603,6 +603,35 @@ class PostgresStore:
         return await self._recent(session_id, _limit(limit, self.config.recent_page_size),
             before_message_id=before_message_id, current_context=current_context)
 
+    async def list_recent_participant_messages(self, session_id: str, *,
+            expected_scope: Mapping[str, Any] | None = None) -> list[ConversationMessage]:
+        """Recent user-original identity metadata, including compacted sources.
+
+        The existing recent-page setting bounds the original-message window.
+        Tool/assistant traffic and synthetic controls do not consume that window;
+        the participant collector owns identity and direct-reply eligibility.
+        """
+        async with self.pool.connection() as conn:
+            scope = await (await conn.execute('SELECT generation,context_id,revision FROM sessions '
+                'WHERE session_id=%s FOR SHARE', (session_id,))).fetchone()
+            if scope is None:
+                return []
+            self._check_scope(scope, expected_scope)
+            rows = await (await conn.execute('''SELECT jsonb_build_object(
+                    'actor_id',m.actor_id,'actor_kind',m.actor_kind,
+                    'source_chat_id',m.source_chat_id,'reply_to_source_id',m.reply_to_source_id,
+                    'reply_to_source_chat_id',r.metadata->'reply_to_source_chat_id',
+                    'reply_to_actor',r.metadata->'reply_to_actor') AS metadata
+                FROM messages m JOIN message_revisions r
+                    ON (r.message_id,r.revision)=(m.id,m.source_revision)
+                WHERE m.session_id=%s AND m.generation=%s AND m.context_id=%s
+                    AND NOT m.hidden AND NOT m.deleted AND m.role='user'
+                    AND COALESCE(r.metadata->>'synthetic_role','')=''
+                ORDER BY m.id DESC LIMIT %s''',
+                (session_id, scope['generation'], scope['context_id'],
+                 _limit(None, self.config.recent_page_size)))).fetchall()
+        return [ConversationMessage(MessageRole.USER, parts=[], metadata=row['metadata']) for row in rows]
+
     async def list_canonical_messages(self, session_id: str, *, after_message_id: int = 0,
                                       limit: int | None = None, expected_scope: Mapping[str, Any] | None = None) -> list[StoredConversationMessage]:
         async with self.pool.connection() as conn:
@@ -1012,7 +1041,8 @@ class PostgresStore:
 
     @staticmethod
     def _search_result(row: Mapping[str, Any]) -> dict[str, Any]:
-        return {'id': row['id'], 'text': row['body'], 'source_ids': [row['id']],
+        return {'id': row['id'], 'text': row['body'], 'source_ids': [row['id']], 'parts': row.get('parts', []),
+            'fragments': [{'offset': 0, 'text': row['body']}], 'total_characters': len(row['body']),
             'kind': 'message', 'role': row['role'], 'generation': row['generation'],
             'actor_id': row['actor_id'], 'actor_name': row['actor_name'], 'actor_kind': row['actor_kind'],
             'source': row['source'], 'source_chat_id': row['source_chat_id'], 'source_message_id': row['source_message_id'],
@@ -1277,14 +1307,18 @@ class PostgresStore:
         span_map: dict[int, list[dict]] = {}
         for span in candidate['spans']:
             span_map.setdefault(span['message_id'], []).append(span)
-        texts = []
+        texts, attributed_sources = [], []
         for row in sources:
             body = row['body']
+            source = PostgresStore._search_result(row)
             if span_map:
-                body = '\n'.join(body[span['start']:span['end']] for span in span_map.get(row['id'], []))
+                source['fragments'] = [{'offset': span['start'], 'text': body[span['start']:span['end']]}
+                    for span in span_map.get(row['id'], [])]
+                body = '\n'.join(fragment['text'] for fragment in source['fragments'])
             texts.append(f"[{row['sent_at'].isoformat()} {row['actor_id'] or 'unknown'} {row['actor_name'] or ''}] {body}")
+            attributed_sources.append(source)
         return {**candidate, 'kind': 'excerpt', 'text': '\n'.join(texts),
-            'sources': [PostgresStore._search_result(row) for row in sources]}
+            'sources': attributed_sources}
 
     async def get_excerpt(self, session_id: str, excerpt_id: int) -> dict[str, Any] | None:
         async with self.pool.connection() as conn:

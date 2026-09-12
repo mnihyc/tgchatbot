@@ -53,57 +53,80 @@ class MemoryEvidenceIdentityTests(BusinessTestCase):
         return result
 
     async def search(self, query):
-        return (await self.tool('memory_search', {'query': query}))['results']
+        return await self.tool('memory_search', {'query': query})
 
     async def test_full_original_matches_once_and_keeps_semantic_citation_readable(self):
         source = await self.original('The cobalt key is in the kitchen drawer. 钥匙🔑', 1)
         span = self.full_span(source)
         excerpt = await self.index([source], [span])
-        rows = await self.search('cobalt')
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]['id'], excerpt['id'])
-        self.assertEqual(rows[0]['kind'], 'excerpt')
-        self.assertEqual(rows[0]['source_ids'], [source.db_id])
-        self.assertEqual(rows[0]['spans'], [span])
-        self.assertEqual(rows[0]['sources'][0]['actor_id'], 'telegram:user:101')
-        read = await self.tool('memory_read', {'message_ids': rows[0]['source_ids']})
-        self.assertEqual(read['messages'][0]['text'], message_body(source.message))
+        result = await self.search('cobalt')
+        self.assertEqual(result['matches'], [{'message_ids': [source.db_id]}])
+        self.assertEqual(excerpt['spans'], [span])
+        self.assertEqual(len(result['messages']), 1)
+        self.assertEqual(result['messages'][0]['speaker']['id'], 'telegram:user:101')
+        self.assertEqual(result['messages'][0]['fragments'], [{'offset': 0, 'text': message_body(source.message)}])
+        read = await self.tool('memory_read', result['matches'][0])
+        self.assertEqual(read['messages'], result['messages'])
 
     async def test_partial_match_does_not_replace_complete_original_with_its_later_correction(self):
         text = 'The cobalt key is in the drawer. Correction: it is now in the blue bag.'
         source = await self.original(text, 1)
         span = {'message_id': source.db_id, 'start': 0, 'end': len('The cobalt key is in the drawer.')}
         await self.index([source], [span])
-        rows = await self.search('cobalt')
+        rows = await self.store.search_excerpts(self.session, 'cobalt', embedding=vector(),
+            model=self.embeddings.space_id)
         self.assertEqual(len(rows), 2)
         passage = next(row for row in rows if row.get('spans'))
         original = next(row for row in rows if row['kind'] == 'message')
         self.assertNotIn('Correction:', passage['text'])
         self.assertEqual(original['text'], text)
         self.assertEqual(original['source_ids'], passage['source_ids'])
+        result = await self.search('cobalt')
+        self.assertEqual(result['matches'], [{'message_ids': [source.db_id]}] * 2)
+        self.assertEqual(len(result['messages']), 1)
+        self.assertEqual(result['messages'][0]['fragments'], [{'offset': 0, 'text': text}])
+        self.assertNotIn('partial', result['messages'][0])
 
     async def test_disjoint_passages_in_one_original_remain_separately_retrievable(self):
-        text = 'The key used to be in the drawer. It is now in the blue bag.'
+        first = '钥匙🔑 used to be in the drawer. '
+        unseen = 'Unretrieved interlude. ' * 100
+        last = 'It is now in the blue bag. 蓝色包里。'
+        text = first + unseen + last
         source = await self.original(text, 1)
-        boundary = text.index('It is now')
         spans = [{'message_id': source.db_id, 'start': start, 'end': end}
-                 for start, end in ((0, boundary), (boundary, len(text)))]
+                 for start, end in ((0, len(first)), (len(first + unseen), len(text)))]
         for span in spans:
             await self.index([source], [span])
-        rows = await self.search('unmatchedlexicalcontrol')
+        rows = await self.store.search_excerpts(self.session, 'unmatchedlexicalcontrol',
+            embedding=vector(), model=self.embeddings.space_id)
         self.assertEqual(len(rows), 2)
         self.assertCountEqual([row['spans'] for row in rows], [[span] for span in spans])
+        result = await self.search('unmatchedlexicalcontrol')
+        self.assertEqual(result['matches'], [{'message_ids': [source.db_id]}] * 2)
+        self.assertEqual(len(result['messages']), 1)
+        record = result['messages'][0]
+        self.assertEqual(record['fragments'], [{'offset': 0, 'text': first},
+            {'offset': len(first + unseen), 'text': last}])
+        self.assertTrue(record['partial'])
+        self.assertEqual(record['total_characters'], len(text))
+        read = await self.tool('memory_read', {'message_ids': [source.db_id]})
+        self.assertEqual(read['messages'][0]['fragments'], [{'offset': 0, 'text': text}])
+        self.assertEqual(read['messages'][0]['speaker'], record['speaker'])
+        self.assertEqual(read['messages'][0]['sent_at'], record['sent_at'])
 
     async def test_identical_words_keep_people_and_repeated_events_separate(self):
         sources = [await self.original('I prefer cobalt stationery.', number, actor)
                    for number, actor in ((1, 101), (2, 102), (3, 101))]
         for source in sources:
             await self.index([source], [self.full_span(source)])
-        rows = await self.search('cobalt')
+        result = await self.search('cobalt')
+        rows = result['matches']
         self.assertEqual(len(rows), 3)
-        self.assertEqual({tuple(row['source_ids']) for row in rows}, {(source.db_id,) for source in sources})
-        read = await self.tool('memory_read', {'message_ids': [row['source_ids'][0] for row in rows]})
-        identities = {row['message_id']: row['actor_id'] for row in read['messages']}
+        self.assertEqual({tuple(row['message_ids']) for row in rows}, {(source.db_id,) for source in sources})
+        self.assertEqual([row['message_id'] for row in result['messages']], [source.db_id for source in sources])
+        read = await self.tool('memory_read', {'message_ids': [source.db_id for source in sources]})
+        self.assertEqual(read['messages'], result['messages'])
+        identities = {row['message_id']: row['speaker']['id'] for row in read['messages']}
         self.assertEqual(identities, {sources[0].db_id: 'telegram:user:101',
             sources[1].db_id: 'telegram:user:102', sources[2].db_id: 'telegram:user:101'})
 
@@ -111,13 +134,15 @@ class MemoryEvidenceIdentityTests(BusinessTestCase):
         question = await self.original('Where did the cobalt key go?', 1)
         answer = await self.original('It moved to the blue bag.', 2, actor=102)
         await self.index([question, answer], [self.full_span(question), self.full_span(answer)])
-        rows = await self.search('cobalt')
+        result = await self.search('cobalt')
+        rows = result['matches']
         self.assertEqual(len(rows), 2)
-        context = next(row for row in rows if len(row['source_ids']) == 2)
-        self.assertIn('Where did the cobalt key go?', context['text'])
-        self.assertIn('It moved to the blue bag.', context['text'])
-        self.assertEqual([row['actor_id'] for row in context['sources']], ['telegram:user:101', 'telegram:user:102'])
-        self.assertTrue(any(row['source_ids'] == [question.db_id] for row in rows))
+        self.assertIn({'message_ids': [question.db_id, answer.db_id]}, rows)
+        self.assertIn({'message_ids': [question.db_id]}, rows)
+        self.assertEqual([row['message_id'] for row in result['messages']], [question.db_id, answer.db_id])
+        self.assertEqual([row['fragments'] for row in result['messages']],
+            [[{'offset': 0, 'text': message_body(source.message)}] for source in (question, answer)])
+        self.assertEqual([row['speaker']['id'] for row in result['messages']], ['telegram:user:101', 'telegram:user:102'])
 
     async def test_duplicate_semantic_representation_cannot_outvote_independent_lexical_support(self):
         repeated = await self.original('The key is in a drawer.', 1)
@@ -125,25 +150,32 @@ class MemoryEvidenceIdentityTests(BusinessTestCase):
         await self.index([repeated])
         await self.index([repeated], [self.full_span(repeated)])
         await self.index([supported], [self.full_span(supported)], similarity=.8)
-        rows = await self.search('cobalt')
+        rows = (await self.search('cobalt'))['matches']
         self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0]['source_ids'], [supported.db_id],
+        self.assertEqual(rows[0]['message_ids'], [supported.db_id],
             'Two representations from one channel must not outrank evidence supported by both channels')
-        self.assertEqual(rows[1]['source_ids'], [repeated.db_id])
+        self.assertEqual(rows[1]['message_ids'], [repeated.db_id])
 
     async def test_edit_and_reset_visibility_stay_owned_by_originals(self):
         source = await self.original('The cobalt key is in the drawer.', 1)
         await self.index([source], [self.full_span(source)])
         await self.store.reset_context(self.session)
-        self.assertEqual(len(await self.search('cobalt')), 1)
+        self.assertEqual(len((await self.search('cobalt'))['matches']), 1)
         revised = await self.original('Correction: the cobalt key is in the blue bag.', 1)
         self.assertEqual(source.db_id, revised.db_id)
-        rows = await self.search('cobalt')
+        rows = await self.store.search_excerpts(self.session, 'cobalt', embedding=vector(),
+            model=self.embeddings.space_id)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]['kind'], 'message', 'An old vector cannot describe a revised original')
         self.assertEqual(rows[0]['source_revision'], 2)
+        result = await self.search('cobalt')
+        self.assertEqual(result['matches'], [{'message_ids': [source.db_id]}])
+        self.assertEqual(result['messages'][0]['fragments'],
+            [{'offset': 0, 'text': message_body(revised.message)}])
         await self.store.reset_full(self.session, self.config.default_session_settings())
-        self.assertEqual(await self.search('cobalt'), [])
+        result = await self.search('cobalt')
+        self.assertEqual(result['matches'], [])
+        self.assertEqual(result['messages'], [])
         read = await self.tool('memory_read', {'message_ids': [source.db_id]})
         self.assertEqual(read['messages'], [])
         self.assertEqual(read['unavailable_ids'], [source.db_id])

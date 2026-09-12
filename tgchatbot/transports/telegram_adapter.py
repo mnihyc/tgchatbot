@@ -1335,7 +1335,7 @@ class TelegramBotApp:
                 nickname = str(canonical_metadata['actor_name']).replace('"', "'")
                 auto_note_parts.append(MessagePart(kind=PartKind.TEXT,
                     text=f'[Message metadata: username={username} nickname="{nickname}" time={local_time}]',
-                    remote_sync=False, origin='auto_note'))
+                    remote_sync=False, origin='provenance'))
 
             # Persist transport facts before downloads, link fetches or SSH. A
             # fixed field allowlist avoids copying Telegram's nested media graph;

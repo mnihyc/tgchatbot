@@ -88,8 +88,10 @@ class LiveConversationState:
     provider_history_token_cache: dict[tuple[str, str, str, tuple[int, ...], int], int] = field(default_factory=dict)
     provider_history_dirty: bool = True
 
-    def active_participant_ids(self, trigger: ConversationMessage | None = None) -> list[str]:
-        """Use retained speakers and direct reply identities, without archive reads."""
+    @staticmethod
+    def active_participant_ids(messages: list[ConversationMessage],
+                               trigger: ConversationMessage | None = None) -> list[str]:
+        """Prioritize the trigger, then supplied original speakers and direct replies."""
         participants: dict[str, None] = {}
         reply_participants: dict[str, None] = {}
 
@@ -118,8 +120,8 @@ class LiveConversationState:
 
         if trigger is not None:
             collect(trigger)
-        for item in reversed(self.raw_messages):
-            collect(item.message)
+        for message in messages:
+            collect(message)
         for actor in reply_participants:
             participants.setdefault(actor, None)
         return list(participants)

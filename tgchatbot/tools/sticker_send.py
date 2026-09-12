@@ -247,12 +247,12 @@ class StickerSendSelectedTool:
         self.catalog = catalog
         self.spec = ToolSpec(
             name='sticker_send_selected',
-            description='Select a known sticker for delivery at the requested timing. A queued selection is not confirmed delivery; inspect the actual receipt.',
+            description='Select a known sticker for delivery. after_final dispatches when the turn ends, even with no final text; no second selection is needed. Queued is not confirmed delivery; inspect the receipt.',
             parameters_schema={
                 'type': 'object',
                 'properties': {
                     'selected_sticker_id': _param('string', 'Exact sticker_id returned by sticker_query.'),
-                    'delivery_timing': _param('string', 'Whether to send the sticker immediately now or after the final text.', enum=['send_now', 'after_final', 'before_final']),
+                    'delivery_timing': _param('string', 'send_now and before_final send immediately; after_final dispatches at turn completion, with or without text.', enum=['send_now', 'after_final', 'before_final']),
                 },
                 'required': ['selected_sticker_id'],
                 'additionalProperties': False,
@@ -278,6 +278,9 @@ class StickerSendSelectedTool:
                 'ok': True, 'status': 'queued', 'sticker_id': entry.sticker_id,
                 'catalog_revision': entry.revision_id, 'delivery_timing': timing.value,
                 'caption': entry.asset.card.get('caption', ''), 'action': entry.asset.card.get('action', ''),
+                **({'guidance': 'When ready, end the turn to dispatch this selection; final text may be empty. '
+                    'Do not select it again just to dispatch it. Queued is not confirmed delivery.'}
+                   if timing == StickerTiming.AFTER_FINAL else {}),
             }, stickers=[sticker])
         except Exception as exc:
             logger.exception('sticker_send_selected failed')

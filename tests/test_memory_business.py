@@ -52,10 +52,10 @@ class MemoryBusinessTests(BusinessTestCase):
         local_result = (await tool.runner.run(local, default_context)).output
         aware_result = (await tool.runner.run(aware, default_context)).output
         aware_in_utc = (await tool.runner.run(aware, utc_context)).output
-        self.assertTrue(local_result['results'])
+        self.assertTrue(local_result['matches'])
         self.assertEqual(local_result, aware_result)
         self.assertEqual(local_result, aware_in_utc)
-        self.assertEqual((await tool.runner.run(local, utc_context)).output['results'], [])
+        self.assertEqual((await tool.runner.run(local, utc_context)).output['matches'], [])
         stored = (await self.store.read_messages(self.session, [source.db_id]))[0]
         self.assertEqual(stored.message.metadata['sent_at'], '2026-01-02T03:04:05+00:00')
 
@@ -195,11 +195,12 @@ class MemoryBusinessTests(BusinessTestCase):
         observation = next(item for item in stored if item.message.name == 'shell_exec')
         self.assertEqual(len(controls), 9)
         found = await memory.search(self.session, 'cardamom')
-        self.assertEqual({row['id'] for row in found['results']}, {source.db_id, observation.db_id})
-        self.assertEqual(next(row['text'] for row in found['results'] if row['id'] == source.db_id), 'I prefer cardamom tea.')
+        self.assertEqual({row['message_ids'][0] for row in found['matches']}, {source.db_id, observation.db_id})
+        self.assertEqual(next(row['fragments'] for row in found['messages'] if row['message_id'] == source.db_id),
+            [{'offset': 0, 'text': 'I prefer cardamom tea.'}])
         read = await memory.read(self.session, [item.db_id for item in controls])
-        self.assertEqual({item['message_id']: item['text'] for item in read['messages']},
-                         {item.db_id: original_text(item.message) for item in controls})
+        self.assertEqual({item['message_id']: item['fragments'] for item in read['messages']},
+                         {item.db_id: [{'offset': 0, 'text': original_text(item.message)}] for item in controls})
         profile = (await memory.fetch_profiles(self.session, ['telegram:user:7']))['profiles'][0]
         self.assertEqual(profile['identity']['last_message']['message_id'], source.db_id)
         self.assertEqual(profile['facts'][0]['source_ids'], [source.db_id])
@@ -319,21 +320,27 @@ class MemoryBusinessTests(BusinessTestCase):
         sources = [await self.ingest('saffron ' + ('x' * 13000 if number == 0 else str(number)),
                                     source_id=number + 1) for number in range(25)]
         result = await memory.search(self.session, 'saffron')
-        self.assertEqual(len(result['results']), 25)
-        long_result = next(row for row in result['results'] if sources[0].db_id in row['source_ids'])
-        self.assertEqual(len(long_result['text']), 13008)
-        self.assertFalse(long_result['truncated'])
+        self.assertEqual(len(result['matches']), 25)
+        long_result = next(row for row in result['messages'] if row['message_id'] == sources[0].db_id)
+        self.assertEqual(long_result['fragments'], [{'offset': 0, 'text': 'saffron ' + 'x' * 13000}])
+        self.assertNotIn('partial', long_result)
+        self.assertFalse(any(row.get('truncated') for row in result['matches']))
         read = await memory.read(self.session, [source.db_id for source in sources])
         self.assertEqual(len(read['messages']), 25)
         self.assertEqual(read['omitted_ids'], [])
-        self.assertEqual(read['messages'][0]['text'], 'saffron ' + 'x' * 13000)
-        self.assertIsNone(read['messages'][0]['next_offset'])
+        self.assertEqual(read['messages'][0]['fragments'], [{'offset': 0, 'text': 'saffron ' + 'x' * 13000}])
+        self.assertNotIn('next_offset', read['messages'][0])
         # Lowering presentation limits leaves the durable original pageable.
         small = MemoryService(self.store, self.embeddings,
             config=replace(memory.config, read_chars=30, response_chars=30))
         first = (await small.read(self.session, [sources[0].db_id]))['messages'][0]
         second = (await small.read(self.session, [sources[0].db_id], offset=first['next_offset']))['messages'][0]
-        self.assertEqual(first['text'] + second['text'], ('saffron ' + 'x' * 13000)[:60])
+        self.assertEqual(first['fragments'], [{'offset': 0, 'text': ('saffron ' + 'x' * 13000)[:30]}])
+        self.assertEqual(second['fragments'], [{'offset': 30, 'text': ('saffron ' + 'x' * 13000)[30:60]}])
+        self.assertEqual((first['next_offset'], second['next_offset']), (30, 60))
+        self.assertTrue(first['partial'])
+        self.assertTrue(second['partial'])
+        self.assertEqual((first['total_characters'], second['total_characters']), (13008, 13008))
 
     async def test_every_uncompacted_message_survives_cache_eviction_and_reaches_generation(self):
         with patch.dict(os.environ, {'MEMORY_CACHED_SESSIONS': '1'}):
@@ -468,11 +475,12 @@ class MemoryBusinessTests(BusinessTestCase):
             await self.store.save_profile_fact(self.session, subject_actor_id=subject,
                 asserted_by=subject, claim=claim, source_ids=[source.db_id])
         result = await self.memory.search(self.session, "coffee")
-        ids = {source for row in result["results"] for source in row["source_ids"]}
+        ids = {source for row in result["matches"] for source in row["message_ids"]}
         self.assertEqual(ids, {alice.db_id, bob.db_id})
         evidence = await self.memory.read(self.session, [alice.db_id, bob.db_id])
-        self.assertEqual({row["actor_id"] for row in evidence["messages"]}, {"telegram:user:7", "telegram:user:8"})
-        self.assertEqual({row["actor_name"] for row in evidence["messages"]}, {"Alex"})
+        self.assertEqual({row["speaker"]["id"] for row in evidence["messages"]}, {"telegram:user:7", "telegram:user:8"})
+        self.assertEqual({row["speaker"]["name"] for row in evidence["messages"]}, {"Alex"})
+        self.assertEqual(evidence['messages'], result['messages'])
         payload = await self.memory.fetch_profiles(self.session, ['telegram:user:8'], include_agent_preferences=False)
         self.assertEqual([(payload['profiles'][0]['actor_id'], fact['claim']) for fact in payload['profiles'][0]['facts']],
                          [("telegram:user:8", "Avoids coffee")])
@@ -490,8 +498,9 @@ class MemoryBusinessTests(BusinessTestCase):
         self.assertNotEqual(new_scope["context_id"], old_scope["context_id"])
         self.assertEqual(await self.store.list_messages(self.session), [])
         self.assertEqual((await self.settings()).system_prompt, "Keep this voice.")
-        self.assertTrue((await self.memory.search(self.session, "jasmine"))["results"])
-        self.assertEqual((await self.memory.read(self.session, [source.db_id]))["messages"][0]["text"], "I prefer jasmine tea.")
+        self.assertTrue((await self.memory.search(self.session, "jasmine"))["matches"])
+        self.assertEqual((await self.memory.read(self.session, [source.db_id]))["messages"][0]["fragments"],
+            [{'offset': 0, 'text': 'I prefer jasmine tea.'}])
         self.assertEqual(len(await self.store.get_profile(self.session, "telegram:user:7")), 1)
         with self.assertRaises(StaleScopeError):
             await self.memory.read(self.session, [source.db_id], scope=old_scope)
@@ -503,7 +512,7 @@ class MemoryBusinessTests(BusinessTestCase):
         await self.store.create_excerpt(self.session, [source.db_id])
         await self.store.reset_full(self.session, self.config.default_session_settings())
         self.runtime.invalidate_session(self.session)
-        self.assertEqual((await self.memory.search(self.session, "jasmine"))["results"], [])
+        self.assertEqual((await self.memory.search(self.session, "jasmine"))["matches"], [])
         self.assertEqual(await self.store.get_profile(self.session, "telegram:user:7"), [])
         read = await self.memory.read(self.session, [source.db_id])
         self.assertEqual(read["messages"], [])
@@ -513,7 +522,8 @@ class MemoryBusinessTests(BusinessTestCase):
             count = (await (await conn.execute("SELECT count(*) AS n FROM messages WHERE id=%s", (source.db_id,))).fetchone())["n"]
         self.assertEqual(count, 1)
         fresh = await self.ingest("I now prefer coffee.", source_id=2)
-        self.assertEqual((await self.memory.read(self.session, [fresh.db_id]))["messages"][0]["text"], "I now prefer coffee.")
+        self.assertEqual((await self.memory.read(self.session, [fresh.db_id]))["messages"][0]["fragments"],
+            [{'offset': 0, 'text': 'I now prefer coffee.'}])
 
     async def test_deleted_evidence_invalidates_profile_and_cannot_be_read_in_another_chat(self):
         source = await self.ingest("I prefer jasmine tea.")
@@ -522,7 +532,7 @@ class MemoryBusinessTests(BusinessTestCase):
         foreign = await self.memory.read("telegram:200", [source.db_id])
         self.assertEqual(foreign["messages"], [])
         await self.store.delete_message_ids(self.session, [source.db_id])
-        self.assertEqual((await self.memory.search(self.session, "jasmine"))["results"], [])
+        self.assertEqual((await self.memory.search(self.session, "jasmine"))["matches"], [])
         self.assertEqual(await self.store.get_profile(self.session, "telegram:user:7"), [])
         self.assertEqual((await self.memory.read(self.session, [source.db_id]))["unavailable_ids"], [source.db_id])
 
@@ -542,7 +552,7 @@ class MemoryBusinessTests(BusinessTestCase):
         self.tools.list_tools.assert_not_called()
         self.tools.runner.run.assert_not_awaited()
         output = self.provider.requests[1]["extra_input_items"][-1]["output"]
-        self.assertEqual(output["messages"][0]["actor_id"], "telegram:user:7")
+        self.assertEqual(output["messages"][0]["speaker"]["id"], "telegram:user:7")
 
     async def test_final_round_cannot_execute_an_extra_memory_read(self):
         await self.settings(mode=ChatMode.CHAT, max_interaction_rounds=1)
@@ -585,10 +595,11 @@ class MemoryBusinessTests(BusinessTestCase):
         await self.runtime.run_turn_from_stored(session_id=self.session,
             user_display_name='Alex', trigger_message_id=source.db_id)
         payload = self.provider.requests[1]['extra_input_items'][-1]['output']
-        evidence = next(row for row in payload['results'] if source.db_id in row['source_ids'])
-        self.assertGreater(TokenEstimator.estimate_text(evidence['text']), 4096)
-        self.assertEqual(evidence['text'], original)
-        self.assertFalse(evidence['truncated'])
+        evidence = next(row for row in payload['messages'] if row['message_id'] == source.db_id)
+        self.assertGreater(TokenEstimator.estimate_text(evidence['fragments'][0]['text']), 4096)
+        self.assertEqual(evidence['fragments'], [{'offset': 0, 'text': original}])
+        self.assertNotIn('partial', evidence)
+        self.assertEqual(payload['matches'], [{'message_ids': [source.db_id]}])
 
     async def test_model_completion_started_before_reset_cannot_become_a_reply(self):
         await self.settings(mode=ChatMode.CHAT)
@@ -778,7 +789,8 @@ class MemoryBusinessTests(BusinessTestCase):
         self.assertEqual(block.structured_data["user_profile"], self.compaction_candidate(owned=True)["user_profile"])
         self.assertEqual([item.db_id for item in state.raw_messages], [latest.db_id])
         originals = await self.memory.read(self.session, [alice.db_id, bob.db_id])
-        self.assertEqual([item["text"] for item in originals["messages"]], ["I prefer coffee.", "I avoid coffee."])
+        self.assertEqual([item['fragments'] for item in originals['messages']],
+            [[{'offset': 0, 'text': text}] for text in ('I prefer coffee.', 'I avoid coffee.')])
 
     async def test_gemini_attribution_retry_commits_summary_without_mutating_original_history(self):
         settings = await self.settings(provider='gemini', model='gemini-3.8-flash',
@@ -854,18 +866,21 @@ class MemoryBusinessTests(BusinessTestCase):
             provider._client = client
             result = await self.runtime._make_episode_block_candidate(provider,
                 await self.settings(provider='gemini', model='gemini-3.8-flash'),
-                [source.message], [source], [])
+                [source.message], [source], [], session_id=self.session)
         self.assertEqual(result['actor_labels'], ['telegram:user:7'])
-        records = [part['text'] for content in captured[0]['contents'] for part in content['parts']
-            if part.get('text', '').startswith('Speaker:')]
+        records = []
+        for content in captured[0]['contents']:
+            for part in content['parts']:
+                try:
+                    record = json.loads(part.get('text', ''))
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict) and record.get('message_id') == source.db_id:
+                    records.append(record)
         self.assertEqual(len(records), 1)
-        speaker, quoted_body, source_details = records[0].split('\n', 2)
-        self.assertEqual(sum(line.startswith('Speaker:') for line in records[0].splitlines()), 1)
-        self.assertTrue(speaker.startswith('Speaker: telegram:user:7 ('))
-        self.assertEqual(json.loads(speaker.removeprefix('Speaker: telegram:user:7 (').removesuffix(')')),
-            display_name)
-        self.assertEqual(json.loads(quoted_body.removeprefix('Message: ')), original_text(source.message))
-        details = json.loads(source_details.removeprefix('Source: '))
+        details = records[0]
+        self.assertEqual(details['speaker'], {'id': 'telegram:user:7', 'name': display_name})
+        self.assertEqual(details['fragments'], [{'offset': 0, 'text': original_text(source.message)}])
         self.assertEqual(details['message_id'], source.db_id)
         self.assertEqual(details['source_message_id'], '1')
         for key, value in relationships.items():
@@ -879,7 +894,7 @@ class MemoryBusinessTests(BusinessTestCase):
         bob = await self.ingest("I avoid coffee.", "telegram:user:8", 2)
         self.provider.responses = [ProviderResponse(final_text=json.dumps(self.compaction_candidate(owned=False))) for _ in range(2)]
         candidate = await self.runtime._make_episode_block_candidate(self.provider, await self.settings(),
-            [alice.message, bob.message], [alice, bob], [])
+            [alice.message, bob.message], [alice, bob], [], session_id=self.session)
         self.assertIsNone(candidate)
         self.assertEqual(len(self.provider.requests), 2)
         self.assertEqual([item.db_id for item in await self.store.list_uncompacted_messages(self.session)], [alice.db_id, bob.db_id])

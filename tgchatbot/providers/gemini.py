@@ -359,6 +359,8 @@ class GeminiProvider:
         if not candidates:
             return ProviderResponse(usage=usage_info, raw=body)
         candidate = candidates[0] or {}
+        if candidate.get('finishReason') == 'MALFORMED_FUNCTION_CALL':
+            raise ValueError('Gemini could not generate a valid function call')
         content = candidate.get('content', {}) or {}
         parts = content.get('parts', []) or []
         text_parts: list[str] = []
