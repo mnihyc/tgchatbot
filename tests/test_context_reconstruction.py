@@ -5,17 +5,127 @@ import asyncio
 import json
 import httpx
 from dataclasses import replace
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from telegram.error import BadRequest
 
 from tests.business_helpers import BusinessTestCase, ScriptedProvider
 from tgchatbot.core.runtime import AgentRuntime
 from tgchatbot.domain.models import (ChatMode, ConversationMessage, MessagePart, MessageRole,
     OutboundArtifact, PartKind, ProviderResponse, ToolCall, ToolHistoryMode, ToolResult)
 from tgchatbot.storage.previews import PreviewCache
+from tgchatbot.tools.file_send import FileSendTool
+from tgchatbot.transports.artifact_delivery import deliver_artifact
 
 
 class ContextReconstructionTests(BusinessTestCase):
+    async def test_same_name_file_outcomes_keep_exact_paths_through_compaction_restart_and_provider_change(self):
+        await self.file_outcome_history(partial_preparation=False)
+
+    async def test_unavailable_same_name_file_keeps_requested_path_through_compaction_restart_and_provider_change(self):
+        await self.file_outcome_history(partial_preparation=True)
+
+    async def file_outcome_history(self, *, partial_preparation):
+        settings = await self.settings(mode=ChatMode.ASSIST, compact_trigger_tokens=100000,
+            tool_history_mode=ToolHistoryMode.NATIVE_SAME_PROVIDER)
+        prefix = 'shared-project/' * 20
+        paths = [prefix + day + '/report.txt' for day in ('2026-04-29', '2026-04-30')]
+        originals, artifacts = [], []
+        for number, workspace_path in enumerate(paths):
+            original, transfer = self.path / f'original-{number}.txt', self.path / f'transfer-{number}.txt'
+            original.write_text(f'Original report {number}')
+            originals.append(original)
+            if not partial_preparation or number == 1:
+                transfer.write_bytes(original.read_bytes())
+                artifacts.append(OutboundArtifact(transfer, 'report.txt', temporary=True,
+                    workspace_path=workspace_path))
+        remote = SimpleNamespace(fetch_files=AsyncMock(return_value=artifacts))
+        sender = FileSendTool(self.config, remote)
+        self.tools.spec = sender.spec
+        self.tools.list_tools.return_value = [sender.spec]
+        arguments = {'paths': paths}
+        self.provider.responses = [ProviderResponse(tool_calls=[ToolCall('file_send', 'reports', arguments)],
+            continuation_items=[{'type': 'function_call', 'call_id': 'reports', 'name': 'file_send',
+                'arguments': json.dumps(arguments)}]), ProviderResponse(final_text='The reports are prepared.')]
+        result = await self.runtime.run_turn(session_id=self.session, user_display_name='Participant',
+            incoming_message=ConversationMessage.user_text('Send both dated reports.'))
+        deliveries = [SimpleNamespace(message_id=77)]
+        if not partial_preparation:
+            deliveries.insert(0, BadRequest('This transfer was rejected'))
+        bot = SimpleNamespace(send_document=AsyncMock(side_effect=deliveries))
+        receipts = []
+        with (nullcontext() if partial_preparation else
+                self.assertLogs('tgchatbot.transports.artifact_delivery', level='ERROR')):
+            for artifact in result.artifacts:
+                receipt = await deliver_artifact(bot, chat_id=100, artifact=artifact)
+                receipts.append(receipt)
+                await self.runtime.record_tool_observation(session_id=self.session, name='file_send',
+                    phase='delivery', payload=receipt, expected_scope=result.scope)
+        expected_deliveries = [(paths[1], 'sent')] if partial_preparation else [(paths[0], 'failed'), (paths[1], 'sent')]
+        self.assertEqual([(item['workspace_path'], item['delivery_state']) for item in receipts], expected_deliveries)
+        self.assertTrue(all(not artifact.path.exists() for artifact in artifacts))
+        self.assertEqual([original.read_text() for original in originals], ['Original report 0', 'Original report 1'])
+        state = await self.runtime._get_live_state(self.session)
+        original_rows = await self.store.read_messages(self.session, [row.db_id for row in state.raw_messages])
+        prepared = next(row.message.metadata['tool_payload']['output'] for row in original_rows
+            if row.message.metadata.get('tool_phase') == 'result')
+        self.assertEqual([item['workspace_path'] for item in prepared['prepared_files']],
+            [paths[1]] if partial_preparation else paths)
+        expected_records = [arguments, prepared, *receipts]
+        requests = []
+
+        def assert_file_records(request):
+            records = []
+            decoder = json.JSONDecoder()
+            for message in request['messages']:
+                for part in message.parts:
+                    text = part.text or ''
+                    for index, character in enumerate(text):
+                        if character == '{':
+                            try:
+                                record, _end = decoder.raw_decode(text[index:])
+                                records.append(record)
+                            except json.JSONDecodeError:
+                                pass
+            for record in expected_records:
+                self.assertIn(record, records,
+                    'The model must receive exact file identities with their separate preparation/delivery outcomes.')
+
+        async def summarize(**request):
+            requests.append(request)
+            assert_file_records(request)
+            data = {key: [] for key in request['response_schema']['properties']}
+            data.update(scope='Sending dated reports', interaction_mode='task_execution',
+                artifacts=paths, results_or_takeaways=[f'Failed: {paths[0]}', f'Sent: {paths[1]}'])
+            return ProviderResponse(final_text=json.dumps(data))
+
+        with patch.object(self.provider, 'generate', side_effect=summarize):
+            candidate = await self.runtime._make_toolspan_block_candidate(self.provider, settings,
+                state.raw_messages, session_id=self.session)
+        self.assertEqual(candidate['data']['artifacts'], paths)
+        changed = await self.settings(provider='gemini', model='fixture-next-model')
+        await self.store.close()
+        restored_store = await self.new_store()
+        restored_cache = PreviewCache(restored_store, max_bytes=0)
+        self.addCleanup(restored_cache.close)
+        next_provider = ScriptedProvider(name='gemini', responses=[ProviderResponse(final_text='Only the April 30 report arrived.')])
+        restored = AgentRuntime(config=self.config, store=restored_store, tool_registry=self.tools,
+            providers={'gemini': next_provider}, preview_cache=restored_cache)
+        rebuilt = await restored._get_live_state(self.session)
+        with patch.object(next_provider, 'generate', side_effect=summarize):
+            await restored._make_toolspan_block_candidate(next_provider, changed,
+                rebuilt.raw_messages, session_id=self.session)
+        self.assertEqual(requests[0]['messages'], requests[1]['messages'])
+        answer = await restored.run_turn(session_id=self.session, user_display_name='Participant',
+            incoming_message=ConversationMessage.user_text('Which report arrived?'))
+        self.assertEqual(answer.text, 'Only the April 30 report arrived.')
+        assert_file_records(next_provider.requests[0])
+        self.assertEqual(await restored_store.read_messages(self.session, [row.db_id for row in original_rows]), original_rows)
+        remote.fetch_files.assert_awaited_once()
+        self.assertEqual(bot.send_document.await_count, len(expected_deliveries),
+            'Reconstruction and compaction never resend files.')
+
     async def test_malformed_generated_calls_cannot_execute_and_retry_preserves_context(self):
         from tgchatbot.providers.gemini import GeminiProvider
         from tgchatbot.providers.openai_responses import OpenAIResponsesProvider

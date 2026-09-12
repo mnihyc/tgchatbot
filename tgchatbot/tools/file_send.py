@@ -55,6 +55,10 @@ class FileSendTool:
                 output['ok'] = False
                 output['error'] = 'No matching files were available to send'
             return ToolResult(call_id='', name=self.spec.name, output=output, artifacts=artifacts)
+        except OSError as exc:
+            logger.exception('file_send local transfer failed')
+            return ToolResult(call_id='', name=self.spec.name,
+                output={'ok': False, 'error': f'Local file transfer failed: {exc.__class__.__name__}'})
         except Exception as exc:
             logger.exception('file_send failed')
             return ToolResult(call_id='', name=self.spec.name, output={'ok': False, 'error': f'{exc.__class__.__name__}: {exc}'})

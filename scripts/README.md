@@ -8,7 +8,8 @@ Use each command's `--help` for its arguments.
 
 ## Workspace file reading
 
-With remote tools enabled, the agent can use `read_doc(scope, path, format)`.
+With remote tools enabled, the agent can use `read_doc(path, format)` with a path
+relative to its session directory.
 Text and PDF reads optionally select an inclusive, one-based `start`/`end` line
 or page range. Ordinary attachments sync as files, with contents read on demand.
 Images and PDF pages require a provider supporting visual tool results; audio/video

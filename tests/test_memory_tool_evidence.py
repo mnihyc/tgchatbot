@@ -31,6 +31,25 @@ class MemoryToolEvidenceTests(BusinessTestCase):
         result = await self.tool('memory_search', {'query': query})
         return [row['message_ids'][0] for row in result['matches']]
 
+    async def test_strict_provider_null_read_options_return_the_same_original_as_omitted_options(self):
+        original = await self.runtime.ingest_user_message(session_id=self.session,
+            incoming_message=ConversationMessage.user_text('Saffron delivery is postponed until Thursday.'))
+        spec = next(tool for tool in self.memory.tools if tool.name == 'memory_read')
+        schema = spec.openai_tool()['parameters']
+        arguments = {key: None for key in schema['required'] if key != 'message_ids'}
+        arguments['message_ids'] = [original.db_id]
+        self.assertIn('null', schema['properties']['offset']['type'])
+        omitted = await self.tool('memory_read', {'message_ids': [original.db_id]})
+        nullable = await self.tool('memory_read', arguments)
+        self.assertEqual(nullable, omitted)
+        self.assertEqual(nullable['messages'][0]['fragments'], [
+            {'offset': 0, 'text': 'Saffron delivery is postponed until Thursday.'}])
+        paged = await self.tool('memory_read', {**arguments, 'offset': 8, 'length': 8})
+        self.assertEqual(paged['messages'][0]['fragments'], [{'offset': 8, 'text': 'delivery'}])
+        for invalid_offset in (-1, ''):
+            invalid = await spec.runner.run({**arguments, 'offset': invalid_offset}, self.context)
+            self.assertFalse(invalid.output['ok'], 'Only an omitted/null offset receives the default')
+
     async def test_repeated_lookups_do_not_displace_originals_or_external_observations(self):
         fact = await self.runtime.ingest_user_message(session_id=self.session,
             incoming_message=ConversationMessage.user_text('Saffron delivery is postponed until Thursday.'))

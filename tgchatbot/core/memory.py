@@ -279,8 +279,9 @@ class MemoryReadTool:
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         evidence_parts = []
         try:
+            offset = args.get('offset')
             output = await self.memory.read(ctx.session_id, args.get('message_ids', []), scope=ctx.scope,
-                offset=args.get('offset', 0), length=args.get('length'),
+                offset=0 if offset is None else offset, length=args.get('length'),
                 include_neighbors=args.get('include_neighbors') is True, timezone=ctx.timezone)
             image_ids = args.get('image_ids')
             if image_ids is None:

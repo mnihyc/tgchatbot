@@ -48,6 +48,30 @@ class ToolWorkflowTests(BusinessTestCase):
                 self.assertEqual(run.await_args.kwargs["timeout_s"], self.config.ssh_exec.max_tool_timeout_s)
                 self.assertEqual(run.await_args.kwargs["session_id"], self.session)
 
+    async def test_file_transfer_errors_keep_local_paths_private_and_remote_errors_actionable(self):
+        local = self.path / 'private-transfer-copy.txt'
+        remote = SimpleNamespace(fetch_files=AsyncMock(side_effect=PermissionError(13, 'Permission denied', str(local))))
+        tool = FileSendTool(self.config, remote)
+        with self.assertLogs('tgchatbot.tools.file_send', level='ERROR') as logs:
+            failed = await tool.run({'paths': ['2026-09-13/report.txt']}, ToolContext(self.session, 'Participant'))
+        self.assertFalse(failed.output['ok'])
+        self.assertEqual(failed.artifacts, [])
+        self.assertEqual(failed.output['error'], 'Local file transfer failed: PermissionError')
+        self.assertIn(str(local), '\n'.join(logs.output), 'Operators retain the detailed transfer diagnostic')
+        remote.fetch_files.side_effect = RuntimeError('Requested remote path is outside the session workspace')
+        with self.assertLogs('tgchatbot.tools.file_send', level='ERROR'):
+            invalid = await tool.run({'paths': ['../report.txt']}, ToolContext(self.session, 'Participant'))
+        self.assertIn('outside the session workspace', invalid.output['error'])
+        local.write_bytes(b'Retry recovered the selected report')
+        remote.fetch_files.side_effect = None
+        remote.fetch_files.return_value = [OutboundArtifact(local, 'report.txt',
+            workspace_path='2026-09-13/report.txt')]
+        recovered = await tool.run({'paths': ['2026-09-13/report.txt']}, ToolContext(self.session, 'Participant'))
+        self.assertTrue(recovered.output['ok'])
+        self.assertEqual(recovered.output['prepared_files'], [
+            {'filename': 'report.txt', 'workspace_path': '2026-09-13/report.txt'}])
+        self.assertEqual(recovered.artifacts[0].path.read_bytes(), b'Retry recovered the selected report')
+
     async def test_registry_requires_remote_enabled_and_sticker_catalog(self):
         remote = SimpleNamespace(enabled=False)
         catalog = Mock()

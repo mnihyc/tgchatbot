@@ -19,7 +19,7 @@ class ShellExecTool:
             name='shell_exec',
             description=(
                 'Run POSIX sh commands in this chat\'s persistent remote workspace for file inspection and command-line tasks. '
-                'The working directory is the session root unless cwd_subdir is supplied. '
+                'The working directory is the session root. '
                 'TGCHATBOT_SESSION_DIR is the root; synced files are referenced relative to it under YYYY-MM-DD/. '
                 'Use dated or custom subfolders for new files. Files may be overwritten. '
                 'Inspect stdout, stderr and returncode; use file_send for files the user should receive.'
@@ -36,10 +36,6 @@ class ShellExecTool:
                         'minimum': 1,
                         'maximum': self.config.ssh_exec.max_tool_timeout_s,
                         'description': 'Execution timeout in seconds. Use null to fall back to the operator default timeout.',
-                    },
-                    'cwd_subdir': {
-                        'type': 'string',
-                        'description': 'Optional subdirectory under the remote session root to use as the working directory. Use null for the session root.',
                     },
                 },
                 'required': ['command'],
@@ -62,10 +58,7 @@ class ShellExecTool:
         timeout_raw = args.get('timeout_s')
         timeout_s = int(timeout_raw) if timeout_raw is not None else self.config.ssh_exec.default_timeout_s
         timeout_s = max(1, min(timeout_s, self.config.ssh_exec.max_tool_timeout_s))
-        cwd_raw = args.get('cwd_subdir')
-        cwd_subdir = str(cwd_raw).strip() if cwd_raw is not None else ''
-        cwd_subdir = cwd_subdir or None
-        result = await self.remote.run_shell(session_id=ctx.session_id, command=command, timeout_s=timeout_s, cwd_subdir=cwd_subdir)
+        result = await self.remote.run_shell(session_id=ctx.session_id, command=command, timeout_s=timeout_s)
         return ToolResult(
             call_id='',
             name=self.spec.name,

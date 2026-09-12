@@ -3242,7 +3242,7 @@ class AgentRuntime:
 
     def _describe_tool_call(self, name: str, payload: dict[str, Any]) -> str:
         arguments = payload.get('arguments') if isinstance(payload.get('arguments'), dict) else {}
-        if name in {'memory_search', 'memory_read', 'user_profile_fetch'}:
+        if name in {'memory_search', 'memory_read', 'user_profile_fetch', 'file_send', 'read_doc'}:
             return f'Tool {name}: ' + json.dumps(arguments, ensure_ascii=False, default=str)
         details: list[str] = []
         if name == 'shell_exec':
@@ -3259,10 +3259,7 @@ class AgentRuntime:
             details.extend(self._describe_sticker_send_call(arguments))
         elif arguments:
             details.append(f'called with arguments {self._clip_inline(self._compact_json(arguments, limit=180), 180)!r}')
-        cwd = arguments.get('cwd_subdir')
         timeout_s = arguments.get('timeout_s')
-        if cwd:
-            details.append(f'cwd_subdir={cwd}')
         if timeout_s:
             details.append(f'timeout={timeout_s}s')
         prefix = f'Tool {name}'
@@ -3270,10 +3267,10 @@ class AgentRuntime:
 
     def _describe_tool_result(self, name: str, payload: dict[str, Any], *, timezone: str | None = None) -> str:
         output = payload.get('output') if isinstance(payload.get('output'), dict) else {}
-        if name == 'read_doc':
-            # Path, format and returned range identify the observation;
-            # parsed text/images are separate ordered evidence parts.
-            return 'Tool read_doc result:\n' + json.dumps(output, ensure_ascii=False, default=str)
+        if name in {'read_doc', 'file_send'}:
+            # These bounded records identify selected paths and outcomes;
+            # document contents are separate ordered evidence parts.
+            return f'Tool {name} result:\n' + json.dumps(output, ensure_ascii=False, default=str)
         if name in {'memory_search', 'memory_read', 'user_profile_fetch'}:
             output = present_tool_output(name, output, timezone or self.config.default_metadata_timezone)
             # Retrieval owns result bounds. Preserve the evidence, identities,
@@ -3303,6 +3300,8 @@ class AgentRuntime:
         return prefix + (': ' + '; '.join(details) if details else ' recorded')
 
     def _describe_tool_delivery(self, name: str, payload: dict[str, Any]) -> str:
+        if name == 'file_send':
+            return 'Tool file_send delivery:\n' + json.dumps(payload, ensure_ascii=False, default=str)
         if name == 'sticker_send':
             details = self._describe_sticker_delivery(payload)
             prefix = f'Tool {name} delivery'

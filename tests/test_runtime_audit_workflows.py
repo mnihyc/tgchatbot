@@ -71,7 +71,6 @@ class RuntimeAuditWorkflows(BusinessTestCase):
         self.assertEqual(candidate['data']['results_or_takeaways'], ['Door code 1591'])
         evidence = '\n'.join(part.text or '' for message in requests[0]['messages'] for part in message.parts)
         self.assertIn(arguments['path'], evidence)
-        self.assertIn('inputs', evidence)
         self.assertEqual(evidence.count(contents), len(calls), 'Each parsed observation is supplied exactly once.')
         if retire_images:
             self.assertIn('[Image compacted]', evidence)

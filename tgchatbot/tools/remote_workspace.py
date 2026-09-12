@@ -265,12 +265,11 @@ class RemoteWorkspaceClient:
         named = Path(filename)
         return f'{named.stem}_{file_id}{named.suffix}'
 
-    async def run_shell(self, *, session_id: str, command: str, timeout_s: int, cwd_subdir: str | None = None) -> dict[str, Any]:
+    async def run_shell(self, *, session_id: str, command: str, timeout_s: int) -> dict[str, Any]:
         paths = await self.ensure_session_dirs(session_id)
-        cwd = paths.root if not cwd_subdir else f"{paths.root.rstrip('/')}/{cwd_subdir.lstrip('/')}"
         env = f"TGCHATBOT_SESSION_DIR={shq(paths.root)} "
-        wrapped = f"set -e; cd {shq(cwd)}; {env} sh -lc {shq(command)}"
-        logger.info('remote.shell sid=%s cwd=%s timeout_s=%s cmd=%s', clip_for_log(session_id, limit=48), clip_for_log(cwd_subdir or '.', limit=32), timeout_s, clip_for_log(command, limit=140))
+        wrapped = f"set -e; cd {shq(paths.root)}; {env} sh -lc {shq(command)}"
+        logger.info('remote.shell sid=%s timeout_s=%s cmd=%s', clip_for_log(session_id, limit=48), timeout_s, clip_for_log(command, limit=140))
         return await self._run_ssh_command(wrapped, timeout_s=timeout_s)
 
     async def run_python(
