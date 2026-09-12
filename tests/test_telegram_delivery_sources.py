@@ -247,6 +247,43 @@ class TelegramDeliverySourceTests(BusinessTestCase):
         self.assertEqual([text for _, text in self.sent if text != '...'],
             ['The tool finished.', 'The next answer.'] * 2)
 
+    async def test_status_failure_cannot_block_sticker_and_file_only_answer(self):
+        from PIL import Image
+
+        settings = await self.settings(process_visibility=ProcessVisibility.STATUS)
+        self.bot.send_document = AsyncMock(return_value=self.message(2001))
+        self.bot.send_sticker = AsyncMock(return_value=self.message(2002))
+        document = self.path / 'requested.txt'
+        document.write_text('Requested file contents')
+        sticker = self.path / 'requested.webp'
+        Image.new('RGB', (4, 4), 'red').save(sticker, format='WEBP')
+        placeholder = self.message(50)
+        placeholder.edit_text.side_effect = TimedOut()
+        result = TurnResult('', artifacts=[OutboundArtifact(document, 'requested.txt')],
+            stickers=[OutboundSticker(sticker, timing=StickerTiming.AFTER_FINAL)],
+            scope=await self.store.get_scope(self.session))
+
+        delivered = await self.app._deliver_result(self.source, self.renderer(placeholder), settings,
+            result, sent_before_receipts=[])
+
+        self.assertEqual(delivered, [], 'A sticker/file-only response must not invent assistant prose')
+        self.bot.send_document.assert_awaited_once()
+        self.bot.send_sticker.assert_awaited_once()
+        self.bot.send_message.assert_not_awaited()
+        history = await (await self.new_store()).list_canonical_messages(self.session)
+        receipts = [row.message.metadata['tool_payload'] for row in history
+            if row.message.metadata.get('tool_phase') == 'delivery']
+        self.assertEqual([receipt['sent'] for receipt in receipts], [True, True])
+
+        self.provider.responses.append(ProviderResponse(final_text='The next answer.'))
+        original = await self.runtime.ingest_user_message(session_id=self.session,
+            incoming_message=ConversationMessage.user_text('Next question.'))
+        await self.app._reply_to_candidate(ReplyCandidate(original.db_id, 'Alex', self.source))
+        self.app._notify_user_error.assert_not_awaited()
+        history = await (await self.new_store()).list_canonical_messages(self.session)
+        self.assertEqual([row.message.parts[0].text for row in history
+            if row.message.role == MessageRole.ASSISTANT], ['The next answer.'])
+
     async def test_optional_progress_cancellation_still_stops_processing(self):
         placeholder = self.message(2001)
         placeholder.edit_text.side_effect = asyncio.CancelledError()
@@ -255,6 +292,8 @@ class TelegramDeliverySourceTests(BusinessTestCase):
             await renderer.begin()
         with self.assertRaises(asyncio.CancelledError):
             await renderer.emit(RuntimeEvent(kind='phase', title='Executing', detail=''))
+        with self.assertRaises(asyncio.CancelledError):
+            await renderer.complete_without_answer()
         await self.settings(process_visibility=ProcessVisibility.MINIMAL)
         original = await self.runtime.ingest_user_message(session_id=self.session,
             incoming_message=ConversationMessage.user_text('A cancelled request.'))

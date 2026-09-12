@@ -278,7 +278,10 @@ class TelegramMessageRenderer:
             header = self.state.live_text
         else:
             header = '\n'.join(line for line in self.state.lines if line.strip()).strip()
-        await self._edit_text(header or 'Done', force=True)
+        try:
+            await self._edit_text(header or 'Done', force=True)
+        except Exception:
+            logger.debug('tg.progress.complete.failed', exc_info=True)
 
     async def _flush(self, final: bool = False, force: bool = False) -> None:
         if self._is_none() or self._is_minimal():
