@@ -130,7 +130,7 @@ class RuntimeTimezoneTests(BusinessTestCase):
             effective_message=SimpleNamespace(reply_text=reply))
         before = await self.store.get_or_create_session(self.session, self.config.default_session_settings())
         await app.param_command(command, SimpleNamespace(args=['metadata_timezone', 'UTC']))
-        self.assertIn('Unknown parameter', reply.await_args.args[0])
+        self.assertIn('Unknown setting', reply.await_args.args[0])
         settings = await self.store.get_or_create_session(self.session, self.config.default_session_settings())
         self.assertEqual(asdict(settings), asdict(before))
         self.assertEqual(self.config.default_metadata_timezone, 'America/New_York')

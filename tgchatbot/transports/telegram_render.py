@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import contextlib
-import html
 import logging
-import re
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
-from telegram import Bot, Message
+from telegram import Bot, Message, MessageEntity
 from telegram.error import BadRequest
 
 from tgchatbot.transports.sticker_delivery import send_sticker as deliver_sticker
@@ -15,8 +14,8 @@ from tgchatbot.transports.telegram_routing import topic_arguments
 from tgchatbot.core.events import RuntimeEvent
 from tgchatbot.domain.models import OutboundArtifact, OutboundSticker, ProcessVisibility, ResponseDelivery
 
-from telegram.helpers import escape_markdown
-from telegramify_markdown import markdownify
+from telegramify_markdown import convert, split_entities, utf16_len
+from telegramify_markdown import MessageEntity as FormattingEntity
 from telegramify_markdown.config import get_runtime_config
 
 cfg = get_runtime_config()
@@ -26,197 +25,106 @@ cfg.markdown_symbol.heading_level_3 = "---"
 cfg.markdown_symbol.heading_level_4 = "----"
 
 logger = logging.getLogger(__name__)
+# Retain the existing headroom below Telegram's 4,096 UTF-16-unit text limit.
 MAX_TELEGRAM_TEXT_CHARS = 3900
 
 
-def _is_parse_error(exc: BadRequest) -> bool:
-    return "can't parse entities" in str(exc).lower()
+@dataclass(frozen=True)
+class TelegramText:
+    """Display text and its formatting; never feed a rendered chunk back into Markdown."""
 
-def _to_safe_markdown_v2(text: str) -> str:
-    raw = text or "..."
-    if markdownify is not None:
-        return markdownify(raw)
-    return escape_markdown(raw, version=2)
+    text: str
+    entities: tuple[FormattingEntity, ...] = ()
+
+    def __bool__(self) -> bool:
+        return bool(self.text)
 
 
-def _rendered_len(text: str) -> int:
-    return len(_to_safe_markdown_v2(text))
+TelegramContent = str | TelegramText
+
+
+def _formatted(text: TelegramContent) -> TelegramText:
+    if isinstance(text, TelegramText):
+        return text
+    plain, entities = convert(text or '...')
+    return TelegramText(plain, tuple(entities))
+
+
+def _join_text(parts: list[TelegramContent], separator: str = '') -> TelegramText:
+    """Join rendered segments, retaining each segment's existing entity offsets."""
+    texts: list[str] = []
+    entities: list[FormattingEntity] = []
+    offset = 0
+    for part in parts:
+        if not part:
+            continue
+        if texts:
+            texts.append(separator)
+            offset += utf16_len(separator)
+        rendered = _formatted(part)
+        texts.append(rendered.text)
+        entities.extend(entity.copy_with(offset=offset + entity.offset) for entity in rendered.entities)
+        offset += utf16_len(rendered.text)
+    return TelegramText(''.join(texts), tuple(entities))
+
+
+def _rendered_len(text: TelegramContent) -> int:
+    return utf16_len(_formatted(text).text)
 
 
 async def bot_message_safe(client: Any, method: str, /, **kwargs):
     fn = getattr(client, method)
-
-    text = kwargs.get("text")
-    parse_mode = kwargs.get("parse_mode")
-
-    if text is None or parse_mode != "MarkdownV2":
+    text = kwargs.get('text')
+    if text is None or (kwargs.get('parse_mode') != 'MarkdownV2' and not isinstance(text, TelegramText)):
         return await fn(**kwargs)
 
-    raw_text = text or "..."
-
-    try:
-        return await fn(**{**kwargs, "text": _to_safe_markdown_v2(raw_text)})
-    except BadRequest as exc:
-        if not _is_parse_error(exc):
-            raise
-
-    plain_kwargs = dict(kwargs)
-    plain_kwargs["text"] = raw_text
-    plain_kwargs.pop("parse_mode", None)
-    return await fn(**plain_kwargs)
+    rendered = _formatted(text)
+    # Native entities avoid Telegram parsing Markdown a second time. Malformed
+    # source Markdown stays literal without discarding neighbouring valid styles.
+    return await fn(**{
+        **kwargs,
+        'text': rendered.text or '...',
+        'parse_mode': None,
+        'entities': [MessageEntity.de_json(entity.to_dict(), bot=None) for entity in rendered.entities],
+    })
 
 
-def _chunk_text(text: str, *, limit: int = MAX_TELEGRAM_TEXT_CHARS) -> list[str]:
-    text = text or ''
-    if len(text) <= limit:
-        return [text]
-    chunks: list[str] = []
-    remaining = text
-    while remaining:
-        if len(remaining) <= limit:
-            chunks.append(remaining)
-            break
-        window = remaining[:limit]
-        split_at = max(window.rfind("\n\n"), window.rfind("\n"), window.rfind(" "))
-        if split_at < max(32, limit // 2):
-            split_at = limit
-        elif window[split_at:split_at + 2] == "\n\n":
-            split_at += 2
-        else:
-            split_at += 1
-        chunk = remaining[:split_at].rstrip()
-        if not chunk:
-            chunk = remaining[:limit]
-            split_at = limit
-        chunks.append(chunk)
-        remaining = remaining[split_at:].lstrip()
-    return chunks
-
-
-def _truncate_text_for_telegram(
-    text: str,
-    *,
-    limit: int = MAX_TELEGRAM_TEXT_CHARS,
-    suffix: str = "\n[continued]",
-) -> str:
-    text = text or ''
-    if _rendered_len(text) <= limit:
-        return text
-    if _rendered_len(suffix) >= limit:
-        return suffix[: max(1, limit)]
-    lo, hi = 0, len(text)
-    best = ''
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        candidate = text[:mid].rstrip() + suffix
-        if _rendered_len(candidate) <= limit:
-            best = candidate
-            lo = mid + 1
-        else:
-            hi = mid - 1
-    return best or suffix
+def _chunk_text_for_telegram(
+    text: TelegramContent, *, limit: int = MAX_TELEGRAM_TEXT_CHARS,
+) -> list[TelegramText]:
+    rendered = _formatted(text)
+    chunks = split_entities(rendered.text, list(rendered.entities), max_utf16_len=limit)
+    return [TelegramText(plain, tuple(entities)) for plain, entities in chunks] or [TelegramText('...')]
 
 
 def _fit_text_with_suffix_for_telegram(
-    text: str,
+    text: TelegramContent,
     *,
     limit: int = MAX_TELEGRAM_TEXT_CHARS,
     suffix: str = "\n[continued]",
-) -> str:
-    text = text or ''
-    candidate = text.rstrip() + suffix
-    if _rendered_len(candidate) <= limit:
-        return candidate
-    return _truncate_text_for_telegram(text, limit=limit, suffix=suffix)
-
-
-def _chunk_text_for_telegram(text: str, *, limit: int = MAX_TELEGRAM_TEXT_CHARS) -> list[str]:
-    text = text or ''
-    if _rendered_len(text) <= limit:
-        return [text]
-
-    chunks: list[str] = []
-    remaining = text
-    while remaining:
-        if _rendered_len(remaining) <= limit:
-            chunks.append(remaining)
-            break
-
-        lo, hi = 1, len(remaining)
-        fit = 1
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            candidate = remaining[:mid]
-            if _rendered_len(candidate) <= limit:
-                fit = mid
-                lo = mid + 1
-            else:
-                hi = mid - 1
-
-        window = remaining[:fit]
-        split_at = max(window.rfind("\n\n"), window.rfind("\n"), window.rfind(" "))
-        if split_at < max(32, fit // 2):
-            split_at = fit
-        elif window[split_at:split_at + 2] == "\n\n":
-            split_at += 2
-        else:
-            split_at += 1
-
-        chunk = remaining[:split_at].rstrip()
-        if not chunk:
-            chunk = remaining[:fit]
-            split_at = fit
-        chunks.append(chunk)
-        remaining = remaining[split_at:].lstrip()
-    return chunks
+) -> TelegramText:
+    ending = _formatted(suffix)
+    budget = limit - _rendered_len(ending)
+    if budget <= 0:
+        return _chunk_text_for_telegram(ending, limit=limit)[0]
+    first = _chunk_text_for_telegram(text, limit=budget)[0]
+    return _join_text([first, ending])
 
 
 def _chunk_text_for_telegram_with_continuation(
-    text: str,
+    text: TelegramContent,
     *,
     limit: int = MAX_TELEGRAM_TEXT_CHARS,
     suffix: str = "\n[continued]",
-) -> list[str]:
-    text = text or ''
+) -> list[TelegramText]:
     if _rendered_len(text) <= limit:
-        return [text]
-    if _rendered_len(suffix) >= limit:
+        return [_formatted(text)]
+    ending = _formatted(suffix)
+    budget = limit - _rendered_len(ending)
+    if budget <= 0:
         return _chunk_text_for_telegram(text, limit=limit)
-
-    chunks: list[str] = []
-    remaining = text
-    while remaining:
-        if _rendered_len(remaining) <= limit:
-            chunks.append(remaining)
-            break
-
-        lo, hi = 1, len(remaining)
-        fit = 1
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            candidate = remaining[:mid].rstrip() + suffix
-            if _rendered_len(candidate) <= limit:
-                fit = mid
-                lo = mid + 1
-            else:
-                hi = mid - 1
-
-        window = remaining[:fit]
-        split_at = max(window.rfind("\n\n"), window.rfind("\n"), window.rfind(" "))
-        if split_at < max(32, fit // 2):
-            split_at = fit
-        elif window[split_at:split_at + 2] == "\n\n":
-            split_at += 2
-        else:
-            split_at += 1
-
-        chunk = remaining[:split_at].rstrip()
-        if not chunk:
-            chunk = remaining[:fit].rstrip()
-            split_at = fit
-        chunks.append(chunk + suffix)
-        remaining = remaining[split_at:].lstrip()
-    return chunks
+    chunks = _chunk_text_for_telegram(text, limit=budget)
+    return [_join_text([chunk, ending]) for chunk in chunks[:-1]] + chunks[-1:]
 
 
 def _visibility_value(value: ProcessVisibility | str | None) -> str:
@@ -230,8 +138,8 @@ class TelegramRenderState:
     lines: list[str] = field(default_factory=list)
     blocks: list[str] = field(default_factory=list)
     answer: str = ''
-    live_text: str = ''
-    last_render_text: str = ''
+    live_text: TelegramContent = ''
+    last_render_text: TelegramContent = ''
     last_render_at: float = 0.0
 
 
@@ -328,7 +236,7 @@ class TelegramMessageRenderer:
     async def _finalize_text(self, text: str) -> None:
         self.state.answer = text or ''
         if self.message is None or self._is_none():
-            await self._send_text_chunks(_chunk_text_for_telegram(self.state.answer))
+            await self._send_exact_chunks(_chunk_text_for_telegram(self.state.answer))
             return
 
         if self._is_minimal():
@@ -336,7 +244,7 @@ class TelegramMessageRenderer:
             return
 
         if self._is_full():
-            header = self.state.live_text.strip()
+            header = self.state.live_text
         else:
             header = '\n'.join(line for line in self.state.lines if line.strip()).strip()
 
@@ -344,15 +252,17 @@ class TelegramMessageRenderer:
             receipts, self._final_messages = self._final_messages, None
             try:
                 await self._edit_text(header or 'Done', force=True)
+            except Exception:
+                logger.debug('tg.progress.finalize.failed', exc_info=True)
             finally:
                 self._final_messages = receipts
-            await self._send_text_chunks(_chunk_text_for_telegram(self.state.answer))
+            await self._send_exact_chunks(_chunk_text_for_telegram(self.state.answer))
             return
         if not self.state.answer:
             await self._edit_text(header or 'Done', force=True)
             return
         if self._is_full() and header:
-            await self._replace_with_chunked_text(f'{header}\n\n{self.state.answer}')
+            await self._replace_with_chunked_text(_join_text([header, self.state.answer], '\n\n'))
             return
 
         await self._replace_with_chunked_text(self.state.answer)
@@ -365,7 +275,7 @@ class TelegramMessageRenderer:
             self.message = None
             return
         if self._is_full():
-            header = self.state.live_text.strip()
+            header = self.state.live_text
         else:
             header = '\n'.join(line for line in self.state.lines if line.strip()).strip()
         await self._edit_text(header or 'Done', force=True)
@@ -374,18 +284,18 @@ class TelegramMessageRenderer:
         if self._is_none() or self._is_minimal():
             return
         if self._is_full():
-            header = self.state.live_text.strip()
+            header = self.state.live_text
         else:
             header = '\n'.join(line for line in self.state.lines if line.strip())
         body = self.state.answer if final else ''
-        text = '\n\n'.join(part for part in [header, body] if part).strip() or '...'
+        text = _join_text([header, body], '\n\n') or '...'
         if not self._is_full() and _rendered_len(text) > MAX_TELEGRAM_TEXT_CHARS:
             return
         await self._edit_text(text, force=force, on_too_long='ignore')
 
     async def _append_full_block(self, block: str) -> None:
-        current = self.state.live_text.strip()
-        candidate = f'{current}\n\n{block}' if current else block
+        current = self.state.live_text
+        candidate = _join_text([current, block], '\n\n')
         if _rendered_len(candidate) <= MAX_TELEGRAM_TEXT_CHARS:
             self.state.live_text = candidate
             await self._edit_text(candidate, on_too_long='ignore')
@@ -406,7 +316,7 @@ class TelegramMessageRenderer:
     async def _send_new_live_text(self, text: str) -> None:
         await self._send_exact_chunks(_chunk_text_for_telegram_with_continuation(text), update_current=True)
 
-    async def _send_exact_chunks(self, chunks: list[str], *, update_current: bool = False) -> Message | None:
+    async def _send_exact_chunks(self, chunks: list[TelegramText], *, update_current: bool = False) -> Message | None:
         target = self._delivery_target()
         bot = target.get_bot()
         last_message: Message | None = None
@@ -422,7 +332,7 @@ class TelegramMessageRenderer:
             self.state.last_render_at = time.monotonic()
         return last_message
 
-    async def _edit_text(self, text: str, force: bool = False, on_too_long: str = 'replace') -> None:
+    async def _edit_text(self, text: TelegramContent, force: bool = False, on_too_long: str = 'replace') -> None:
         if self.message is None:
             return
         now = time.monotonic()
@@ -485,55 +395,47 @@ class TelegramMessageRenderer:
             return None
         return self.source_message.message_id
 
-    async def _send_text_via_bot(self, bot: Bot, chat_id: int, text: str) -> Message:
+    async def _send_text_via_bot(self, bot: Bot, chat_id: int, text: TelegramContent) -> Message:
         message = await bot_message_safe(bot, 'send_message', chat_id=chat_id, text=text, parse_mode='MarkdownV2', disable_web_page_preview=True, reply_to_message_id=self._reply_to_message_id(), **topic_arguments(self._delivery_target()))
         self._remember_final_message(message)
         return message
 
-    async def _send_text_chunks(self, chunks: list[str]) -> Message | None:
-        target = self._delivery_target()
-        bot = target.get_bot()
-        last_message: Message | None = None
-        for chunk in chunks:
-            for safe_chunk in _chunk_text_for_telegram(chunk):
-                last_message = await self._send_text_via_bot(bot, target.chat.id, safe_chunk or '...')
-        return last_message
-
-    async def _replace_message_with_chunked_text(self, text: str) -> None:
+    async def _replace_message_with_chunked_text(self, text: TelegramContent) -> None:
         original_message = self.message
         chunks = _chunk_text_for_telegram(text)
         if original_message is None:
-            await self._send_text_chunks(chunks)
+            await self._send_exact_chunks(chunks)
             return
         try:
             await bot_message_safe(original_message, 'edit_text', text=(chunks[0] or '...'), parse_mode='MarkdownV2', disable_web_page_preview=True)
-            self.message = original_message
-            self._remember_final_message(original_message)
-            if len(chunks) > 1:
-                await self._send_text_chunks(chunks[1:])
         except BadRequest as exc:
             logger.warning('Telegram chunked replacement edit failed; falling back to fresh reply: %s', exc)
-            replacement = await self._send_text_chunks(chunks)
+            replacement = await self._send_exact_chunks(chunks)
             if replacement is not None:
                 self.message = replacement
-            if replacement is not None and original_message is not None and replacement.message_id != original_message.message_id:
+            if replacement is not None and replacement.message_id != original_message.message_id:
                 await self._delete_message_if_possible(original_message)
+            return
+        self.message = original_message
+        self._remember_final_message(original_message)
+        if len(chunks) > 1:
+            await self._send_exact_chunks(chunks[1:])
 
-    async def _replace_with_chunked_text(self, text: str) -> None:
+    async def _replace_with_chunked_text(self, text: TelegramContent) -> None:
         chunks = _chunk_text_for_telegram(text)
         if self.message is None:
-            await self._send_text_chunks(chunks)
+            await self._send_exact_chunks(chunks)
             return
         await self._edit_text(chunks[0] or '...', force=True)
         if len(chunks) > 1:
-            await self._send_text_chunks(chunks[1:])
+            await self._send_exact_chunks(chunks[1:])
 
     async def send_text(self, text: str) -> None:
-        await self._send_text_chunks(_chunk_text_for_telegram(text))
+        await self._send_exact_chunks(_chunk_text_for_telegram(text))
 
-    async def _fallback_send_text(self, text: str) -> None:
+    async def _fallback_send_text(self, text: TelegramContent) -> None:
         original_message = self.message
-        message = await self._send_text_chunks(_chunk_text_for_telegram(text))
+        message = await self._send_exact_chunks(_chunk_text_for_telegram(text))
         if message is not None:
             self.message = message
         if message is not None and original_message is not None and message.message_id != original_message.message_id:

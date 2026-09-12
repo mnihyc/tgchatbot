@@ -52,11 +52,6 @@ from tgchatbot.settings_schema import (
     PROVIDER_RETRY_COUNT_MIN,
     SPONTANEOUS_REPLY_CHANCE_MAX,
     SPONTANEOUS_REPLY_CHANCE_MIN,
-    TEMPERATURE_MAX,
-    TEMPERATURE_MIN,
-    TOP_K_MIN,
-    TOP_P_MAX,
-    TOP_P_MIN,
     clamp_float,
     clamp_int,
     effective_optional_disabled_int,
@@ -139,6 +134,16 @@ class AgentRuntime:
             available = ', '.join(sorted(self.providers.keys())) or '-'
             raise RuntimeError(f'Provider {provider_name!r} is not configured. Available providers: {available}')
         return provider
+
+    def _request_tools(self, settings: SessionSettings) -> list[ToolSpec]:
+        policy = policy_for_mode(settings.mode)
+        tools = (self.tool_registry.list_tools(
+            allow_python_exec=policy.allow_python_exec,
+            allow_stickers=(settings.sticker_mode == StickerMode.AUTO),
+        ) if policy.allow_tools else [])
+        if self.memory is not None:
+            tools = [*tools, *self.memory.tools]
+        return tools
 
 
     async def ingest_user_message(self, *, session_id: str, incoming_message: ConversationMessage, expected_scope: dict[str, int] | None = None, intake: bool = False) -> StoredConversationMessage:
@@ -389,16 +394,7 @@ class AgentRuntime:
         catalog = getattr(self.tool_registry, 'sticker_catalog', None)
         if catalog is not None and policy.allow_tools and settings.sticker_mode == StickerMode.AUTO:
             await catalog.aensure_loaded()
-        tools = (
-            self.tool_registry.list_tools(
-                allow_python_exec=policy.allow_python_exec,
-                allow_stickers=(settings.sticker_mode == StickerMode.AUTO),
-            )
-            if policy.allow_tools
-            else []
-        )
-        if self.memory is not None:
-            tools = [*tools, *self.memory.tools]
+        tools = self._request_tools(settings)
         latest_preview = self._message_text_preview(state.raw_messages[-1].message) if state.raw_messages else ''
         est_ctx_tokens = self._estimate_request_breakdown(
             state=state,
@@ -787,43 +783,16 @@ class AgentRuntime:
         logger.warning('turn.limit sid=%s trigger=%s rounds=%s usage=%s', self._session_log_id(session_id), trigger_message_id, max_tool_rounds, self._usage_log_text(last_usage))
         raise RuntimeError('Interaction-round limit reached without a final response')
 
-    async def describe_session(self, session_id: str) -> dict[str, Any]:
-        state = await self._get_live_state(session_id)
+    async def describe_settings(self, session_id: str) -> dict[str, Any]:
         settings = await self.store.get_or_create_session(session_id, self.config.default_session_settings())
-        provider = self._require_provider(settings.provider)
-        await self._load_request_estimate_bias(settings)
-        l0_blocks = sum(1 for block in state.blocks if block.level == 0)
-        l1_blocks = sum(1 for block in state.blocks if block.level == 1)
-        l2_blocks = sum(1 for block in state.blocks if block.level == 2)
-        catalog = getattr(self.tool_registry, 'sticker_catalog', None)
-        if catalog is not None:
-            await catalog.aensure_loaded()
-        tools = self.tool_registry.list_tools(
-            allow_python_exec=policy_for_mode(settings.mode).allow_python_exec,
-            allow_stickers=(settings.sticker_mode == StickerMode.AUTO),
-        )
-        instructions = build_system_prompt(settings, timezone=self.config.default_metadata_timezone)
-        sticker_stats = self.tool_registry.sticker_catalog.stats()
-        remote = self.tool_registry.remote_workspace
+        return self._describe_settings_values(settings, self._require_provider(settings.provider))
+
+    def _describe_settings_values(self, settings: SessionSettings, provider: ModelProvider) -> dict[str, Any]:
         controls = provider.describe_controls(settings) if hasattr(provider, 'describe_controls') else {}
-        temperature = self._effective_temperature(settings)
-        top_p = self._effective_top_p(settings)
-        top_k = self._effective_top_k(settings)
         native_web_search_max = self._effective_native_web_search_max(settings)
         max_input_images = self._effective_max_input_images(provider, settings)
         compact_target_images = self._effective_compact_target_images(provider, settings)
-        request_estimate = self._estimate_request_breakdown(
-            state=state,
-            settings=settings,
-            provider=provider,
-            instructions=instructions,
-            tools=tools,
-        )
         return {
-            'memory_jobs': await self.store.job_status(session_id),
-            'scope': await self.store.get_scope(session_id),
-            'memory_last_error': getattr(getattr(self.memory, 'worker', None), 'last_error', None),
-            'semantic_enabled': bool(self.memory is not None and self.memory.embeddings.enabled),
             'provider': settings.provider,
             'model': settings.model,
             'mode': settings.mode.value,
@@ -880,6 +849,7 @@ class AgentRuntime:
             'native_web_search_max_note': 'OpenAI-only cap for built-in web_search tool calls. 0 disables the explicit cap.',
             'prompt_injection_mode': settings.prompt_injection_mode.value,
             'tool_history_mode': settings.tool_history_mode.value,
+            'tool_history_mode_source': 'session',
             'link_prefetch_mode': settings.link_prefetch_mode if settings.link_prefetch_mode != 'default' else self.config.default_link_prefetch_mode,
             'link_prefetch_mode_source': 'session' if settings.link_prefetch_mode != 'default' else 'default',
             'max_interaction_rounds': self._effective_max_interaction_rounds(settings),
@@ -895,19 +865,10 @@ class AgentRuntime:
             'group_reply_delay_s': self._effective_group_reply_delay_s(settings),
             'group_reply_delay_s_source': 'session' if (settings.group_reply_delay_s is not None or settings.reply_delay_s is not None) else 'default',
             'metadata_injection_mode': settings.metadata_injection_mode or 'on',
-            'metadata_injection_mode_source': 'session' if (settings.metadata_injection_mode or 'on') != self.config.default_metadata_injection_mode else 'default',
+            'metadata_injection_mode_source': 'session',
             'metadata_timezone': self.config.default_metadata_timezone,
             'metadata_timezone_source': 'environment',
             'system_prompt_chars': len(settings.system_prompt or ''),
-            'raw_messages': len(state.raw_messages),
-            'tool_history_messages': sum(1 for item in state.raw_messages if item.message.role == MessageRole.TOOL),
-            'memory_blocks': len(state.blocks),
-            'l0_blocks': l0_blocks,
-            'l1_blocks': l1_blocks,
-            'l2_blocks': l2_blocks,
-            'estimated_history_tokens': request_estimate.history_tokens,
-            'estimated_request_tokens': request_estimate.total_tokens,
-            'estimated_request_images': self._estimate_request_images(state),
             'max_input_images': format_optional_disabled_int(max_input_images, disabled_label='unlimited'),
             'max_input_images_source': 'session' if settings.max_input_images is not None else 'default',
             'compact_target_images': format_optional_disabled_int(compact_target_images, disabled_label='disabled'),
@@ -928,6 +889,41 @@ class AgentRuntime:
             'compact_min_messages_source': 'session' if settings.compact_min_messages is not None else 'default',
             'min_raw_messages_reserve': self._effective_min_raw_messages_reserve(settings),
             'min_raw_messages_reserve_source': 'session' if settings.min_raw_messages_reserve is not None else 'default',
+        }
+
+    async def describe_session(self, session_id: str) -> dict[str, Any]:
+        state = await self._get_live_state(session_id)
+        settings = await self.store.get_or_create_session(session_id, self.config.default_session_settings())
+        provider = self._require_provider(settings.provider)
+        await self._load_request_estimate_bias(settings)
+        l0_blocks = sum(1 for block in state.blocks if block.level == 0)
+        l1_blocks = sum(1 for block in state.blocks if block.level == 1)
+        l2_blocks = sum(1 for block in state.blocks if block.level == 2)
+        catalog = getattr(self.tool_registry, 'sticker_catalog', None)
+        if catalog is not None:
+            await catalog.aensure_loaded()
+        tools = self._request_tools(settings)
+        instructions = build_system_prompt(settings, timezone=self.config.default_metadata_timezone)
+        sticker_stats = self.tool_registry.sticker_catalog.stats()
+        remote = self.tool_registry.remote_workspace
+        request_estimate = self._estimate_request_breakdown(
+            state=state, settings=settings, provider=provider, instructions=instructions, tools=tools)
+        return {
+            **self._describe_settings_values(settings, provider),
+            'memory_jobs': await self.store.job_status(session_id),
+            'scope': await self.store.get_scope(session_id),
+            'memory_last_error': getattr(getattr(self.memory, 'worker', None), 'last_error', None),
+            'semantic_enabled': bool(self.memory is not None and self.memory.embeddings.enabled),
+            'raw_messages': len(state.raw_messages),
+            'tool_history_messages': sum(1 for item in state.raw_messages if item.message.role == MessageRole.TOOL),
+            'memory_blocks': len(state.blocks),
+            'l0_blocks': l0_blocks,
+            'l1_blocks': l1_blocks,
+            'l2_blocks': l2_blocks,
+            'estimated_history_tokens': request_estimate.history_tokens,
+            'estimated_request_tokens': request_estimate.total_tokens,
+            'estimated_request_images': self._estimate_request_images(state),
+            'available_tools': [tool.name for tool in tools],
             'provider_history_messages': len(self._build_provider_history(state, settings=settings, provider_name=provider.name)),
             'loaded_in_memory': state.loaded,
             'sticker_index_loaded': sticker_stats['loaded'],
@@ -982,21 +978,6 @@ class AgentRuntime:
             settings.native_web_search_max,
             getattr(self.config.provider_config(settings.provider), 'native_web_search_max', 0),
         )
-
-    def _effective_temperature(self, settings: SessionSettings) -> float:
-        if settings.temperature is not None:
-            return clamp_float(settings.temperature, minimum=TEMPERATURE_MIN, maximum=TEMPERATURE_MAX, default=TEMPERATURE_MIN)
-        return clamp_float(getattr(self.config.provider_config(settings.provider), 'temperature', None) or TEMPERATURE_MIN, minimum=TEMPERATURE_MIN, maximum=TEMPERATURE_MAX, default=TEMPERATURE_MIN)
-
-    def _effective_top_p(self, settings: SessionSettings) -> float:
-        if settings.top_p is not None:
-            return clamp_float(settings.top_p, minimum=TOP_P_MIN, maximum=TOP_P_MAX, default=TOP_P_MIN)
-        return clamp_float(getattr(self.config.provider_config(settings.provider), 'top_p', None) or TOP_P_MIN, minimum=TOP_P_MIN, maximum=TOP_P_MAX, default=TOP_P_MIN)
-
-    def _effective_top_k(self, settings: SessionSettings) -> int:
-        if settings.top_k is not None:
-            return clamp_int(settings.top_k, minimum=TOP_K_MIN, default=TOP_K_MIN)
-        return clamp_int(getattr(self.config.provider_config(settings.provider), 'top_k', TOP_K_MIN), minimum=TOP_K_MIN, default=TOP_K_MIN)
 
     def _effective_compact_trigger_tokens(self, settings: SessionSettings) -> int:
         if settings.compact_trigger_tokens is not None:

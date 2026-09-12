@@ -69,6 +69,7 @@ class _Index:
     reading_positions: tuple[int, ...] = ()
     image_matrix: np.ndarray | None = None
     image_assets: tuple[int, ...] = ()
+    pack_count: int = 0
 
 
 def _interleave(*rankings):
@@ -104,7 +105,8 @@ class StickerCatalog:
         return self._loaded
 
     def stats(self):
-        return {'stickers': len(self._index.assets), 'revision': self._index.revision_id,
+        return {'loaded': self.loaded, 'packs': self._index.pack_count,
+                'stickers': len(self._index.assets), 'revision': self._index.revision_id,
                 'readings': len(self._index.reading_assets),
                 'image_vectors': len(self._index.image_assets)}
 
@@ -132,7 +134,8 @@ class StickerCatalog:
             replacement = _Index(snapshot.revision_id, snapshot.recipe, assets,
                 np.asarray(reading_rows, dtype=np.float32) if reading_rows else None,
                 tuple(reading_assets), tuple(reading_positions),
-                np.asarray(image_rows, dtype=np.float32) if image_rows else None, tuple(image_assets))
+                np.asarray(image_rows, dtype=np.float32) if image_rows else None, tuple(image_assets),
+                pack_count=len({alias.pack for asset in assets for alias in asset.aliases if alias.pack}))
             # All derived arrays and row IDs belong to this snapshot. A query retains
             # its own reference even if another query observes a newly activated head.
             self._index = replacement

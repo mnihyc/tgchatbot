@@ -6,13 +6,14 @@ import math
 import random
 import contextlib
 import hashlib
+import html
 import json
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 from telegram import Chat, Message, Update
-from telegram.constants import ChatAction, ChatType
+from telegram.constants import ChatAction, ChatType, MessageLimit
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from tgchatbot.config import AppConfig
@@ -70,6 +71,7 @@ from tgchatbot.settings_schema import (
     normalize_optional_disabled_int,
 )
 from tgchatbot.transports.telegram_render import MAX_TELEGRAM_TEXT_CHARS, TelegramMessageRenderer, _chunk_text_for_telegram, bot_message_safe
+from tgchatbot.transports import telegram_command_views as command_views
 
 logger = logging.getLogger(__name__)
 
@@ -246,8 +248,7 @@ class TelegramBotApp:
     def _min_raw_messages_reserve_default(self) -> int:
         return int(self.config.context.min_raw_messages_reserve)
 
-    def _param_usage_lines(self, settings: SessionSettings) -> list[str]:
-        lines = ['Usage: /param <name> <value|default>']
+    def _parameter_usage(self, settings: SessionSettings) -> dict[str, str]:
         usage = {
             'reasoning_effort': 'reasoning_effort <none|minimal|low|medium|high|xhigh|default>',
             'reasoning_summary': 'reasoning_summary <off|on|auto|detailed|concise|default>',
@@ -261,12 +262,12 @@ class TelegramBotApp:
             'thinking_budget': f'thinking_budget <{gemini_thinking_budget_usage(settings.model)}|default>',
             'thinking_level': f"thinking_level <{'|'.join(gemini_allowed_thinking_levels(settings.model))}|default>",
         }
-        lines.extend(line for name, line in usage.items() if self._provider_supports_control(settings, name))
-        lines.extend([
+        usage = {name: line for name, line in usage.items() if self._provider_supports_control(settings, name)}
+        common = [
             'link_prefetch <off|title|snippet|default>',
             'max_output_tokens <positive integer|default>',
             'max_input_images <nonnegative integer|default>  (0 disables the image-count cap)',
-            'compact_target_images <nonnegative integer|default>  (0 disables the separate image compaction target)',
+            'compact_target_images <nonnegative integer|default>  (0 uses the image limit as the target)',
             'compact_trigger_tokens <positive integer|default>',
             'compact_target_tokens <positive integer|default>',
             'compact_batch_tokens <positive integer|default>',
@@ -280,13 +281,15 @@ class TelegramBotApp:
             'group_spontaneous_reply_delay_s <nonnegative seconds|default>',
             'private_reply_delay_s <nonnegative seconds|default>',
             'group_reply_delay_s <nonnegative seconds|default>',
+            'reply_delay_s <nonnegative seconds|default>  (sets both private and group reply delays)',
             'provider_retry_count <nonnegative integer|default>',
             'metadata <on|off|default>',
             'tool_history_mode <translated|native_same_provider|default>',
-        ])
-        return lines
+        ]
+        usage.update({line.split(' ', 1)[0]: line for line in common})
+        return usage
 
-    def _param_lines(self, session_status: dict[str, object], *, include_help: bool) -> list[str]:
+    def _param_lines(self, session_status: dict[str, object]) -> list[str]:
         lines = ['Session parameters']
         for name in ('reasoning_effort', 'reasoning_summary', 'text_verbosity', 'include_thoughts', 'thinking_budget', 'thinking_level', 'native_web_search', 'native_web_search_max'):
             if session_status.get(f'{name}_supported'):
@@ -305,7 +308,7 @@ class TelegramBotApp:
             f"compact_keep_recent_ratio={session_status['compact_keep_recent_ratio']} ({session_status['compact_keep_recent_ratio_source']})",
             f"compact_tool_ratio_threshold={session_status['compact_tool_ratio_threshold']} ({session_status['compact_tool_ratio_threshold_source']})",
             f"compact_tool_min_tokens={session_status['compact_tool_min_tokens']} ({session_status['compact_tool_min_tokens_source']})",
-            f"(legacy) compact_min_messages={session_status['compact_min_messages']} ({session_status['compact_min_messages_source']}) min_raw_messages_reserve={session_status['min_raw_messages_reserve']} ({session_status['min_raw_messages_reserve_source']})",
+            f"compact_min_messages={session_status['compact_min_messages']} ({session_status['compact_min_messages_source']}) min_raw_messages_reserve={session_status['min_raw_messages_reserve']} ({session_status['min_raw_messages_reserve_source']})",
             f"max_interaction_rounds={session_status['max_interaction_rounds']} ({session_status['max_interaction_rounds_source']})",
             f"spontaneous_reply_chance={session_status['spontaneous_reply_chance']}% ({session_status['spontaneous_reply_chance_source']})",
             f"group_spontaneous_reply_delay_s={session_status['group_spontaneous_reply_delay_s']} ({session_status['group_spontaneous_reply_delay_s_source']})",
@@ -316,13 +319,11 @@ class TelegramBotApp:
             f"prompt_injection={session_status['prompt_injection_mode']}",
             f"tool_history_mode={session_status['tool_history_mode']}",
         ])
-        if include_help:
-            lines.append('')
-            lines.append('Set with /param <name> <value|default>')
-            #lines.extend(self._param_usage_lines()[1:])
+        lines.append('')
+        lines.append('Set with /param <name> <value|default>')
         return lines
 
-    def _status_lines(self, session_status: dict[str, object], flow: dict[str, object], *, full: bool, include_param_help: bool) -> list[str]:
+    def _status_lines(self, session_status: dict[str, object], flow: dict[str, object]) -> list[str]:
         lines = [
             'Session',
             f"provider={session_status['provider']} model={session_status['model']}",
@@ -338,10 +339,6 @@ class TelegramBotApp:
         ]
         if session_status.get('memory_last_error'):
             lines.append('Memory worker error: ' + str(session_status['memory_last_error']))
-        if not full:
-            lines.append('')
-            lines.append('Use [/status full] for the original detailed status and current /params values.')
-            return lines
         lines.extend([
             '',
             'Context',
@@ -356,12 +353,27 @@ class TelegramBotApp:
             '',
             'Remote + queue',
             f"remote_enabled={session_status['remote_enabled']} remote_master_ready={session_status['remote_master_ready']}",
+            'available_tools=' + ', '.join(session_status['available_tools']),
             f"ingest_inflight={flow['ingest_inflight']} reply_running={flow['reply_running']}",
             f"latest_pending_reply_message_id={flow['latest_pending_reply_message_id']} last_replied_message_id={flow['last_replied_message_id']}",
             '',
         ])
-        lines.extend(self._param_lines(session_status, include_help=include_param_help))
+        lines.extend(self._param_lines(session_status))
         return lines
+
+    @staticmethod
+    async def _send_command_document(message: Message, text: str, *, filename: str, caption: str) -> None:
+        await message.reply_document(document=text.encode('utf-8'), filename=filename, caption=caption)
+
+    async def _send_command(self, message: Message, text: str) -> None:
+        plain = command_views.plain_text(text)
+        # Telegram counts formatted text in UTF-16 units. Keep all content if
+        # an unusually long model name, preset or diagnostic exceeds its limit.
+        if len(plain.encode('utf-16-le')) // 2 > MessageLimit.MAX_TEXT_LENGTH:
+            await self._send_command_document(message, plain,
+                filename='command-details.txt', caption='Full details')
+            return
+        await message.reply_text(text, parse_mode='HTML')
 
     def _register_handlers(self) -> None:
         self.application.add_handler(CommandHandler('start', self.start_command))
@@ -379,6 +391,7 @@ class TelegramBotApp:
         self.application.add_handler(CommandHandler('provider', self.provider_command))
         self.application.add_handler(CommandHandler('model', self.model_command))
         self.application.add_handler(CommandHandler('params', self.params_command))
+        self.application.add_handler(CommandHandler('settings', self.params_command))
         self.application.add_handler(CommandHandler('param', self.param_command))
         self.application.add_handler(CommandHandler('retry', self.retry_command))
         self.application.add_handler(CommandHandler('rollback', self.rollback_command))
@@ -404,11 +417,11 @@ class TelegramBotApp:
             await update.effective_message.reply_text('[BOT] Whitelist restricted.')
             return
         settings = await self.store.get_or_create_session(self._session_id(chat), self._default_settings())
-        await update.effective_message.reply_text(
-            'Started.\n'
-            f'provider={settings.provider} model={settings.model}\n'
-            f'mode={settings.mode.value} process={settings.process_visibility.value} delivery={settings.response_delivery.value} stickers={settings.sticker_mode.value}\n\n'
-            'Use /help to see commands and controls.'
+        await self._send_command(update.effective_message,
+            '👋 <b>Ready to chat</b>\n'
+            f'<code>{html.escape(settings.model)}</code> · {html.escape(settings.provider)}\n'
+            f'Mode: <b>{html.escape(settings.mode.value)}</b>\n\n'
+            '/status — current state\n/settings — customize this chat\n/help — commands'
         )
 
 
@@ -416,28 +429,8 @@ class TelegramBotApp:
         chat = update.effective_chat
         if not chat or not self._allowed(chat):
             return
-        settings = await self.store.get_or_create_session(self._session_id(chat), self._default_settings())
-        lines = [
-            'Commands',
-            '/status [full] - concise session/context view by default; use full for the detailed parameter block',
-            f'/mode chat|assist|agent - current: {settings.mode.value}',
-            f'/process off|minimal|status|verbose|full - current: {settings.process_visibility.value}',
-            f'/delivery edit|final_new - current: {settings.response_delivery.value}',
-            f'/stickers off|auto - current: {settings.sticker_mode.value}',
-            f"/provider {'|'.join(sorted(self.runtime.providers.keys()))} - current: {settings.provider}",
-            '/model <name>|default - set the exact model string for the current provider',
-            '/params - show session tuning, defaults, and provider applicability',
-            '/param <name> <value|default> - trusted users only; use /params for the full parameter list and value semantics',
-            '/prompt - show prompt controls, including augment vs exact preset mode',
-            '/preset <name> [augment|exact]|clear and /presets - manage prompt presets',
-            '/reset - start a fresh context; keep searchable history and profiles',
-            '/reset_full - start a new agent with defaults; keep prior data for audit only',
-            '/reset session - restore settings only (history/all aliases remain supported)',
-            '/retry - regenerate from the latest visible user message after hiding newer assistant/tool output',
-            '/rollback [count] - hide the last visible consecutive user/bot block(s) from session history',
-            '',
-       ]
-        await update.effective_message.reply_text('\n'.join(lines))
+        topic = context.args[0].strip().lower() if context.args else ''
+        await self._send_command(update.effective_message, command_views.help_view(topic))
 
     async def reset_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
@@ -619,15 +612,18 @@ class TelegramBotApp:
         available = set(self.runtime.providers.keys())
         if value not in available:
             available_text = '|'.join(sorted(available))
-            await update.effective_message.reply_text(
-                f'Usage: /provider {available_text}\n'
-                f'Current provider: {settings.provider} (model={settings.model})'
+            await self._send_command(update.effective_message,
+                '🤖 <b>Provider</b>\n'
+                f'{html.escape(settings.provider)} · <code>{html.escape(settings.model)}</code>\n\n'
+                f'<code>/provider {html.escape(available_text)}</code>\n'
+                'Switching also selects that provider’s configured default model.'
             )
             return
         settings.provider = value
         settings.model = self.config.default_model_for_provider(value)
         await self.store.save_session(self._session_id(chat), settings)
-        await update.effective_message.reply_text(f'Provider set to {value}.')
+        await self._send_command(update.effective_message,
+            f'✅ <b>Provider updated</b>\n{html.escape(value)} · <code>{html.escape(settings.model)}</code>')
 
     async def model_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
@@ -636,9 +632,12 @@ class TelegramBotApp:
         settings = await self.store.get_or_create_session(self._session_id(chat), self._default_settings())
         value = (" ".join(context.args).strip() if context.args else '')
         if not value:
-            await update.effective_message.reply_text(
-                'Usage: /model <name>|default\n'
-                f'Current provider/model: {settings.provider}/{settings.model}'
+            await self._send_command(update.effective_message,
+                f'🤖 <b>Model</b> · {html.escape(settings.provider)}\n'
+                f'<code>{html.escape(settings.model)}</code>\n\n'
+                '<code>/model &lt;name&gt;</code> — use an exact model name\n'
+                '/model default — use the configured default\n'
+                '/params model — thinking and generation'
             )
             return
         if value.lower() == 'default':
@@ -646,7 +645,8 @@ class TelegramBotApp:
         else:
             settings.model = value
         await self.store.save_session(self._session_id(chat), settings)
-        await update.effective_message.reply_text(f'Model set to {settings.model} for provider {settings.provider}.')
+        await self._send_command(update.effective_message,
+            f'✅ <b>Model updated</b>\n{html.escape(settings.provider)} · <code>{html.escape(settings.model)}</code>')
 
 
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -655,20 +655,28 @@ class TelegramBotApp:
             return
         session_status = await self.runtime.describe_session(self._session_id(chat))
         flow = await self._flow_snapshot(chat.id)
-        full = bool(context.args and context.args[0].strip().lower() == 'full')
-        lines = self._status_lines(session_status, flow, full=full, include_param_help=full)
-        await update.effective_message.reply_text('\n'.join(lines))
+        topic = context.args[0].strip().lower() if context.args else ''
+        if topic == 'full':
+            lines = self._status_lines(session_status, flow)
+            await self._send_command_document(update.effective_message, '\n'.join(lines),
+                filename='status.txt', caption='Full chat status')
+            return
+        await self._send_command(update.effective_message, command_views.status_view(session_status, flow, topic))
 
 
     async def params_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
         if not chat or not self._allowed(chat):
             return
-        session_status = await self.runtime.describe_session(self._session_id(chat))
-        lines = self._param_lines(session_status, include_help=True)
-        if not self._advanced_allowed(update):
-            lines.append('This sender is not allowed to change advanced session parameters.')
-        await update.effective_message.reply_text('\n'.join(lines))
+        session_status = await self.runtime.describe_settings(self._session_id(chat))
+        topic = context.args[0].strip().lower() if context.args else ''
+        if topic == 'full':
+            await self._send_command_document(update.effective_message,
+                '\n'.join(self._param_lines(session_status)),
+                filename='settings.txt', caption='Full chat settings')
+            return
+        await self._send_command(update.effective_message,
+            command_views.settings_view(session_status, topic, can_change=self._advanced_allowed(update)))
 
     async def param_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
@@ -679,7 +687,13 @@ class TelegramBotApp:
             return
         settings = await self.store.get_or_create_session(self._session_id(chat), self._default_settings())
         if len(context.args) < 2:
-            await update.effective_message.reply_text('\n'.join(self._param_usage_lines(settings)))
+            session_status = await self.runtime.describe_settings(self._session_id(chat))
+            if context.args:
+                name = context.args[0].strip().lower()
+                text = command_views.parameter_view(session_status, name, self._parameter_usage(settings).get(name))
+            else:
+                text = command_views.settings_view(session_status, can_change=True)
+            await self._send_command(update.effective_message, text)
             return
         name = context.args[0].strip().lower()
         value = context.args[1].strip().lower()
@@ -1122,19 +1136,24 @@ class TelegramBotApp:
                 return
             settings.tool_history_mode = ToolHistoryMode(self.config.default_tool_history_mode) if value == 'default' else ToolHistoryMode(value)
         else:
-            await update.effective_message.reply_text('Unknown parameter. Use /params to inspect supported names.')
+            await self._send_command(update.effective_message,
+                'Unknown setting. Use /params to choose a group, then <code>/param name</code> for help.')
             return
         await self.store.save_session(self._session_id(chat), settings)
-        await update.effective_message.reply_text('Session parameter updated. Use /params or [/status full] to inspect the effective values.')
+        session_status = await self.runtime.describe_settings(self._session_id(chat))
+        await self._send_command(update.effective_message,
+            command_views.parameter_view(session_status, name, self._parameter_usage(settings).get(name), changed=True))
 
     async def presets_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._command_allowed(update):
             return
         names = self.preset_store.list_names()
         if not names:
-            await update.effective_message.reply_text('No presets found in data/presets.')
+            await self._send_command(update.effective_message, '📝 <b>Prompt presets</b>\nNo presets available.\n/prompt — edit this chat’s prompt')
             return
-        await update.effective_message.reply_text('Available presets: ' + ', '.join(names))
+        await self._send_command(update.effective_message,
+            '📝 <b>Prompt presets</b>\n' + '\n'.join(f'<code>{html.escape(name)}</code>' for name in names)
+            + '\n\n<code>/preset &lt;name&gt;</code> — apply a preset\n/help model — prompt modes')
 
     async def preset_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
@@ -1142,10 +1161,14 @@ class TelegramBotApp:
             return
         settings = await self.store.get_or_create_session(self._session_id(chat), self._default_settings())
         if not context.args:
-            current = settings.system_prompt.strip().splitlines()[0][:120] if settings.system_prompt.strip() else '(empty)'
-            await update.effective_message.reply_text(
-                'Usage: /preset <name> [augment|exact]|clear\n'
-                f'Current prompt preview: {current}'
+            await self._send_command(update.effective_message,
+                '📝 <b>Prompt preset</b>\n'
+                f'Mode: <code>{settings.prompt_injection_mode.value}</code>\n\n'
+                '<code>/preset &lt;name&gt; [augment|exact]</code>\n'
+                '/presets — available presets\n'
+                '/preset clear — restore the configured prompt\n'
+                '/prompt show — view the current prompt\n'
+                '/help model — prompt modes'
             )
             return
         name = context.args[0].strip()
@@ -1167,7 +1190,8 @@ class TelegramBotApp:
                 return
         settings.system_prompt = text
         await self.store.save_session(self._session_id(chat), settings)
-        await update.effective_message.reply_text(f'Preset loaded: {name} (prompt_injection={settings.prompt_injection_mode.value}).')
+        await self._send_command(update.effective_message,
+            f'✅ <b>Preset loaded</b>: {html.escape(name)}\nMode: <code>{settings.prompt_injection_mode.value}</code>')
 
     async def prompt_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
@@ -1175,27 +1199,22 @@ class TelegramBotApp:
             return
         settings = await self.store.get_or_create_session(self._session_id(chat), self._default_settings())
         if not context.args:
-            preview = settings.system_prompt.strip() or '(empty)'
-            if len(preview) > 700:
-                preview = preview[:700] + '\n[truncated]'
-            await update.effective_message.reply_text(
-                'Usage:\n'
-                '/prompt show\n'
-                '/prompt reset\n'
-                '/prompt set <text>\n'
-                '/prompt append <text>\n'
-                '/prompt mode <augment|exact>\n\n'
-                f'Current prompt mode: {settings.prompt_injection_mode.value}\n\n'
-                f'Current prompt:\n{preview}'
+            await self._send_command(update.effective_message,
+                '📝 <b>Chat prompt</b>\n'
+                f'Mode: <code>{settings.prompt_injection_mode.value}</code> · {len(settings.system_prompt):,} characters\n\n'
+                '/prompt show — read the full prompt\n'
+                '<code>/prompt set &lt;text&gt;</code> — replace\n'
+                '<code>/prompt append &lt;text&gt;</code> — add text\n'
+                '<code>/prompt mode augment|exact</code> — /help model\n'
+                '/prompt reset — restore the configured prompt'
             )
             return
         sub = context.args[0].strip().lower()
         rest = ' '.join(context.args[1:]).strip()
         if sub == 'show':
-            preview = settings.system_prompt.strip() or '(empty)'
-            if len(preview) > 3500:
-                preview = preview[:3500] + '\n[truncated]'
-            await update.effective_message.reply_text(f'Prompt mode: {settings.prompt_injection_mode.value}\n\n{preview}')
+            await self._send_command(update.effective_message,
+                f'📝 <b>Chat prompt</b> · {settings.prompt_injection_mode.value}\n\n'
+                + html.escape(settings.system_prompt or '(empty)'))
             return
         if sub == 'reset':
             settings.system_prompt = self._default_settings().system_prompt
@@ -2001,40 +2020,24 @@ class TelegramBotApp:
             return
         settings = await self.store.get_or_create_session(self._session_id(chat), self._default_settings())
         value = (context.args[0].strip().lower() if context.args else '')
-        if target == 'mode':
-            try:
-                settings.mode = ChatMode(value)
-            except Exception:
-                await update.effective_message.reply_text(f'Usage: /mode chat|assist|agent\nCurrent mode: {settings.mode.value}')
-                return
-            await self.store.save_session(self._session_id(chat), settings)
-            await update.effective_message.reply_text(f'Mode set to {settings.mode.value}.')
-            return
-        if target == 'process':
-            try:
-                settings.process_visibility = ProcessVisibility(value)
-            except Exception:
-                await update.effective_message.reply_text(f'Usage: /process off|minimal|status|verbose|full\nCurrent process visibility: {settings.process_visibility.value}')
-                return
-            await self.store.save_session(self._session_id(chat), settings)
-            await update.effective_message.reply_text(f'Process visibility set to {settings.process_visibility.value}.')
-            return
-        if target == 'stickers':
-            try:
-                settings.sticker_mode = StickerMode(value)
-            except Exception:
-                await update.effective_message.reply_text(f'Usage: /stickers off|auto\nCurrent sticker mode: {settings.sticker_mode.value}')
-                return
-            await self.store.save_session(self._session_id(chat), settings)
-            await update.effective_message.reply_text(f'Sticker mode set to {settings.sticker_mode.value}.')
-            return
+        attribute, enum, label, help_topic = {
+            'mode': ('mode', ChatMode, 'Reply mode', 'replies'),
+            'process': ('process_visibility', ProcessVisibility, 'Progress', 'replies'),
+            'stickers': ('sticker_mode', StickerMode, 'Stickers', 'tools'),
+            'delivery': ('response_delivery', ResponseDelivery, 'Answer delivery', 'replies'),
+        }[target]
         try:
-            settings.response_delivery = ResponseDelivery(value)
-        except Exception:
-            await update.effective_message.reply_text(f'Usage: /delivery edit|final_new\nCurrent delivery mode: {settings.response_delivery.value}')
+            selected = enum(value)
+        except ValueError:
+            choices = '|'.join(item.value for item in enum)
+            await self._send_command(update.effective_message,
+                f'⚙️ <b>{label}</b> · <code>{getattr(settings, attribute).value}</code>\n\n'
+                f'<code>/{target} {choices}</code>\n/help {help_topic} — what each option means')
             return
+        setattr(settings, attribute, selected)
         await self.store.save_session(self._session_id(chat), settings)
-        await update.effective_message.reply_text(f'Response delivery set to {settings.response_delivery.value}.')
+        await self._send_command(update.effective_message,
+            f'✅ <b>{label}</b> · <code>{selected.value}</code>')
 
     def _command_allowed(self, update: Update) -> bool:
         chat = update.effective_chat

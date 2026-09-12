@@ -78,6 +78,22 @@ class TelegramDeliverySourceTests(BusinessTestCase):
             actor_id='telegram:user:999', actor_kind='bot', actor_name='Fixture Bot')
         self.assertEqual((await self.store.list_canonical_messages(self.session))[0].message.metadata['source_revision'], 1)
 
+    async def test_formatted_multichunk_delivery_keeps_original_markdown_as_canonical_evidence(self):
+        raw = '**Remember this**\n\n```python\n' + '    print("你好🙂 _*[]")\n' * 300 + '```'
+        settings = await self.settings(process_visibility=ProcessVisibility.OFF)
+        result = TurnResult(raw, scope=await self.store.get_scope(self.session))
+        delivered = await self.app._deliver_result(self.source, self.renderer(), settings,
+            result, sent_before_receipts=[])
+        self.assertGreater(len(delivered), 1)
+        await self.record(raw, delivered)
+        originals = await self.store.list_canonical_messages(self.session)
+        self.assertEqual(len(originals), 1)
+        self.assertEqual(originals[0].message.parts[0].text, raw)
+        payloads = [call.kwargs for call in self.bot.send_message.await_args_list]
+        self.assertTrue(all(payload.get('parse_mode') is None for payload in payloads))
+        self.assertTrue(all(any(entity.type == 'pre' for entity in payload['entities']) for payload in payloads))
+        self.assertEqual(''.join(payload['text'] for payload in payloads).count('print("你好🙂 _*[]")'), 300)
+
     async def test_single_chunk_uses_primary_source_index_without_redundant_alias_row(self):
         delivered = []
         last = await self.app._send_text_message(self.source, 'One answer.', delivered_messages=delivered)
@@ -154,7 +170,7 @@ class TelegramDeliverySourceTests(BusinessTestCase):
             original = await self.runtime.ingest_user_message(session_id=self.session, incoming_message=incoming)
             originals.append(original.db_id)
             await self.app._reply_to_candidate(ReplyCandidate(original.db_id, 'Alex', self.message(number, actor=7)))
-        self.assertEqual([text for _, text in self.sent], [r'The key is in the blue bag\.', r'Yes, the blue bag\.'])
+        self.assertEqual([text for _, text in self.sent], ['The key is in the blue bag.', 'Yes, the blue bag.'])
         self.assertEqual(len(self.provider.requests), 2, 'Typing failures must not cause extra generation calls')
         self.assertGreaterEqual(self.bot.send_chat_action.await_count, 1)
         self.assertTrue(all(call.kwargs.get('reply_to_message_id') is None
@@ -186,7 +202,7 @@ class TelegramDeliverySourceTests(BusinessTestCase):
                     original = await self.runtime.ingest_user_message(session_id=self.session,
                         incoming_message=ConversationMessage.user_text(question))
                     await self.app._reply_to_candidate(ReplyCandidate(original.db_id, 'Alex', self.source))
-        self.assertEqual([text for _, text in self.sent if text != r'\.\.\.'], [r'The answer is ready\.'] * 4)
+        self.assertEqual([text for _, text in self.sent if text != '...'], ['The answer is ready.'] * 4)
         self.assertEqual(len(self.provider.requests), 4)
         self.app._notify_user_error.assert_not_awaited()
         stored = await (await self.new_store()).list_canonical_messages(self.session)
@@ -228,8 +244,8 @@ class TelegramDeliverySourceTests(BusinessTestCase):
         stored = await (await self.new_store()).list_canonical_messages(self.session)
         self.assertEqual([row.message.parts[0].text for row in stored if row.message.role == MessageRole.ASSISTANT],
             ['The tool finished.', 'The next answer.'] * 2)
-        self.assertEqual([text for _, text in self.sent if text != r'\.\.\.'],
-            [r'The tool finished\.', r'The next answer\.'] * 2)
+        self.assertEqual([text for _, text in self.sent if text != '...'],
+            ['The tool finished.', 'The next answer.'] * 2)
 
     async def test_optional_progress_cancellation_still_stops_processing(self):
         placeholder = self.message(2001)
@@ -252,7 +268,7 @@ class TelegramDeliverySourceTests(BusinessTestCase):
         send = self.bot.send_message.side_effect
 
         async def fail_answer(**kwargs):
-            if kwargs['text'] != r'\.\.\.':
+            if kwargs['text'] != '...':
                 raise TimedOut()
             return await send(**kwargs)
 

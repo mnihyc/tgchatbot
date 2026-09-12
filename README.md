@@ -66,11 +66,13 @@ Optional spontaneous group replies can be configured separately. Set
 
 | Command | Purpose |
 | --- | --- |
-| `/help`, `/status`, `/status full` | Commands and current state |
+| `/help [replies\|model\|context\|tools]` | Short command guide, with focused help by topic |
+| `/status [context\|memory\|tools]`, `/status full` | Compact status, topic details, or full diagnostics as a text file |
 | `/mode chat`, `/mode assist`, `/mode agent` | Conversation with read-only memory, occasional tools, or multistep tools |
 | `/provider`, `/model` | Inspect or change the chat's generation route |
 | `/presets`, `/preset <name>`, `/prompt` | Manage personality prompts |
-| `/params`, `/param <name> <value>` | Inspect or change supported session settings |
+| `/params` or `/settings`, `/params <group>` | Browse model, context, replies or tools settings; `full` downloads all values |
+| `/param <name>`, `/param <name> <value>` | Inspect one setting and its accepted inputs, or change it; `default` restores its configured default |
 | `/process off`, `/delivery final_new` | Control progress visibility and final-answer delivery |
 | `/stickers auto`, `/stickers off` | Enable or disable sticker tools in a tool-enabled mode |
 | `/retry` | Retry the latest eligible user message without duplicating it |
@@ -78,6 +80,11 @@ Optional spontaneous group replies can be configured separately. Set
 | `/reset` or `/reset history` | Clear working context; retain searchable history, profiles and settings |
 | `/reset_full` or `/reset all` | Start a fresh agent with defaults; previous generations become operator-audit-only |
 | `/reset session` | Restore session settings while retaining conversation and learned profiles |
+
+Commands send ordinary, persistent chat messages. Settings apply to the entire
+chat; `TGBOT_CONTROL_UIDS` restricts `/param` to trusted users when configured.
+Agent replies support Markdown formatting, including bold text, links and code
+blocks. Long replies retain formatting across messages.
 
 Retry and rollback affect the current context. They do not retract Telegram
 messages or undo remote actions. Full reset leaves the shared sticker library and

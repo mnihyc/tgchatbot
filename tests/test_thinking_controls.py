@@ -110,10 +110,11 @@ class ThinkingCommandWorkflows(BusinessTestCase):
         ):
             with self.subTest(model=model):
                 await self.settings(provider='gemini', model=model, thinking_level='high')
-                await app.param_command(update, SimpleNamespace(args=[]))
-                choices = next(line for line in message.reply_text.call_args.args[0].splitlines()
-                    if line.startswith('thinking_level '))
-                self.assertEqual(choices, 'thinking_level <' +
+                await app.param_command(update, SimpleNamespace(args=['thinking_level']))
+                from tgchatbot.transports.telegram_command_views import plain_text
+                choices = next(line for line in plain_text(message.reply_text.call_args.args[0]).splitlines()
+                    if line.startswith('/param thinking_level <'))
+                self.assertEqual(choices, '/param thinking_level <' +
                     ('minimal|' if supports_minimal else '') + 'low|medium|high|default>')
 
                 await app.param_command(update, SimpleNamespace(args=['thinking_level', 'minimal']))
