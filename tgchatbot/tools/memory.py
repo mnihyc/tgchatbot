@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 import uuid
 
+from psycopg import Error as DatabaseError
+
 from tgchatbot.domain.models import MessageRole
 from tgchatbot.domain.timestamps import format_timestamp
 from tgchatbot.embeddings import EmbeddingClient, EmbeddingConfig
@@ -277,11 +279,13 @@ async def rebuild(store: PostgresStore, session_id: str, space_id: str, *, progr
 
 
 async def audit_records(store: PostgresStore, session_id: str, *, message_id: int | None = None,
+                        telegram_message_id: int | None = None,
                         generation: int | None = None, after_message_id: int = 0,
                         after_revision: int = 0,
                         options: OperationsConfig | None = None) -> AsyncIterator[dict[str, Any]]:
     options = options if options is not None else from_env(OperationsConfig, 'MEMORY_OPERATIONS')
     await existing_scope(store, session_id)
+    source_chat_id = session_id.removeprefix('telegram:')
     while True:
         async with store.pool.connection() as conn:
             rows = await (await conn.execute('''SELECT m.id AS message_id,m.session_id,m.generation,m.context_id,
@@ -289,14 +293,83 @@ async def audit_records(store: PostgresStore, session_id: str, *, message_id: in
                 m.sent_at,m.hidden,m.deleted,r.revision,r.body,r.parts,r.metadata,r.edited_at,r.created_at
                 FROM messages m JOIN message_revisions r ON r.message_id=m.id
                 WHERE m.session_id=%s AND (%s::bigint IS NULL OR m.id=%s)
+                AND (%s::text IS NULL OR (m.source='telegram' AND m.source_chat_id=%s
+                    AND m.source_message_id=%s) OR EXISTS (
+                    SELECT 1 FROM message_source_aliases a WHERE a.message_id=m.id
+                    AND a.session_id=m.session_id AND a.generation=m.generation
+                    AND a.source='telegram' AND a.source_chat_id=%s AND a.source_message_id=%s))
                 AND (%s::bigint IS NULL OR m.generation=%s) AND (m.id,r.revision)>(%s,%s)
                 ORDER BY m.id,r.revision LIMIT %s''',
-                (session_id, message_id, message_id, generation, generation, after_message_id, after_revision, options.page_size))).fetchall()
+                (session_id, message_id, message_id,
+                 str(telegram_message_id) if telegram_message_id is not None else None,
+                 source_chat_id, str(telegram_message_id), source_chat_id, str(telegram_message_id),
+                 generation, generation, after_message_id, after_revision, options.page_size))).fetchall()
         if not rows:
             return
         for row in rows:
             yield {'type': 'audit_revision', **row}
         after_message_id, after_revision = rows[-1]['message_id'], rows[-1]['revision']
+
+
+async def job_records(store: PostgresStore, session_id: str, *, status: str | None = None,
+                      kind: str | None = None, job_id: int | None = None,
+                      generation: int | None = None,
+                      options: OperationsConfig | None = None) -> AsyncIterator[dict[str, Any]]:
+    """Stream saved job state, including errors and accepted remote operation identities."""
+    options = options if options is not None else from_env(OperationsConfig, 'MEMORY_OPERATIONS')
+    scope = await existing_scope(store, session_id)
+    generation = scope['generation'] if generation is None else generation
+    after = 0
+    while True:
+        async with store.pool.connection() as conn:
+            rows = await (await conn.execute('''SELECT * FROM jobs
+                WHERE session_id=%s AND generation=%s AND id>%s
+                AND (%s::text IS NULL OR status=%s) AND (%s::text IS NULL OR kind=%s)
+                AND (%s::bigint IS NULL OR id=%s) ORDER BY id LIMIT %s''',
+                (session_id, generation, after, status, status, kind, kind, job_id, job_id,
+                 options.page_size))).fetchall()
+        if not rows:
+            return
+        for row in rows:
+            yield {'type': 'memory_job', **row}
+        after = rows[-1]['id']
+
+
+async def profile_records(store: PostgresStore, session_id: str, *, max_bytes: int,
+                          actor_id: str | None = None,
+                          options: OperationsConfig | None = None) -> AsyncIterator[dict[str, Any]]:
+    """Inspect current bounded profiles and pending material without refreshing them."""
+    from tgchatbot.domain.profiles import present_profile
+    options = options if options is not None else from_env(OperationsConfig, 'MEMORY_OPERATIONS')
+    scope = await existing_scope(store, session_id)
+    after = ''
+    while True:
+        async with store.pool.connection() as conn:
+            if actor_id is not None:
+                actors = [actor_id]
+            else:
+                rows = await (await conn.execute('''SELECT actor_id FROM (
+                    SELECT actor_id FROM profile_current WHERE session_id=%s AND generation=%s
+                    UNION SELECT actor_id FROM profile_inputs
+                        WHERE session_id=%s AND generation=%s AND pending_bytes>0
+                    ) actors WHERE actor_id>%s ORDER BY actor_id LIMIT %s''',
+                    (session_id, scope['generation'], session_id, scope['generation'], after,
+                     options.page_size))).fetchall()
+                actors = [row['actor_id'] for row in rows]
+        if not actors:
+            await store.assert_scope(session_id, scope, generation_only=True)
+            return
+        snapshot = await store.fetch_profile_snapshot(session_id, actors,
+            expected_scope=scope, max_bytes=max_bytes, include_pending=True)
+        for document in snapshot['profiles']:
+            actor = document['actor_id']
+            yield {'type': 'current_profile', 'session_id': session_id, **snapshot['scope'],
+                   'as_of': snapshot['as_of'], 'profile': present_profile(document),
+                   'evidence': [fact for fact in snapshot['facts'] if fact['subject_actor_id'] == actor],
+                   'pending_material': snapshot['pending_material'][actor]}
+        if actor_id is not None:
+            return
+        after = actors[-1]
 
 
 async def audit_state_records(store: PostgresStore, session_id: str, *,
@@ -404,18 +477,55 @@ async def _run(args: argparse.Namespace) -> None:
     session_id = f'telegram:{args.chat_id}' if getattr(args, 'chat_id', None) is not None else None
     try:
         await store.initialize()
+        if args.command == 'jobs':
+            async for record in job_records(store, session_id, status=args.status, kind=args.kind,
+                    job_id=args.job_id, generation=args.generation, options=options):
+                emit(record)
+            return
+        if args.command == 'profiles':
+            async for record in profile_records(store, session_id, actor_id=args.actor_id,
+                    max_bytes=config.memory.profile_bytes, options=options):
+                emit(record)
+            return
+        if args.command == 'context':
+            from tgchatbot.tools.memory_inspection import context_records
+            async for record in context_records(store, session_id, options=options):
+                emit(record)
+            return
+        if args.command == 'read':
+            from tgchatbot.tools.memory_inspection import query_memory
+            emit(await query_memory(store, config, None, session_id, message_ids=args.message_id,
+                offset=args.offset, length=args.length, include_neighbors=args.neighbors))
+            return
+        if args.command == 'image':
+            from tgchatbot.tools.memory_inspection import export_image
+            emit(await export_image(store, session_id, message_id=args.message_id,
+                image_id=args.image_id, output=args.output))
+            return
+        if args.command == 'search' and args.lexical_only:
+            from tgchatbot.tools.memory_inspection import query_memory
+            emit(await query_memory(store, config, None, session_id, query=args.query,
+                actor_id=args.actor_id, before=args.before, after=args.after, limit=args.limit,
+                lexical_only=True))
+            return
         if args.command == 'audit':
             if args.state:
                 async for record in audit_state_records(store, session_id, generation=args.generation, options=options):
                     emit(record)
             async for record in audit_records(store, session_id, message_id=args.message_id,
+                    telegram_message_id=args.telegram_message_id,
                     generation=args.generation, after_message_id=args.after_message_id, after_revision=args.after_revision, options=options):
                 emit(record)
             return
         embedding_config = EmbeddingConfig.from_env()
         if embedding_config.enabled and embedding_config.dimensions != EMBEDDING_DIMENSIONS:
             raise ValueError(f'Conversation memory requires EMBEDDING_DIMENSIONS={EMBEDDING_DIMENSIONS}')
-        if args.command == 'status':
+        if args.command == 'search':
+            from tgchatbot.tools.memory_inspection import query_memory
+            emit(await query_memory(store, config, embedding_config, session_id, query=args.query,
+                actor_id=args.actor_id, before=args.before, after=args.after, limit=args.limit,
+                lexical_only=args.lexical_only))
+        elif args.command == 'status':
             async for record in status_records(store, embedding_config.space_id, session_id, include_coverage=args.coverage, options=options):
                 emit(record)
         elif args.command == 'rebuild':
@@ -460,9 +570,41 @@ def parser() -> argparse.ArgumentParser:
     rebuild_parser.add_argument('--chat-id', type=_nonzero, required=True)
     retry = commands.add_parser('retry-jobs', help='Resume failed jobs in this chat and selected space, preserving paid Batch identity')
     retry.add_argument('--chat-id', type=_nonzero, required=True)
+    jobs = commands.add_parser('jobs', help='Stream saved job errors, progress and remote identities; current generation by default')
+    jobs.add_argument('--chat-id', type=_nonzero, required=True)
+    jobs.add_argument('--status', help='Exact saved job status')
+    jobs.add_argument('--kind', help='Exact job kind')
+    jobs.add_argument('--job-id', type=_positive)
+    jobs.add_argument('--generation', type=_positive, help='Inspect this retained generation instead of the current one')
+    profiles = commands.add_parser('profiles', help='Inspect current stored profiles and pending material without model calls')
+    profiles.add_argument('--chat-id', type=_nonzero, required=True)
+    profiles.add_argument('--actor-id', help='Stable actor ID; omit to discover profiles and pending actors')
+    context = commands.add_parser('context', help='Inspect current context layers and counts without model calls')
+    context.add_argument('--chat-id', type=_nonzero, required=True)
+    search = commands.add_parser('search', help='Search currently retrievable memory; may call embeddings unless --lexical-only')
+    search.add_argument('--chat-id', type=_nonzero, required=True)
+    search.add_argument('--query', required=True)
+    search.add_argument('--actor-id')
+    search.add_argument('--before', help='Latest source date/time in the configured timezone')
+    search.add_argument('--after', help='Earliest source date/time in the configured timezone')
+    search.add_argument('--limit', type=_positive)
+    search.add_argument('--lexical-only', action='store_true', help='Search stored text without embedding requests')
+    read = commands.add_parser('read', help='Read current retrievable originals without model calls; use audit for old full-reset generations')
+    read.add_argument('--chat-id', type=_nonzero, required=True)
+    read.add_argument('--message-id', type=_positive, action='append', required=True, help='Internal memory message ID; may repeat')
+    read.add_argument('--offset', type=int, default=0)
+    read.add_argument('--length', type=_positive)
+    read.add_argument('--neighbors', action='store_true')
+    image = commands.add_parser('image', help='Export one retained compressed image from currently retrievable memory without model calls')
+    image.add_argument('--chat-id', type=_nonzero, required=True)
+    image.add_argument('--message-id', type=_positive, required=True, help='Internal memory message ID')
+    image.add_argument('--image-id', required=True, help='Image ID shown beside a memory read/search result')
+    image.add_argument('--output', type=Path, required=True, help='Destination file for the retained compressed image')
     audit = commands.add_parser('audit', help='Stream original revisions, including old generations and hidden/deleted messages')
     audit.add_argument('--chat-id', type=_nonzero, required=True)
-    audit.add_argument('--message-id', type=_positive, help='Internal PostgreSQL message ID, not Telegram message ID')
+    audit_source = audit.add_mutually_exclusive_group()
+    audit_source.add_argument('--message-id', type=_positive, help='Internal PostgreSQL message ID, not Telegram message ID')
+    audit_source.add_argument('--telegram-message-id', type=int, help='Telegram message ID in this chat, including historical export IDs and split reply aliases')
     audit.add_argument('--generation', type=_positive)
     audit.add_argument('--state', action='store_true', help='Include retired generation settings/persona and retained hosted Batch identities')
     audit.add_argument('--after-message-id', type=int, default=0, help='Resume after the pair (internal message ID, revision)')
@@ -479,7 +621,7 @@ def main() -> None:
         asyncio.run(_run(args))
     except KeyboardInterrupt:
         arguments.exit(130, 'Memory worker stopped; durable jobs remain resumable.\n')
-    except (ValueError, RuntimeError) as exc:
+    except (ValueError, RuntimeError, OSError, DatabaseError) as exc:
         arguments.exit(1, f'Memory operation stopped: {exc}\n')
 
 

@@ -277,7 +277,7 @@ def parse_args(argv=None):
 
 
 async def run(args):
-    load_dotenv()
+    load_dotenv(Path.cwd() / '.env')
     config, build_config = load_config(require_telegram=False), BuildConfig.from_env()
     # Build transport waits are independent of interactive chat latency settings.
     if build_config.provider in {'gemini', 'openai'}:

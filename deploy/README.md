@@ -110,8 +110,8 @@ results report unsupported on the current API routes.
 
 The bot starts with an empty sticker catalog. Add original media and build it
 explicitly; normal updates do not regenerate it or make annotation requests.
-See [maintenance commands](https://github.com/mnihyc/tgchatbot/blob/main/scripts/README.md) for append, selected regeneration,
-corrections, imports and memory work.
+See [maintenance commands](https://github.com/mnihyc/tgchatbot/blob/main/scripts/README.md) for catalog inspection, selected regeneration,
+corrections, imports, profiles and memory work.
 
 To stop everything, use `docker compose stop`; restart with `./update.sh` so the
 bundled database is started as needed. For maintenance that uses PostgreSQL,

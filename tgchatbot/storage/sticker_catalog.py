@@ -1,7 +1,7 @@
 """Versioned sticker catalog. Active readers never observe a partially built revision."""
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass, field
 from importlib.resources import files
 import hashlib
@@ -10,7 +10,7 @@ import uuid
 from typing import Any
 
 import numpy as np
-from psycopg import AsyncConnection
+from psycopg import AsyncConnection, AsyncServerCursor
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -172,6 +172,105 @@ class StickerCatalogStore:
             expected_parent=revision['id'], pack_descriptions=descriptions)
         await self.activate(revision_id)
         return revision_id
+
+    @staticmethod
+    async def _inspection_revision(conn, revision_id: str | None) -> dict | None:
+        row = await (await conn.execute('''SELECT revision.*,head.revision_id AS active_revision_id
+            FROM sticker_catalog_head head LEFT JOIN sticker_catalog_revisions revision
+              ON revision.id=COALESCE(%s,head.revision_id) WHERE head.singleton''', (revision_id,))).fetchone()
+        if not row or row['id'] is None:
+            if revision_id is not None:
+                raise KeyError(f'Unknown sticker revision: {revision_id}')
+            return None
+        return row
+
+    async def inspect_revision(self, revision_id: str | None = None) -> dict:
+        """Read publication status and saved build channels without loading vectors."""
+        async with self.store.pool.connection() as conn:
+            async with conn.transaction():
+                await conn.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+                revision = await self._inspection_revision(conn, revision_id)
+                if revision is None:
+                    return {'revision_id': None, 'active_revision_id': None, 'counts': {}}
+                rows = await (await conn.execute('''SELECT state,count(*) AS assets,
+                    count(*) FILTER (WHERE generated_card IS NOT NULL AND generated_card<>'null'::jsonb) AS saved_annotations,
+                    count(reading_vectors_id) AS saved_reading_vectors,
+                    count(image_vector_id) AS saved_image_vectors
+                    FROM sticker_catalog_items WHERE revision_id=%s GROUP BY state ORDER BY state''',
+                    (revision['id'],))).fetchall()
+                failures = await (await conn.execute('''SELECT asset_id,aliases,error
+                    FROM sticker_catalog_items WHERE revision_id=%s AND state='failed' ORDER BY asset_id''',
+                    (revision['id'],))).fetchall()
+        return {**{key: value for key, value in revision.items() if key != 'id'}, 'revision_id': revision['id'],
+                'parent_is_current': revision['parent_id'] == revision['active_revision_id'],
+                'counts': {row['state']: {key: value for key, value in row.items() if key != 'state'} for row in rows},
+                'failures': failures}
+
+    async def iter_revisions(self):
+        """Stream every revision, including interrupted staging work."""
+        async with self.store.pool.connection() as conn:
+            async with conn.transaction():
+                await conn.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+                async with AsyncServerCursor(conn, name='sticker_revision_inspection') as cursor:
+                    cursor.itersize = self.store.config.read_page_size
+                    await cursor.execute('''SELECT revision.id AS revision_id,revision.parent_id,
+                        revision.state,revision.source_root,revision.created_at,revision.activated_at,
+                        head.revision_id AS active_revision_id,
+                        revision.parent_id IS NOT DISTINCT FROM head.revision_id AS parent_is_current
+                        FROM sticker_catalog_revisions revision CROSS JOIN sticker_catalog_head head
+                        WHERE head.singleton ORDER BY revision.created_at DESC,revision.id DESC''')
+                    async for row in cursor:
+                        yield row
+
+    async def iter_assets(self, revision_id: str | None = None, *, pack: str | None = None,
+                          state: str | None = None, asset_ids: list[str] | None = None, details: bool = False):
+        """Stream catalog records from one snapshot, never their binary vectors."""
+        async with self.store.pool.connection() as conn:
+            async with conn.transaction():
+                await conn.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+                revision = await self._inspection_revision(conn, revision_id)
+                if revision is None:
+                    return
+                columns = ('item.asset_id,item.content_hash,item.aliases,item.media,item.generated_card,'
+                    'item.corrections,item.card,item.provenance,item.dimensions,item.state,item.error,'
+                    'item.image_vector_id IS NOT NULL AS has_image_vector,'
+                    'item.reading_vectors_id IS NOT NULL AS has_reading_vectors'
+                    if details else "item.asset_id,item.aliases,item.card->>'caption' AS caption,item.state,item.error")
+                conditions = ['item.revision_id=%s']
+                parameters: list[Any] = [revision['id']]
+                if pack is not None:
+                    conditions.append("EXISTS(SELECT 1 FROM jsonb_array_elements(item.aliases) alias WHERE alias->>'pack'=%s)")
+                    parameters.append(pack)
+                if state is not None:
+                    conditions.append('item.state=%s')
+                    parameters.append(state)
+                if asset_ids is not None:
+                    conditions.append('item.asset_id=ANY(%s)')
+                    parameters.append(asset_ids)
+                async with AsyncServerCursor(conn, name='sticker_asset_inspection') as cursor:
+                    cursor.itersize = self.store.config.read_page_size
+                    await cursor.execute('SELECT ' + columns + ' FROM sticker_catalog_items item WHERE '
+                                         + ' AND '.join(conditions) + ' ORDER BY item.asset_id', parameters)
+                    async for row in cursor:
+                        packs = {alias['pack'] for alias in row['aliases']}
+                        yield {'revision_id': revision['id'], **row,
+                               'pack_descriptions': {pack: description for pack, description in revision['pack_descriptions'].items()
+                                                     if pack in packs}}
+
+    async def inspect_asset(self, asset_id: str, revision_id: str | None = None) -> dict:
+        async with aclosing(self.iter_assets(revision_id, asset_ids=[asset_id], details=True)) as records:
+            async for row in records:
+                return row
+        raise KeyError(f'Unknown sticker asset: {asset_id}')
+
+    async def export_corrections(self, revision_id: str | None = None, *,
+                                 asset_ids: list[str] | None = None, pack: str | None = None) -> dict[str, dict]:
+        """Export complete saved overrides in the builder's existing input format."""
+        result = {row['asset_id']: row['corrections'] async for row in
+                  self.iter_assets(revision_id, asset_ids=asset_ids, pack=pack, details=True)}
+        if asset_ids and (missing := set(asset_ids) - result.keys()):
+            raise KeyError('Sticker assets not found in selection: ' + ', '.join(sorted(missing)))
+        return result
 
     async def get_asset(self, asset_id: str, revision_id: str | None = None) -> CatalogAsset | None:
         async with self.store.pool.connection() as conn:

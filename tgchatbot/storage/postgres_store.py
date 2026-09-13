@@ -1522,7 +1522,8 @@ class PostgresStore:
 
     async def fetch_profile_snapshot(self, session_id: str, actor_ids: Sequence[str], *,
                                      expected_scope: Mapping[str, Any] | None = None,
-                                     max_bytes: int, for_learning: bool = False) -> dict[str, Any]:
+                                     max_bytes: int, for_learning: bool = False,
+                                     include_pending: bool = False) -> dict[str, Any]:
         """Read bounded documents and their internal evidence from one committed snapshot."""
         from psycopg import AsyncServerCursor
         from tgchatbot.domain.profiles import profile_document
@@ -1562,10 +1563,24 @@ class PostgresStore:
                 facts.extend(accepted)
             if for_learning:
                 await add_source_dates(conn, profiles)
+            if include_pending:
+                # Learning publishes facts and consumes source spans atomically.
+                # Operator progress must describe that same committed snapshot.
+                pending_material = {actor_id: {'sources': 0, 'bytes': 0,
+                    'first_message_id': None, 'last_message_id': None} for actor_id in actor_ids}
+                if scope is not None:
+                    pending = await (await conn.execute('''SELECT actor_id,count(*) AS sources,
+                        sum(pending_bytes) AS bytes,min(message_id) AS first_message_id,
+                        max(message_id) AS last_message_id FROM profile_inputs
+                        WHERE session_id=%s AND generation=%s AND actor_id=ANY(%s) AND pending_bytes>0
+                        GROUP BY actor_id''', (session_id, scope['generation'], list(actor_ids)))).fetchall()
+                    pending_material.update({row['actor_id']: {key: int(value) for key, value in row.items()
+                        if key != 'actor_id'} for row in pending})
         if expected_scope is not None:
             await self.assert_scope(session_id, expected_scope)
         return {'scope': dict(scope) if scope is not None else None, 'as_of': as_of,
-                'profiles': profiles, 'facts': facts}
+                'profiles': profiles, 'facts': facts,
+                **({'pending_material': pending_material} if include_pending else {})}
 
     async def claim_profile_batch(self, **kwargs):
         from tgchatbot.storage.profiles import claim_batch

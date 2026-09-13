@@ -1,9 +1,10 @@
 # Maintenance
 
 Run these commands from the deployment directory. They use the existing `.env`
-and PostgreSQL configuration and do not send Telegram messages. Start the database
-with `./update.sh` before maintenance if it is stopped. For source development,
-replace `docker compose run --rm --no-deps bot python` with `uv run --frozen python`.
+and PostgreSQL configuration and do not send Telegram messages. If the bundled
+database is stopped, start only it with `docker compose up -d postgres`.
+For source development, replace the Docker command prefix through `python`
+with `uv run --frozen python`.
 Use each command's `--help` for its arguments.
 
 ## Workspace file reading
@@ -75,7 +76,25 @@ docker compose run --rm --no-deps bot python -m scripts.build_sticker_index --as
 docker compose run --rm --no-deps bot python -m scripts.build_sticker_index --resume REVISION_ID
 ```
 
-The default operation adds new content and refreshes current file paths and pack
+Discover IDs and inspect saved work without model requests or SQL:
+
+```sh
+docker compose run --rm --no-deps bot python -m scripts.sticker_catalog status
+docker compose run --rm --no-deps bot python -m scripts.sticker_catalog revisions
+docker compose run --rm --no-deps bot python -m scripts.sticker_catalog status --revision REVISION_ID
+docker compose run --rm --no-deps bot python -m scripts.sticker_catalog assets --pack 'Blue bird'
+docker compose run --rm --no-deps bot python -m scripts.sticker_catalog asset ASSET_ID
+```
+
+`assets` lists IDs, file paths, captions and processing states; use `--state failed`
+and `--revision` to inspect interrupted work. `asset` shows the original generated
+card, saved corrections, effective card and provenance, without binary vectors.
+`revisions` finds staging IDs even if a build's terminal output was lost. Check that
+revision's status for failures, saved channels, original source and model settings
+before resuming. A staging revision whose parent is no longer current cannot resume;
+start from the current catalog instead.
+
+By default, `build_sticker_index` adds new content and refreshes current file paths and pack
 membership, reusing completed compatible analysis. Run it after moving folders;
 use selection flags only when you want to regenerate analysis. Explicitly saved
 pack preferences use folder names, so update those preferences if you rename them.
@@ -100,7 +119,22 @@ embedding routes use card descriptions for best-effort appearance retrieval;
 candidate previews still come from original images. Sampling and
 other settings are listed in [the full configuration example](../.env.full.example).
 
-Apply reviewed corrections with `--corrections /app/data/corrections.json`:
+Export saved corrections before editing, so unrelated overrides are preserved:
+
+```sh
+docker compose run --rm --no-deps -T bot python -m scripts.sticker_catalog corrections \
+  --asset-id ASSET_ID > data/corrections.json
+```
+
+Use `--pack` to export a pack or omit selectors for all assets. Edit this JSON and
+apply it:
+
+```sh
+docker compose run --rm --no-deps bot python -m scripts.build_sticker_index \
+  --corrections /app/data/corrections.json
+```
+
+Example correction object:
 
 ```json
 {
@@ -111,8 +145,12 @@ Apply reviewed corrections with `--corrections /app/data/corrections.json`:
 }
 ```
 
-Corrections survive regeneration. Family labels need evidence; sharing a pack
-does not prove that two stickers depict the same character. Keep all original
+Each selected asset's correction object replaces its previous overrides; omitted
+assets keep theirs. `{}` clears an asset's overrides, restoring its generated card.
+The builder updates affected embeddings and still discovers new source files;
+applying corrections can incur charges. Inspect the published asset to verify the
+effective result. Corrections survive regeneration. Family labels need evidence;
+sharing a pack does not prove that two stickers depict the same character. Keep all original
 files needed for delivery. The bot verifies content identity before sending.
 
 Inspect candidates without sending or changing preferences:
@@ -122,8 +160,9 @@ docker compose run --rm --no-deps bot python -m scripts.query_sticker_index \
   --intent-core 'Offer a warm greeting'
 ```
 
-`--session-id` includes that chat's saved preferences and confirmed delivery
-history. `--plan` accepts the structured `sticker_query` arguments. Candidate
+This semantic query can incur embedding charges. `--session-id` includes that
+chat's saved preferences and confirmed delivery history. `--plan` accepts the
+structured `sticker_query` arguments. Candidate
 previews are evidence for selection; they are not automatically sent to Telegram.
 
 ## Import Telegram Desktop history
@@ -179,6 +218,9 @@ Inspect work in another terminal:
 ```sh
 docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory status --chat-id=-1001234567890
 docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory status --chat-id=-1001234567890 --coverage
+docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory jobs --chat-id=-1001234567890 --status failed
+docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory profiles --chat-id=-1001234567890
+docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory context --chat-id=-1001234567890
 docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory retry-jobs --chat-id=-1001234567890
 docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory rebuild --chat-id=-1001234567890
 docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory audit --chat-id=-1001234567890 --state
@@ -190,9 +232,39 @@ accepted Batch identities; ambiguous submissions are reconciled before any new
 submission. A changed or unknown space is reported rather than silently mixed.
 Inspection, queueing and audit commands themselves make no model requests.
 
+`status` without a chat selector discovers existing sessions. `jobs` streams saved
+errors, attempts, scheduling and provider checkpoint details; filter by `--job-id`,
+`--kind`, `--status` or `--generation`. It defaults to the current generation.
+`profiles` discovers participant IDs and shows their current bounded profiles,
+evidence and pending learning material; `--actor-id` focuses on one participant.
+It never triggers a refresh. `context` shows current raw-message counts and the
+remaining compaction summaries with source ranges and layers, without dumping
+original bodies. Traversal page sizes control fetches, not total output limits.
+
+Check what the agent can retrieve:
+
+```sh
+docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory search \
+  --chat-id=-1001234567890 --query 'the travel plans' --lexical-only
+docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory read \
+  --chat-id=-1001234567890 --message-id MESSAGE_ID
+docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory image \
+  --chat-id=-1001234567890 --message-id MESSAGE_ID --image-id IMAGE_ID --output /app/data/recalled.png
+```
+
+Omit `--lexical-only` to use the configured semantic embedding route, which can
+incur query charges. Search accepts participant/time filters; read supports
+`--offset`, `--length` and `--neighbors`. Both reuse the agent's retrieval bounds
+and return source identities and available image IDs. `image` saves the selected
+compressed image to a new file; it does not overwrite an existing output. These
+reads include history before `/reset` and exclude history before `/reset_full`.
+
 Audit is an operator-only view and may include hidden originals, prior generations
 and settings snapshots. It is not an agent tool. `--message-id` refers to the
 internal database ID, not a Telegram ID. Treat its output as retained chat data.
+Use `audit --chat-id=CHAT_ID --telegram-message-id TELEGRAM_ID` to find an original
+directly from its Telegram ID, including delivery-chunk aliases. `--generation`
+selects retained history; without it audit includes all generations.
 
 Stop the dedicated worker before restarting the bot with `./update.sh`. The bot
 can continue accepted jobs. Do not run separate workers against the same live

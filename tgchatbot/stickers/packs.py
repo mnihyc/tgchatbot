@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from pathlib import Path
 
 from dotenv import load_dotenv
 from psycopg import Error as DatabaseError
@@ -28,7 +29,7 @@ def parse_args(argv=None):
 
 
 async def run(args):
-    load_dotenv()
+    load_dotenv(Path.cwd() / '.env')
     config = load_config(require_telegram=False)
     store = PostgresStore(config.database_url)
     try:

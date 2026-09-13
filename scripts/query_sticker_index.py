@@ -24,7 +24,7 @@ from tgchatbot.tools.sticker_send import _candidate_payload
 
 
 async def run(args):
-    load_dotenv()
+    load_dotenv(Path.cwd() / '.env')
     config = load_config(require_telegram=False)
     store = PostgresStore(config.database_url)
     embeddings = EmbeddingClient(sticker_embedding_config())
