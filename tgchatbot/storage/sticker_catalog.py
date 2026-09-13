@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib.resources import files
 import hashlib
 import struct
@@ -65,6 +65,7 @@ class CatalogSnapshot:
     recipe: dict
     source_root: str
     assets: tuple[CatalogAsset, ...]
+    pack_descriptions: dict[str, str] = field(default_factory=dict)
 
 
 _UNSET = object()
@@ -121,7 +122,56 @@ class StickerCatalogStore:
                 if revision is None:
                     raise KeyError(revision_id)
                 rows = await (await conn.execute(ITEM_SELECT + ' WHERE item.revision_id=%s ORDER BY item.asset_id', (revision_id,))).fetchall()
-        return CatalogSnapshot(revision_id, revision['recipe'], revision['source_root'], tuple(self._asset(row) for row in rows))
+        return CatalogSnapshot(revision_id, revision['recipe'], revision['source_root'],
+                               tuple(self._asset(row) for row in rows), revision['pack_descriptions'])
+
+    async def _active_pack_metadata(self) -> dict | None:
+        # One statement reads the head, its metadata and its pack membership
+        # together, without fetching card contents or vector bytes.
+        async with self.store.pool.connection() as conn:
+            return await (await conn.execute('''SELECT revision.id,revision.source_root,
+                revision.recipe,revision.pack_descriptions,
+                ARRAY(SELECT DISTINCT alias.value->>'pack'
+                    FROM sticker_catalog_items item,
+                         jsonb_array_elements(item.aliases) AS alias(value)
+                    WHERE item.revision_id=revision.id
+                      AND NULLIF(alias.value->>'pack','') IS NOT NULL
+                    ORDER BY 1) AS pack_ids
+                FROM sticker_catalog_head head
+                JOIN sticker_catalog_revisions revision ON revision.id=head.revision_id
+                WHERE head.singleton''')).fetchone()
+
+    async def list_pack_descriptions(self) -> dict[str, str | None]:
+        """List current packs and configured IDs retained after a folder move."""
+        revision = await self._active_pack_metadata()
+        if revision is None:
+            return {}
+        descriptions = revision['pack_descriptions']
+        return {pack: descriptions.get(pack) for pack in sorted(set(revision['pack_ids']) | descriptions.keys())}
+
+    async def update_pack_descriptions(self, updates: dict[str, str | None]) -> str:
+        """Update current or already configured packs; None removes a description."""
+        revision = await self._active_pack_metadata()
+        if revision is None:
+            raise CatalogConflict('No active sticker catalog')
+        unknown = updates.keys() - (set(revision['pack_ids']) | revision['pack_descriptions'].keys())
+        if unknown:
+            raise KeyError('Unknown sticker pack: ' + ', '.join(sorted(unknown)))
+        if any(description is not None and not description.strip() for description in updates.values()):
+            raise ValueError('Pack description must contain text; use None to remove it')
+        descriptions = dict(revision['pack_descriptions'])
+        for pack, description in updates.items():
+            if description is None:
+                descriptions.pop(pack, None)
+            else:
+                descriptions[pack] = description
+        if descriptions == revision['pack_descriptions']:
+            return revision['id']
+        revision_id = await self.begin_revision(
+            source_root=revision['source_root'], recipe=revision['recipe'],
+            expected_parent=revision['id'], pack_descriptions=descriptions)
+        await self.activate(revision_id)
+        return revision_id
 
     async def get_asset(self, asset_id: str, revision_id: str | None = None) -> CatalogAsset | None:
         async with self.store.pool.connection() as conn:
@@ -130,7 +180,7 @@ class StickerCatalogStore:
                 (asset_id, revision_id))).fetchone()
         return self._asset(row) if row else None
 
-    async def begin_revision(self, *, source_root: str, recipe: dict, assets: list[CatalogAsset] | None = None, dimensions: int = 0, expected_parent: str | None | object = _UNSET) -> str:
+    async def begin_revision(self, *, source_root: str, recipe: dict, assets: list[CatalogAsset] | None = None, dimensions: int = 0, expected_parent: str | None | object = _UNSET, pack_descriptions: dict[str, str] | None = None) -> str:
         revision_id = uuid.uuid4().hex
         async with self.store.pool.connection() as conn:
             async with conn.transaction():
@@ -138,8 +188,14 @@ class StickerCatalogStore:
                 parent = head['revision_id']
                 if expected_parent is not _UNSET and parent != expected_parent:
                     raise CatalogConflict('Active catalog changed during inventory; retry from the current catalog')
-                await conn.execute('INSERT INTO sticker_catalog_revisions(id,parent_id,source_root,recipe) VALUES(%s,%s,%s,%s)',
-                                   (revision_id, parent, source_root, Jsonb(recipe)))
+                if pack_descriptions is None:
+                    parent_revision = await (await conn.execute(
+                        'SELECT pack_descriptions FROM sticker_catalog_revisions WHERE id=%s',
+                        (parent,))).fetchone()
+                    pack_descriptions = parent_revision['pack_descriptions'] if parent_revision else {}
+                await conn.execute('''INSERT INTO sticker_catalog_revisions
+                    (id,parent_id,source_root,recipe,pack_descriptions) VALUES(%s,%s,%s,%s,%s)''',
+                    (revision_id, parent, source_root, Jsonb(recipe), Jsonb(pack_descriptions)))
                 if parent and assets is None:
                     await conn.execute('''INSERT INTO sticker_catalog_items
                         SELECT %s,asset_id,content_hash,aliases,media,generated_card,corrections,card,provenance,

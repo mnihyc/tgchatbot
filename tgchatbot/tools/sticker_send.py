@@ -28,6 +28,7 @@ def _candidate_payload(match: StickerMatch) -> dict[str, Any]:
         'uncertainty': asset.card.get('uncertainty', ''),
         'matched_reading': match.reading,
         'packs': list(dict.fromkeys(alias.pack for alias in asset.aliases)),
+        **({'pack_descriptions': dict(match.pack_descriptions)} if match.pack_descriptions else {}),
         'character_families': list(asset.family_ids),
         'style_tags': list(asset.style_tags),
         'animated': match.entry.animated,

@@ -45,6 +45,26 @@ Nested source and media-format directories remain part of the file path; they do
 not create separate packs. Virtual packs express your grouping, not a claim that
 every sticker depicts the same character.
 
+Optionally describe a pack's shared style or usage. The description appears beside
+every matching candidate in every `sticker_query` response, helping the agent choose.
+Keep it to a short, specific phrase since candidates repeat it.
+Descriptions are manually supplied; unconfigured packs have none. Use the exact pack
+ID returned by `list`:
+
+```sh
+docker compose run --rm --no-deps bot python -m scripts.sticker_pack list
+docker compose run --rm --no-deps bot python -m scripts.sticker_pack get 'Blue bird'
+docker compose run --rm --no-deps bot python -m scripts.sticker_pack set 'Blue bird' 'Quiet, understated reactions in a watercolor style.'
+docker compose run --rm --no-deps bot python -m scripts.sticker_pack remove 'Blue bird'
+```
+
+These commands use the existing database configuration and make no model requests.
+Descriptions are stored once per catalog revision and survive appending or
+regenerating stickers in the same pack. They do not change ranking, filtering or
+embeddings. `remove` clears only the description. After renaming a pack, set its
+description under the new name. The old description remains listed and can be
+removed with `remove 'Old pack name'`, or retained if that pack will be used again.
+
 Build new entries or regenerate selected content:
 
 ```sh

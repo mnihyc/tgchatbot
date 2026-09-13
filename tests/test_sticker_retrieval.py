@@ -27,8 +27,10 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
         self.assets = []
+        self.pack_descriptions = {}
         self.store = Mock(active_revision_id=AsyncMock(return_value='r1'))
-        self.store.load_snapshot = AsyncMock(side_effect=lambda _: CatalogSnapshot('r1', {'embedding_space_id': 'space'}, '', tuple(self.assets)))
+        self.store.load_snapshot = AsyncMock(side_effect=lambda _: CatalogSnapshot('r1', {'embedding_space_id': 'space'}, '', tuple(self.assets),
+            pack_descriptions=dict(self.pack_descriptions)))
         self.personas = Mock(get_sticker_persona=AsyncMock(return_value=None),
             save_sticker_persona=AsyncMock(), clear_sticker_persona=AsyncMock())
         async def remember(session_id, value, **kwargs):
@@ -99,6 +101,36 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('intermediate animation events', labels[0])
         self.assertEqual(sum(part.kind == PartKind.IMAGE for part in result.evidence_parts), 1)
         self.assertEqual(result.output['candidates'][0]['caption'], '抱抱')
+
+    async def test_configured_pack_description_accompanies_every_matching_candidate_every_time(self):
+        first = self.asset(pack='series')
+        second = self.asset(pack='series')
+        plain = self.asset(pack='unconfigured')
+        description = 'Dry, playful reaction cartoons with a blunt expressive style.'
+        self.pack_descriptions = {'series': description, 'not-in-shortlist': 'Unrelated collection'}
+        for _ in range(2):
+            result = await self.query(candidate_budget=3)
+            candidates = {item['sticker_id']: item for item in result.output['candidates']}
+            for asset in (first, second):
+                self.assertEqual(candidates[asset.asset_id]['packs'], ['series'])
+                self.assertEqual(candidates[asset.asset_id]['pack_descriptions'], {'series': description})
+            self.assertNotIn('pack_descriptions', candidates[plain.asset_id])
+            self.assertEqual(result.stickers, [])
+        self.personas.save_sticker_persona.assert_not_awaited()
+
+    async def test_shared_asset_retains_each_pack_description_and_removal_refreshes_next_query(self):
+        asset = self.asset(pack='series')
+        self.assets[0] = replace(asset, aliases=asset.aliases + (CatalogAlias('other/alias.png', 'other'),))
+        self.pack_descriptions = {'series': 'Warm drawn scenes', 'other': 'Collected reaction images'}
+        first = await self.query()
+        self.assertEqual(first.output['candidates'][0]['pack_descriptions'], self.pack_descriptions)
+        self.store.active_revision_id.return_value = 'r2'
+        self.store.load_snapshot.side_effect = lambda _: CatalogSnapshot('r2', {'embedding_space_id': 'space'}, '',
+            tuple(self.assets), pack_descriptions={'other': 'Collected reaction images'})
+        revised = await self.query()
+        self.assertEqual(revised.output['candidates'][0]['packs'], ['series', 'other'])
+        self.assertEqual(revised.output['candidates'][0]['pack_descriptions'], {'other': 'Collected reaction images'})
+        self.assertEqual(revised.output['candidates'][0]['caption'], asset.card['caption'])
 
     async def test_animation_warning_survives_sampling_only_one_distinct_frame(self):
         asset = self.asset(animated=True)
@@ -422,6 +454,7 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
     async def test_publication_during_search_keeps_original_caption_vector_and_id_together(self):
         import asyncio
         asset = self.asset(caption='A quiet hug')
+        self.pack_descriptions = {'pack-a': 'Original pack description'}
         entered, release = asyncio.Event(), asyncio.Event()
         async def delayed_embedding(*args, **kwargs):
             entered.set()
@@ -433,15 +466,18 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         new_card = {**asset.card, 'caption': 'Corrected caption'}
         changed = replace(asset, card=new_card)
         self.store.active_revision_id.return_value = 'r2'
-        self.store.load_snapshot.side_effect = lambda _: CatalogSnapshot('r2', {'embedding_space_id': 'space'}, '', (changed,))
+        self.store.load_snapshot.side_effect = lambda _: CatalogSnapshot('r2', {'embedding_space_id': 'space'}, '', (changed,),
+            pack_descriptions={'pack-a': 'Updated pack description'})
         await self.catalog.aensure_loaded()
         release.set()
         prior = await pending
         self.assertEqual(prior.output['catalog_revision'], 'r1')
         self.assertEqual(prior.output['candidates'][0]['caption'], 'A quiet hug')
+        self.assertEqual(prior.output['candidates'][0]['pack_descriptions'], {'pack-a': 'Original pack description'})
         current = await self.query()
         self.assertEqual(current.output['catalog_revision'], 'r2')
         self.assertEqual(current.output['candidates'][0]['caption'], 'Corrected caption')
+        self.assertEqual(current.output['candidates'][0]['pack_descriptions'], {'pack-a': 'Updated pack description'})
 
     async def test_only_fitting_asset_is_not_removed_because_it_was_sent_before(self):
         fitting = self.asset(caption='抱抱')

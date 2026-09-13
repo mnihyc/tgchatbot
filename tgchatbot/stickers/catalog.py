@@ -57,6 +57,7 @@ class StickerMatch:
     reading: dict[str, str] | None = None
     recently_delivered: bool = False
     visually_similar_deliveries: tuple[str, ...] = ()
+    pack_descriptions: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,7 @@ class _Index:
     image_matrix: np.ndarray | None = None
     image_assets: tuple[int, ...] = ()
     pack_count: int = 0
+    pack_descriptions: dict[str, str] = field(default_factory=dict)
 
 
 def _interleave(*rankings):
@@ -135,7 +137,8 @@ class StickerCatalog:
                 np.asarray(reading_rows, dtype=np.float32) if reading_rows else None,
                 tuple(reading_assets), tuple(reading_positions),
                 np.asarray(image_rows, dtype=np.float32) if image_rows else None, tuple(image_assets),
-                pack_count=len({alias.pack for asset in assets for alias in asset.aliases if alias.pack}))
+                pack_count=len({alias.pack for asset in assets for alias in asset.aliases if alias.pack}),
+                pack_descriptions=snapshot.pack_descriptions)
             # All derived arrays and row IDs belong to this snapshot. A query retains
             # its own reference even if another query observes a newly activated head.
             self._index = replacement
@@ -414,7 +417,9 @@ class StickerCatalog:
             result.append(StickerMatch(StickerIndexEntry(asset, verified_path, index.revision_id),
                 tuple(name for name, members in channel_members.items() if i in members),
                 readings[best_reading[i]] if i in best_reading and best_reading[i] < len(readings) else None,
-                asset.asset_id in recent, similar))
+                asset.asset_id in recent, similar,
+                {alias.pack: index.pack_descriptions[alias.pack] for alias in asset.aliases
+                    if alias.pack in index.pack_descriptions}))
             if len(result) >= min(plan.candidate_budget, self.config.max_candidates):
                 break
         return result

@@ -4,10 +4,13 @@ CREATE TABLE IF NOT EXISTS sticker_catalog_revisions (
     parent_id text REFERENCES sticker_catalog_revisions(id),
     source_root text NOT NULL,
     recipe jsonb NOT NULL,
+    pack_descriptions jsonb NOT NULL DEFAULT '{}',
     state text NOT NULL DEFAULT 'staging' CHECK (state IN ('staging','active','superseded')),
     created_at timestamptz NOT NULL DEFAULT now(),
     activated_at timestamptz
 );
+ALTER TABLE sticker_catalog_revisions
+    ADD COLUMN IF NOT EXISTS pack_descriptions jsonb NOT NULL DEFAULT '{}';
 CREATE TABLE IF NOT EXISTS sticker_catalog_head (
     singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
     revision_id text REFERENCES sticker_catalog_revisions(id)
