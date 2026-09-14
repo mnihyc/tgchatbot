@@ -95,7 +95,7 @@ class CatalogBuilder:
         await self.store.stage_asset(revision_id, **values)
 
     async def build(self, source_root: Path | str, *, regenerate_ids=(), regenerate_packs=(), regenerate_files=(), corrections=None,
-                    resume: str | None = None) -> BuildResult:
+                    resume: str | None = None, prune_missing: bool = False) -> BuildResult:
         root = Path(source_root).resolve()
         corrections = corrections or {}
         source_files = [path for path in sorted(root.rglob('*')) if path.is_file()]
@@ -105,7 +105,7 @@ class CatalogBuilder:
             snapshot = await self.store.load_snapshot(resume)
             if snapshot.recipe != self.recipe or Path(snapshot.source_root) != root:
                 raise ValueError('Resume uses the original source directory and build/embedding settings')
-            if regenerate_ids or regenerate_packs or regenerate_files or corrections:
+            if regenerate_ids or regenerate_packs or regenerate_files or corrections or prune_missing:
                 raise ValueError('Resume continues existing work; selections/corrections belong to a new build')
             revision_id = resume
         else:
@@ -127,7 +127,9 @@ class CatalogBuilder:
                 alias = CatalogAlias(relative.as_posix(), relative.parts[0] if len(relative.parts) > 1 else '')
                 inventory.setdefault(asset_id, []).append(alias)
                 paths[alias.path] = asset_id
-            known = set(previous) | set(inventory)
+            # Explicit source cleanup changes the active inventory only. Prior
+            # revisions retain removed originals' cards, vectors and provenance.
+            known = set(inventory) if prune_missing else set(previous) | set(inventory)
             unknown = (set(regenerate_ids) | set(corrections)) - known
             if unknown:
                 raise ValueError(f'Unknown asset IDs: {sorted(unknown)}')
@@ -185,7 +187,7 @@ class CatalogBuilder:
             if (regenerate_ids or regenerate_packs or regenerate_files) and not selected:
                 raise ValueError('No processable assets match the selected files, packs or IDs; '
                                  'unsupported files: ' + ', '.join(unsupported))
-            if not planned:
+            if not planned and not (prune_missing and snapshot.assets):
                 return BuildResult(None, False, 0, (), unsupported)
             # Inventory and copied records commit together before any paid work.
             # A crash cannot leave a revision containing only half its intended input.
@@ -280,6 +282,8 @@ def parse_args(argv=None):
     parser.add_argument('--file', action='append', default=[], help='Regenerate this exact relative file alias; may repeat')
     parser.add_argument('--pack', action='append', default=[], help='Regenerate this exact pack; may repeat')
     parser.add_argument('--corrections', type=Path, help='JSON object keyed by asset ID; replaces explicit correction records')
+    parser.add_argument('--prune-missing', action='store_true',
+                        help='Remove entries with no remaining original from the active catalog; keep historical revisions')
     parser.add_argument('--resume', help='Resume the reported unfinished revision with the same settings')
     return parser.parse_args(argv)
 
@@ -305,7 +309,8 @@ async def run(args):
         builder = CatalogBuilder(catalog, provider, embeddings, settings=config.default_session_settings(), config=build_config,
             on_revision=lambda identity: print(json.dumps({'staging_revision': identity}), flush=True))
         result = await builder.build(args.source or config.sticker_dir, regenerate_ids=args.asset_id,
-            regenerate_packs=args.pack, regenerate_files=args.file, corrections=corrections, resume=args.resume)
+            regenerate_packs=args.pack, regenerate_files=args.file, corrections=corrections, resume=args.resume,
+            prune_missing=args.prune_missing)
         print(json.dumps(asdict(result), ensure_ascii=False))
         return 0 if result.active else 1
     finally:

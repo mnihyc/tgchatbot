@@ -98,6 +98,9 @@ By default, `build_sticker_index` adds new content and refreshes current file pa
 membership, reusing completed compatible analysis. Run it after moving folders;
 use selection flags only when you want to regenerate analysis. Explicitly saved
 pack preferences use folder names, so update those preferences if you rename them.
+After deliberately removing originals, run `build_sticker_index --prune-missing`
+to remove their entries from the active catalog. Historical revisions retain their
+descriptions and provenance; entries with another remaining copy are kept.
 Unsupported files are listed in the result; supported files in the same
 source are still processed. Selection flags may repeat. `scripts.reset_sticker` is an alias for the
 same regeneration workflow. Neither command deletes original media. Failed work

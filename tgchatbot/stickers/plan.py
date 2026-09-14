@@ -143,10 +143,10 @@ class TextConstraints:
 
 @dataclass(slots=True)
 class IntensityLimits:
-    max_harshness: int = 3
+    max_harshness: int = 4
     max_intimacy: int = 4
     max_meme_dependence: int = 4
-    allow_animation: bool = False
+    allow_animation: bool = True
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -353,8 +353,12 @@ class StickerRetrievalPlan:
         visual_source = _norm_mapping(_first_present(advanced.get('visual_focus'), data.get('visual_focus')))
         style_source = _norm_mapping(_first_present(advanced.get('style_focus'), data.get('style_focus')))
         text_source = _norm_mapping(_first_present(advanced.get('text_constraints'), data.get('text_constraints')))
-        intensity_source = _norm_mapping(_first_present(advanced.get('intensity_limits'),
-            advanced.get('safety_limits'), data.get('intensity_limits'), data.get('safety_limits')))
+        intensity_sources = [_norm_mapping(source) for source in (
+            advanced.get('intensity_limits'), advanced.get('safety_limits'),
+            data.get('intensity_limits'), data.get('safety_limits'))]
+
+        def intensity_value(name, default):
+            return _first_present(*(source.get(name) for source in intensity_sources), data.get(name), default)
 
         legacy_text_priority = _norm_text(data.get('text_priority', '')).lower()
         legacy_style_policy = _norm_text(data.get('style_policy', '')).lower()
@@ -397,10 +401,10 @@ class StickerRetrievalPlan:
             avoid_text_meanings=avoid_text_meanings,
         )
         intensity_limits = IntensityLimits(
-            max_harshness=_bounded_int(_first_present(intensity_source.get('max_harshness'), data.get('max_harshness'), 3), default=3, minimum=0, maximum=4),
-            max_intimacy=_bounded_int(_first_present(intensity_source.get('max_intimacy'), data.get('max_intimacy'), 4), default=4, minimum=0, maximum=4),
-            max_meme_dependence=_bounded_int(_first_present(intensity_source.get('max_meme_dependence'), data.get('max_meme_dependence'), 4), default=4, minimum=0, maximum=4),
-            allow_animation=_norm_bool(_first_present(intensity_source.get('allow_animation'), data.get('allow_animation'), False), default=False),
+            max_harshness=_bounded_int(intensity_value('max_harshness', 4), default=4, minimum=0, maximum=4),
+            max_intimacy=_bounded_int(intensity_value('max_intimacy', 4), default=4, minimum=0, maximum=4),
+            max_meme_dependence=_bounded_int(intensity_value('max_meme_dependence', 4), default=4, minimum=0, maximum=4),
+            allow_animation=_norm_bool(intensity_value('allow_animation', True), default=True),
         )
         persona = StickerPersona(
             visual_identity=PersonaVisualIdentity(

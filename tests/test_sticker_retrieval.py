@@ -174,7 +174,8 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         missing = self.asset()
         (self.root / missing.aliases[0].path).rename(self.root / 'unavailable.png')
         valid = self.asset(reading_vectors=[[.8, .6, 0]], harshness=0)
-        result = await self.query(candidate_budget=1, advanced={'intensity_limits': {'max_harshness': 0}})
+        result = await self.query(candidate_budget=1,
+            advanced={'intensity_limits': {'max_harshness': 0, 'allow_animation': False}})
         self.assertEqual([x['sticker_id'] for x in result.output['candidates']], [valid.asset_id])
 
     async def test_pack_preference_keeps_global_choices_but_explicit_requirement_filters(self):
@@ -483,7 +484,7 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         fitting = self.asset(caption='抱抱')
         self.asset(harshness=4, action='Threatening the recipient')
         self.deliveries.recent.return_value = [{'sticker_id': fitting.asset_id}]
-        result = await self.query(diversity_preference='prefer_fresh_variant')
+        result = await self.query(diversity_preference='prefer_fresh_variant', max_harshness=0)
         self.assertEqual([c['sticker_id'] for c in result.output['candidates']], [fitting.asset_id])
         self.assertTrue(result.output['candidates'][0]['recently_delivered'])
 

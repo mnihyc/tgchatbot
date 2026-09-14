@@ -27,6 +27,8 @@ from tgchatbot.stickers.build import CatalogBuilder, BuildConfig
 from tgchatbot.stickers.catalog import StickerCatalog
 from tgchatbot.stickers.media import MediaConfig, PreparedMedia, content_hash, prepare_media
 from tgchatbot.stickers.plan import StickerRetrievalPlan
+from tgchatbot.tools.base import ToolContext
+from tgchatbot.tools.sticker_send import StickerQueryTool
 
 CARD = {'caption': 'Hello', 'appearance': 'A round blue bird', 'action': 'A raised wing',
         'readings': [{'meaning': 'Greeting', 'context': 'Opening a friendly conversation'}],
@@ -171,6 +173,102 @@ class StickerBuildWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first_asset.provenance, before.assets[0].provenance)
         self.assertEqual((await self.catalog.load_snapshot(first.revision_id)).assets[0].aliases[0].path, 'pack/one.png')
         self.assertNotEqual(first.revision_id, second.revision_id)
+
+    async def test_explicit_pruning_keeps_remaining_copies_and_historical_evidence_without_rebuying_work(self):
+        source = self.root / 'originals'
+        retained_id = self.picture('originals/pack/one.png', 'red')
+        self.picture('originals/pack/copy.png', 'red')
+        removed_id = self.picture('originals/pack/two.png', 'blue')
+        first = await self.builder.build(source)
+        before = await self.catalog.load_snapshot()
+        calls = len(self.provider.calls), len(self.embeddings.calls)
+        (source / 'pack/one.png').rename(self.root / 'removed-copy.png')
+        (source / 'pack/two.png').rename(self.root / 'removed-original.png')
+
+        await self.builder.build(source)
+        self.assertIsNotNone(await self.catalog.get_asset(removed_id), 'Default builds retain missing evidence')
+        pruned = await self.builder.build(source, prune_missing=True)
+        self.assertTrue(pruned.active)
+        self.assertEqual({a.asset_id for a in (await self.catalog.load_snapshot()).assets}, {retained_id})
+        retained = await self.catalog.get_asset(retained_id)
+        self.assertEqual([a.path for a in retained.aliases], ['pack/copy.png'])
+        original = next(a for a in before.assets if a.asset_id == retained_id)
+        self.assertEqual(retained.card, original.card)
+        np.testing.assert_array_equal(retained.image_vector, original.image_vector)
+        np.testing.assert_array_equal(retained.reading_vectors, original.reading_vectors)
+        historical = await self.catalog.load_snapshot(first.revision_id)
+        self.assertEqual({a.asset_id for a in historical.assets}, {retained_id, removed_id})
+        self.assertEqual((len(self.provider.calls), len(self.embeddings.calls)), calls)
+
+    async def test_explicit_pruning_can_publish_an_empty_catalog_without_erasing_history(self):
+        source = self.root / 'originals'
+        asset_id = self.picture('originals/pack/one.png', 'red')
+        first = await self.builder.build(source)
+        (source / 'pack').rename(self.root / 'removed-pack')
+        result = await self.builder.build(source, prune_missing=True)
+        self.assertTrue(result.active)
+        self.assertEqual((await self.catalog.load_snapshot()).assets, ())
+        self.assertIsNotNone(await self.catalog.get_asset(asset_id, first.revision_id))
+        self.assertEqual(len(self.provider.calls), 1)
+
+    async def test_imported_catalog_is_eligible_until_the_agent_requests_exclusions(self):
+        calm_id = self.picture('pack/calm.png', 'red')
+        intense_id = self.picture('pack/intense.png', 'blue')
+        animation = self.root / 'pack/animated.gif'
+        frames = [Image.new('RGB', (20, 20), color) for color in ('green', 'yellow')]
+        try:
+            frames[0].save(animation, save_all=True, append_images=frames[1:], duration=100, loop=0)
+        finally:
+            for frame in frames:
+                frame.close()
+        animated_id = 'sha256:' + content_hash(animation)
+        built = await self.builder.build(self.root, corrections={intense_id: {'card': {'compatibility': {
+            'harshness_level': 4, 'intimacy_level': 4, 'meme_dependence_level': 4}}}})
+        self.assertTrue(built.active)
+        self.assertTrue((await self.catalog.get_asset(animated_id)).media['animated'])
+        calls = len(self.provider.calls), len(self.embeddings.calls)
+        self.embeddings.enabled = True
+        self.embeddings.config.space_id = self.embeddings.space_id
+        self.embeddings.embed_query = AsyncMock(return_value=(await self.catalog.get_asset(calm_id)).reading_vectors[0])
+        runtime = StickerCatalog(self.catalog, self.root, embedding_client=self.embeddings)
+        tool = StickerQueryTool(runtime)
+        context = ToolContext('fixture-chat', 'Participant')
+        all_ids = {calm_id, intense_id, animated_id}
+        direct = await runtime.achoose(plan=StickerRetrievalPlan(intent_core='A greeting', candidate_budget=3))
+        self.assertEqual({match.entry.sticker_id for match in direct}, all_ids)
+        nullable = {'max_harshness': None, 'max_intimacy': None,
+                    'max_meme_dependence': None, 'allow_animation': None}
+        cases = [
+            ({}, all_ids),
+            ({**nullable, 'advanced': {'intensity_limits': nullable}}, all_ids),
+            ({'allow_animation': False}, {calm_id, intense_id}),
+            ({'max_harshness': 3}, {calm_id, animated_id}),
+            ({'advanced': {'intensity_limits': {'max_intimacy': 0}}}, {calm_id, animated_id}),
+            ({'advanced': {'intensity_limits': {'max_meme_dependence': 0}}}, {calm_id, animated_id}),
+            ({'allow_animation': False, 'max_harshness': 0,
+              'advanced': {'intensity_limits': nullable}}, {calm_id}),
+            ({'allow_animation': True, 'max_harshness': 4,
+              'advanced': {'intensity_limits': {'allow_animation': False, 'max_harshness': 0}}}, {calm_id}),
+            ({'intensity_limits': {'allow_animation': False, 'max_harshness': 0},
+              'advanced': {'intensity_limits': nullable}}, {calm_id}),
+            ({'safety_limits': {'allow_animation': False, 'max_harshness': 0},
+              'advanced': {'intensity_limits': {'max_intimacy': 4}}}, {calm_id}),
+            ({'advanced': {'intensity_limits': nullable,
+                          'safety_limits': {'allow_animation': False, 'max_harshness': 0}}}, {calm_id}),
+            ({'intensity_limits': {'allow_animation': False, 'max_harshness': 0},
+              'advanced': {'intensity_limits': {'allow_animation': True, 'max_harshness': 4}}}, all_ids),
+            ({'intensity_limits': {'allow_animation': False, 'max_harshness': 0},
+              'advanced': {'intensity_limits': {'allow_animation': True}}}, {calm_id, animated_id}),
+            ({'intensity_limits': {'allow_animation': False, 'max_harshness': 0},
+              'advanced': {'intensity_limits': {'max_harshness': 4}}}, {calm_id, intense_id}),
+        ]
+        for controls, expected in cases:
+            with self.subTest(controls=controls):
+                result = await tool.run({'intent_core': 'A greeting', 'candidate_budget': 3, **controls}, context)
+                self.assertTrue(result.output['ok'])
+                self.assertEqual({item['sticker_id'] for item in result.output['candidates']}, expected)
+                self.assertEqual(result.stickers, [])
+        self.assertEqual((len(self.provider.calls), len(self.embeddings.calls)), calls)
 
     async def test_folder_aggregation_refreshes_delivery_continuity_without_rebuying_vectors(self):
         first_id = self.picture('birdPack/one.png', 'red')
