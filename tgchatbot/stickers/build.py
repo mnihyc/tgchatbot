@@ -141,6 +141,7 @@ class CatalogBuilder:
                 raise ValueError(f'Unknown relative files: {sorted(unknown_files)}')
             planned = []
             selected = False
+            media_preparation = asdict(self.media_config)
             for asset_id in sorted(known):
                 old = previous.get(asset_id)
                 # Present originals take their current locations and packs from the
@@ -164,10 +165,15 @@ class CatalogBuilder:
                 if card is not None:
                     provenance['effective_card_hash'] = card_hash(card)
                 same_readings = old is not None and old.card is not None and card is not None and reading_texts(old.card) == reading_texts(card) and old.provenance.get('reading_input') == self.recipe['reading_input']
+                previous_preparation = old.media.get('preparation') if old else None
+                if old is not None and old.media.get('animated') is False and previous_preparation:
+                    # A known static original always supplies one image; changing
+                    # the animation frame allowance cannot change its pixels.
+                    previous_preparation = {**previous_preparation, 'max_frames': media_preparation['max_frames']}
                 # Explicit regeneration also rebuilds sampled visual evidence:
                 # decoder fixes can change pixels without changing source bytes.
                 same_visual = not regenerate and old is not None and old.provenance.get('image_input') == self.recipe['image_input'] and (
-                    old.media.get('preparation') == asdict(self.media_config) if self.visual_embedding_source == 'image'
+                    previous_preparation == media_preparation if self.visual_embedding_source == 'image'
                     else appearance_text(old.card) == appearance_text(card))
                 readings = old.reading_vectors if same_space and same_readings else None
                 image = old.image_vector if same_space and same_visual and self._needs_visual(card) else None

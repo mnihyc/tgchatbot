@@ -25,7 +25,7 @@ from tgchatbot.storage.sticker_catalog import StickerCatalogStore, CatalogConfli
 from tgchatbot.storage.sticker_delivery import StickerDeliveryStore
 from tgchatbot.stickers.build import CatalogBuilder, BuildConfig
 from tgchatbot.stickers.catalog import StickerCatalog
-from tgchatbot.stickers.media import PreparedMedia, content_hash, prepare_media
+from tgchatbot.stickers.media import MediaConfig, PreparedMedia, content_hash, prepare_media
 from tgchatbot.stickers.plan import StickerRetrievalPlan
 
 CARD = {'caption': 'Hello', 'appearance': 'A round blue bird', 'action': 'A raised wing',
@@ -303,6 +303,63 @@ class StickerBuildWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(selected.family_ids, ('supported-blue-bird',))
         self.assertEqual((await self.catalog.get_asset(other)).provenance, before_other.provenance)
         self.assertEqual(selected.card['compatibility']['harshness_level'], 0)
+
+    async def test_frame_allowance_change_reuses_static_images_and_preserves_reviewed_cards(self):
+        static_id = self.picture('pack/static.png', 'red')
+        animated_path = self.root / 'pack' / 'animated.webp'
+        frames = [Image.new('RGB', (20, 20), color)
+                  for color in ('red', 'green', 'blue', 'yellow', 'white')]
+        try:
+            frames[0].save(animated_path, save_all=True, append_images=frames[1:],
+                           duration=100, loop=0, lossless=True)
+        finally:
+            for frame in frames:
+                frame.close()
+        animated_id = 'sha256:' + content_hash(animated_path)
+        corrections = {identity: {'card': {'caption': 'Reviewed caption', 'readings': [
+            {'meaning': 'Reviewed greeting', 'context': 'A familiar friend arrives'}]},
+            'style_tags': ['reviewed drawing']} for identity in (static_id, animated_id)}
+        first_builder = CatalogBuilder(self.catalog, self.provider, self.embeddings,
+                                       media_config=MediaConfig(max_frames=3))
+        await first_builder.build(self.root, corrections=corrections)
+        before = {identity: await self.catalog.get_asset(identity) for identity in corrections}
+        annotation_calls, embedding_calls = len(self.provider.calls), len(self.embeddings.calls)
+
+        larger = CatalogBuilder(self.catalog, self.provider, self.embeddings,
+                                media_config=MediaConfig(max_frames=5))
+        result = await larger.build(self.root)
+
+        self.assertTrue(result.active)
+        self.assertEqual(result.completed, 1, 'Only animated visual evidence changes')
+        self.assertEqual(len(self.provider.calls), annotation_calls)
+        new_calls = self.embeddings.calls[embedding_calls:]
+        self.assertEqual(len(new_calls), 1)
+        self.assertEqual(new_calls[0][0].item_id, animated_id + ':image')
+        self.assertEqual(len(new_calls[0][0].media), 5)
+        for identity in corrections:
+            current = await self.catalog.get_asset(identity)
+            for field in ('aliases', 'generated_card', 'corrections', 'card'):
+                self.assertEqual(getattr(current, field), getattr(before[identity], field), field)
+            np.testing.assert_array_equal(current.reading_vectors, before[identity].reading_vectors)
+        static = await self.catalog.get_asset(static_id)
+        self.assertEqual(static.media, before[static_id].media)
+        self.assertEqual(static.provenance, before[static_id].provenance)
+        np.testing.assert_array_equal(static.image_vector, before[static_id].image_vector)
+        animated = await self.catalog.get_asset(animated_id)
+        self.assertEqual(animated.media['supplied_frames'], 5)
+        self.assertFalse(np.array_equal(animated.image_vector, before[animated_id].image_vector))
+
+        calls = len(self.provider.calls), len(self.embeddings.calls)
+        self.assertEqual((await larger.build(self.root)).completed, 0)
+        self.assertEqual((len(self.provider.calls), len(self.embeddings.calls)), calls)
+        resized = CatalogBuilder(self.catalog, self.provider, self.embeddings,
+                                 media_config=MediaConfig(max_frames=5, max_dimension=10))
+        self.assertEqual((await resized.build(self.root)).completed, 2)
+        self.assertEqual(len(self.provider.calls), calls[0])
+        changed_images = self.embeddings.calls[calls[1]:]
+        self.assertEqual({batch[0].item_id for batch in changed_images},
+                         {static_id + ':image', animated_id + ':image'})
+        self.assertTrue(all(document.media for batch in changed_images for document in batch))
 
     async def test_selected_regeneration_refreshes_changed_samples_and_resumes_image_failure(self):
         path = self.root / 'pack' / 'animated.webp'
