@@ -145,9 +145,9 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         asset = replace(asset, asset_id='sha256:' + digest, content_hash=digest,
             aliases=(CatalogAlias(path.relative_to(self.root).as_posix(), 'pack-a'),))
         self.assets[0] = asset
-        # Two timeline endpoints are identical; three samples also reveal blue.
+        # Two endpoints are identical; three samples reveal blue and the return to red.
         # Sampling/deduplication runs normally, without a mocked media decoder.
-        for max_frames, expected_images in ((2, 1), (3, 2)):
+        for max_frames, expected_images in ((2, 1), (3, 3)):
             with self.subTest(max_frames=max_frames):
                 self.catalog.media_config = replace(self.catalog.media_config, max_frames=max_frames)
                 result = await self.query(allow_animation=True)

@@ -164,7 +164,9 @@ class CatalogBuilder:
                 if card is not None:
                     provenance['effective_card_hash'] = card_hash(card)
                 same_readings = old is not None and old.card is not None and card is not None and reading_texts(old.card) == reading_texts(card) and old.provenance.get('reading_input') == self.recipe['reading_input']
-                same_visual = old is not None and old.provenance.get('image_input') == self.recipe['image_input'] and (
+                # Explicit regeneration also rebuilds sampled visual evidence:
+                # decoder fixes can change pixels without changing source bytes.
+                same_visual = not regenerate and old is not None and old.provenance.get('image_input') == self.recipe['image_input'] and (
                     old.media.get('preparation') == asdict(self.media_config) if self.visual_embedding_source == 'image'
                     else appearance_text(old.card) == appearance_text(card))
                 readings = old.reading_vectors if same_space and same_readings else None

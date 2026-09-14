@@ -25,7 +25,7 @@ from tgchatbot.storage.sticker_catalog import StickerCatalogStore, CatalogConfli
 from tgchatbot.storage.sticker_delivery import StickerDeliveryStore
 from tgchatbot.stickers.build import CatalogBuilder, BuildConfig
 from tgchatbot.stickers.catalog import StickerCatalog
-from tgchatbot.stickers.media import PreparedMedia, content_hash
+from tgchatbot.stickers.media import PreparedMedia, content_hash, prepare_media
 from tgchatbot.stickers.plan import StickerRetrievalPlan
 
 CARD = {'caption': 'Hello', 'appearance': 'A round blue bird', 'action': 'A raised wing',
@@ -303,6 +303,72 @@ class StickerBuildWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(selected.family_ids, ('supported-blue-bird',))
         self.assertEqual((await self.catalog.get_asset(other)).provenance, before_other.provenance)
         self.assertEqual(selected.card['compatibility']['harshness_level'], 0)
+
+    async def test_selected_regeneration_refreshes_changed_samples_and_resumes_image_failure(self):
+        path = self.root / 'pack' / 'animated.webp'
+        path.parent.mkdir()
+        frames = [Image.new('RGB', (20, 20), color) for color in ('red', 'green', 'blue')]
+        frames[0].save(path, save_all=True, append_images=frames[1:], duration=[50, 100, 50], lossless=True)
+        target = 'sha256:' + content_hash(path)
+        other = self.picture('other/two.png', 'yellow')
+        prepared = prepare_media(path, self.builder.media_config)
+        # The original and preparation settings stay identical across a decoder
+        # fix, while the selected pixels and observed timing change.
+        stale = replace(prepared, frames=prepared.frames[1:], facts={**prepared.facts,
+            'supplied_frames': len(prepared.frames) - 1,
+            'frame_times_s': [frame.timestamp_s for frame in prepared.frames[1:]],
+            'duration_s': prepared.facts['duration_s'] - .05})
+        def old_preparation(source, config):
+            return stale if source == path else prepare_media(source, config)
+        correction = {'card': {'caption': 'Deliberately corrected caption'}}
+        with patch('tgchatbot.stickers.build.prepare_media', side_effect=old_preparation):
+            baseline = await self.builder.build(self.root, corrections={target: correction})
+        before_target = await self.catalog.get_asset(target)
+        before_other = await self.catalog.get_asset(other)
+        self.provider.card['action'] = 'The newly visible opening gesture'
+        self.embeddings.fail_images = True
+
+        failed = await self.builder.build(self.root, regenerate_ids=[target])
+
+        self.assertFalse(failed.active, 'A stale image vector must not bypass the refreshed image request')
+        self.assertEqual([failure['asset_id'] for failure in failed.failed], [target])
+        self.assertEqual(await self.catalog.active_revision_id(), baseline.revision_id)
+        staged = await self.catalog.get_asset(target, failed.revision_id)
+        self.assertEqual(staged.media, prepared.facts)
+        self.assertIsNone(staged.image_vector)
+        self.assertIsNotNone(staged.reading_vectors)
+        self.assertEqual(staged.generated_card['action'], self.provider.card['action'])
+        self.assertEqual(staged.corrections, correction)
+        self.assertEqual(staged.card['caption'], correction['card']['caption'])
+        generated_images = [part.data_b64 for part in self.provider.calls[-1]['messages'][0].parts
+                            if part.data_b64]
+        self.assertEqual(generated_images, [frame.data_b64 for frame in prepared.frames])
+        failed_image = self.embeddings.calls[-1][0]
+        self.assertEqual(failed_image.item_id, target + ':image')
+        self.assertEqual([media.data_b64 for media in failed_image.media], generated_images)
+        annotation_calls = len(self.provider.calls)
+        embedding_calls = len(self.embeddings.calls)
+        self.embeddings.fail_images = False
+
+        resumed = await self.builder.build(self.root, resume=failed.revision_id)
+
+        self.assertTrue(resumed.active)
+        self.assertEqual(len(self.provider.calls), annotation_calls, 'Keep the successful annotation on retry')
+        self.assertEqual(len(self.embeddings.calls), embedding_calls + 1, 'Only the failed image request retries')
+        self.assertEqual(self.embeddings.calls[-1][0], failed_image)
+        current = await self.catalog.get_asset(target)
+        self.assertEqual(current.media, prepared.facts)
+        self.assertEqual(current.generated_card, staged.generated_card)
+        np.testing.assert_array_equal(current.reading_vectors, staged.reading_vectors)
+        self.assertFalse(np.array_equal(current.image_vector, before_target.image_vector))
+        expected_image = (await FakeEmbeddings().embed_documents([failed_image]))[0]
+        np.testing.assert_array_equal(current.image_vector, expected_image)
+        unchanged = await self.catalog.get_asset(other)
+        for field in ('aliases', 'media', 'generated_card', 'corrections', 'card', 'provenance', 'state', 'error'):
+            self.assertEqual(getattr(unchanged, field), getattr(before_other, field), field)
+        np.testing.assert_array_equal(unchanged.image_vector, before_other.image_vector)
+        np.testing.assert_array_equal(unchanged.reading_vectors, before_other.reading_vectors)
+        self.assertEqual(content_hash(path), target.removeprefix('sha256:'))
 
     async def test_space_change_reembeds_every_asset_without_reannotation(self):
         self.picture('pack/one.png', 'red')

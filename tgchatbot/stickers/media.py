@@ -71,8 +71,10 @@ def _decode(path: Path) -> Iterator[tuple[Image.Image, float, float]]:
             at = 0.0
             for index in range(getattr(picture, 'n_frames', 1)):
                 picture.seek(index)
+                # WebP exposes the current frame's duration only after decoding it.
+                frame = picture.convert('RGBA')
                 duration = max(0.0, float(picture.info.get('duration', 0))) / 1000
-                yield picture.convert('RGBA'), at, duration
+                yield frame, at, duration
                 at += duration
         return
     with av.open(str(path)) as container:
@@ -111,18 +113,20 @@ def prepare_media(path: Path | str, config: MediaConfig | None = None) -> Prepar
     sample_count = min(config.max_frames, count)
     targets = [extent * index / (sample_count - 1) for index in range(sample_count)] if sample_count > 1 else [0.0]
     selected: list[PreparedFrame] = []
-    hashes: set[str] = set()
+    last_digest: str | None = None
     target_index = 0
     previous: tuple[Image.Image, float] | None = None
 
     def keep(picture: Image.Image, at: float):
+        nonlocal last_digest
         picture.thumbnail((config.max_dimension, config.max_dimension), Image.Resampling.LANCZOS)
         canvas = Image.new('RGB', picture.size, ImageColor.getrgb(config.background))
         canvas.paste(picture, mask=picture.getchannel('A'))
         digest = hashlib.sha256(str(canvas.size).encode() + canvas.tobytes()).hexdigest()
-        if digest in hashes:
+        if digest == last_digest:
             return
-        hashes.add(digest)
+        # A later return to an earlier expression is meaningful motion evidence.
+        last_digest = digest
         buffer = io.BytesIO()
         canvas.save(buffer, format='JPEG', quality=config.jpeg_quality)
         selected.append(PreparedFrame(buffer.getvalue(), 'image/jpeg', float(at), *canvas.size))
