@@ -63,6 +63,18 @@ async def publish_current(store, conn, scope, session_id, actor_id, *, add_ids=(
         ([row['id'] for row in rows if row['id'] in add_ids], session_id, scope['generation']))
 
 
+async def request_catchup(conn, *, session_id, scope):
+    """Coalesce reset requests durably, including while a profile batch is busy."""
+    await conn.execute('''INSERT INTO jobs
+        (session_id,generation,context_id,scope_revision,kind,policy,dedupe_key)
+        SELECT %s,%s,%s,%s,'memory_profile_request','memory','reset'
+        WHERE EXISTS (SELECT 1 FROM profile_inputs WHERE session_id=%s
+            AND generation=%s AND pending_bytes>0)
+        ON CONFLICT(session_id,generation,kind,dedupe_key) DO NOTHING''',
+        (session_id, scope['generation'], scope['context_id'], scope['revision'],
+         session_id, scope['generation']))
+
+
 async def claim_batch(store, *, max_bytes, lease_seconds, session_id=None, actor_ids=None, lazy=False,
                       profile_actor_ids=(), profile_bytes=None):
     """One chat owns one in-flight patch; no database lock spans a model call."""
@@ -81,9 +93,11 @@ async def claim_batch(store, *, max_bytes, lease_seconds, session_id=None, actor
                   NOT EXISTS (SELECT 1 FROM jobs j WHERE j.session_id=s.session_id
                     AND j.generation=s.generation AND j.kind='memory_profile'
                     AND j.status IN ('pending','running','failed')) AND
+                  (EXISTS (SELECT 1 FROM jobs j WHERE j.session_id=s.session_id
+                    AND j.generation=s.generation AND j.kind='memory_profile_request') OR
                   (SELECT COALESCE(sum(p.pending_bytes),0) FROM
                     (SELECT pending_bytes FROM profile_inputs p WHERE p.session_id=s.session_id
-                     AND p.generation=s.generation AND p.pending_bytes>0 ORDER BY p.message_id LIMIT %s) p)>=%s)
+                     AND p.generation=s.generation AND p.pending_bytes>0 ORDER BY p.message_id LIMIT %s) p)>=%s))
                 ORDER BY last_served NULLS FIRST,s.session_id FOR UPDATE OF s SKIP LOCKED LIMIT 1''',
                 (max_bytes, max_bytes))).fetchone()
             if not candidate:
@@ -110,6 +124,12 @@ async def claim_batch(store, *, max_bytes, lease_seconds, session_id=None, actor
             return await (await conn.execute('''UPDATE jobs SET status='running',attempts=attempts+1,
                 lease_token=%s,lease_until=now()+(%s * interval '1 second') WHERE id=%s RETURNING *''',
                 (str(uuid.uuid4()), lease_seconds, existing['id']))).fetchone()
+        # Background consumption waits for any current batch and leaves its
+        # lease/retry policy untouched. Explicit subject refreshes do not consume
+        # a chat-wide reset request on behalf of unrelated pending participants.
+        request = (await (await conn.execute('''SELECT id FROM jobs WHERE session_id=%s
+            AND generation=%s AND kind='memory_profile_request' FOR UPDATE''',
+            (session_id, scope['generation']))).fetchone()) if actor_ids is None else None
         rows = await (await conn.execute('''WITH candidates AS (
             SELECT p.* FROM profile_inputs p
             JOIN messages m ON m.id=p.message_id AND m.source_revision=p.source_revision
@@ -121,7 +141,7 @@ async def claim_batch(store, *, max_bytes, lease_seconds, session_id=None, actor
             JOIN message_revisions r ON (r.message_id,r.revision)=(p.message_id,p.source_revision)
             WHERE previous_bytes<%s ORDER BY p.message_id''',
             (session_id, scope['generation'], actor_ids, actor_ids, max_bytes, max_bytes))).fetchall()
-        if not lazy and (not rows or sum(row['pending_bytes'] for row in rows) < max_bytes):
+        if not lazy and request is None and (not rows or sum(row['pending_bytes'] for row in rows) < max_bytes):
             return None
         spans, remaining, cursors, revisions = [], max_bytes, {}, {}
         for row in rows:
@@ -152,6 +172,10 @@ async def claim_batch(store, *, max_bytes, lease_seconds, session_id=None, actor
                 break
         if rows and not spans:
             raise ValueError('MEMORY_WORKER_PROFILE_REQUEST_BYTES must fit one source character')
+        if request is not None:
+            # The request and its materialized batch commit together. A model
+            # failure retries that same batch; a process restart loses neither.
+            await conn.execute('DELETE FROM jobs WHERE id=%s', (request['id'],))
         if not spans:
             return None
         return await (await conn.execute('''INSERT INTO jobs

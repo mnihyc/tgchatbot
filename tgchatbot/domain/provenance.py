@@ -388,20 +388,10 @@ def message_evidence(source: Mapping[str, Any], *, message_id: int | None,
             previous['text'] += fragment['text'][end - fragment['offset']:]
         else:
             record['fragments'].append({'offset': fragment['offset'], 'text': fragment['text']})
-    # Coverage concerns the original body, not an excerpt's rendered labels.
-    # Coalesce already displayed overlap; never join an unseen gap.
-    covered = 0
-    for fragment in sorted(record['fragments'], key=lambda item: item['offset']):
-        if fragment['offset'] > covered:
-            break
-        covered = max(covered, fragment['offset'] + len(fragment['text']))
-    if covered < total_characters:
-        record.update(partial=True, total_characters=total_characters)
+    groups = []
     if source.get('parts'):
         # Typed source spans distinguish application/attachment context from
         # participant words. Literal lookalike text keeps its original owner.
-        groups = []
-        image_ids = {image['image_id'] for image in images or []}
         for index, part in enumerate(source['parts']):
             span = part.get('text_span')
             if span is None:
@@ -416,6 +406,24 @@ def message_evidence(source: Mapping[str, Any], *, message_id: int | None,
                 groups[-1][1] = span[1]
             else:
                 groups.append([*span, kind, part, part.get('part_index', index)])
+    # Completeness follows the same typed projection as the displayed evidence.
+    # Hidden provenance and its joining separators are not missing user words;
+    # canonical offsets and caller-selected slices remain unchanged.
+    required = ([(start, end) for start, end, kind, *_ in groups if kind != 'provenance']
+                if source.get('parts') else [(0, total_characters)])
+    for start, end in required:
+        covered = start
+        for fragment in record['fragments']:
+            if fragment['offset'] > covered:
+                break
+            covered = max(covered, fragment['offset'] + len(fragment['text']))
+            if covered >= end:
+                break
+        if covered < end:
+            record.update(partial=True, total_characters=total_characters)
+            break
+    if source.get('parts'):
+        image_ids = {image['image_id'] for image in images or []}
         originals, annotations = [], []
         for fragment in record['fragments']:
             offset, text = fragment['offset'], fragment['text']

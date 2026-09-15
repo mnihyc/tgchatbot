@@ -1513,7 +1513,8 @@ class TelegramBotApp:
         return last_message
 
     async def _record_delivered_assistant_text(self, *, session_id: str, result: TurnResult,
-                                               source_message: Message, delivered_messages: list[Message]) -> None:
+                                               source_message: Message, delivered_messages: list[Message],
+                                               context_owner_message_id: int | None = None) -> None:
         text = (result.text or '').strip()
         if not text:
             return
@@ -1549,7 +1550,8 @@ class TelegramBotApp:
             assistant_metadata.update(reply_to_source_id=str(source_message.message_id),
                                       reply_to_source_chat_id=str(source_message.chat.id))
         stored = await self.runtime.record_assistant_text(session_id=session_id, text=text,
-            metadata=assistant_metadata, expected_scope=result.scope)
+            metadata=assistant_metadata, expected_scope=result.scope,
+            context_owner_message_id=context_owner_message_id)
         await self.store.bind_message_source(session_id, stored.db_id, source='telegram',
             source_chat_id=str(source_message.chat.id), source_message_ids=message_ids,
             actor_id=assistant_metadata['actor_id'], actor_kind='bot', actor_name=actor_name,
@@ -1710,7 +1712,12 @@ class TelegramBotApp:
             if event.kind == 'assistant_text':
                 text = (event.detail or str(event.payload.get('text') or '')).strip()
                 if text:
-                    await renderer.send_text(text)
+                    delivered = await renderer.send_text(text)
+                    await self._record_delivered_assistant_text(session_id=session_id,
+                        result=TurnResult(text=text, scope=event.payload.get('scope'),
+                            provider_name=event.payload.get('provider'), provider_model=event.payload.get('model')),
+                        source_message=message, delivered_messages=delivered,
+                        context_owner_message_id=event.payload.get('context_owner_message_id'))
                 return
             if should_show_status:
                 await renderer.emit(event)

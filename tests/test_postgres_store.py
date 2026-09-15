@@ -288,7 +288,11 @@ class PostgresConversationWorkflows(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(claimed[0]['source_ids'], batch['source_ids'])
         self.assertTrue(await self.store.complete_job(running))
         self.assertTrue(await self.store.complete_job(claimed[0]))
-        self.assertEqual(await self.store.job_status(self.session), [])
+        self.assertEqual([(job['kind'], job['status'], job['count'])
+            for job in await self.store.job_status(self.session)], [('memory_profile_request', 'pending', 1)],
+            'Finishing ingestion must not consume the soft-reset profile request')
+        profile = await self.store.claim_profile_batch(max_bytes=12000, lease_seconds=900)
+        self.assertEqual(profile['source_ids'], [row.db_id for row in rows])
         self.assertEqual(len(await self.store.read_messages(self.session, [row.db_id for row in rows])), 7)
 
     async def test_attachment_only_message_is_searchable_without_becoming_a_human_claim(self):

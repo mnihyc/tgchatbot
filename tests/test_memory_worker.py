@@ -342,7 +342,7 @@ class WorkerWorkflowTests(BusinessTestCase):
         self.assertTrue(self.provider.requests, 'Profile processing must progress before the import queue drains')
         self.assertTrue(await self.store.search_messages(self.session, 'jasmine'))
 
-    async def test_lazy_profile_fetch_processes_only_one_unicode_batch_before_indexing(self):
+    async def test_explicit_profile_refresh_processes_only_one_unicode_batch_before_indexing(self):
         self.worker.limits = replace(self.worker.limits, profile_request_bytes=32)
         text = '我喜欢安静的地方和有趣的企鹅。' * 4
         original = await self.source(text, 1)
@@ -352,6 +352,7 @@ class WorkerWorkflowTests(BusinessTestCase):
         while len(seen) < len(text):
             self.provider.responses = [self.patch_response()]
             before = len(self.provider.requests)
+            await self.worker.refresh_profiles(self.session, ['telegram:user:7', 'agent'])
             result = await memory.fetch_profiles(self.session, ['telegram:user:7'])
             self.assertTrue(result['ok'])
             self.assertNotIn('more_available', result)
@@ -361,6 +362,7 @@ class WorkerWorkflowTests(BusinessTestCase):
             self.assertLessEqual(len(chunk.encode('utf-8')), 32)
             seen += chunk
         self.assertEqual(seen, text)
+        await self.worker.refresh_profiles(self.session, ['telegram:user:7', 'agent'])
         await memory.fetch_profiles(self.session, ['telegram:user:7'])
         self.assertEqual(len(self.provider.requests), before + 1, 'Consumed sources must not learn again')
         self.assertEqual((await self.store.read_messages(self.session, [original.db_id]))[0].message.parts[0].text, text)
@@ -388,8 +390,11 @@ class WorkerWorkflowTests(BusinessTestCase):
         self.assertEqual(pending, len('I prefer tea. I like birds.'.encode()))
         self.assertEqual(audits, 0)
 
-    async def test_concurrent_lazy_fetches_do_not_learn_or_publish_the_same_batch_twice(self):
-        source = await self.source('I prefer jasmine tea.', 1)
+    async def test_concurrent_refresh_and_read_keep_committed_profile_without_duplicate_learning(self):
+        earlier = await self.source('I enjoy hiking.', 1)
+        await self.store.save_profile_fact(self.session, subject_actor_id='telegram:user:7',
+            asserted_by='telegram:user:7', claim='Enjoys hiking', source_ids=[earlier.db_id])
+        source = await self.source('I prefer jasmine tea.', 2)
         started, release = asyncio.Event(), asyncio.Event()
         async def generate(**kwargs):
             started.set()
@@ -400,16 +405,21 @@ class WorkerWorkflowTests(BusinessTestCase):
         memory = MemoryService(self.store, self.embeddings)
         memory.worker = self.worker
         with patch.object(self.provider, 'generate', AsyncMock(side_effect=generate)) as request:
-            first = asyncio.create_task(memory.fetch_profiles(self.session, ['telegram:user:7']))
+            first = asyncio.create_task(self.worker.refresh_profiles(self.session, ['telegram:user:7', 'agent']))
             await asyncio.wait_for(started.wait(), timeout=5)
             try:
                 second = await memory.fetch_profiles(self.session, ['telegram:user:7'])
-                self.assertEqual(second['profiles'][0]['facts'], [], 'Read the committed state while learning is in flight')
+                self.assertEqual([fact['claim'] for fact in second['profiles'][0]['facts']], ['Enjoys hiking'],
+                    'Read the last committed profile while learning is in flight')
+                await self.worker.refresh_profiles(self.session, ['telegram:user:7', 'agent'])
                 request.assert_awaited_once()
             finally:
                 release.set()
-            result = await first
-        self.assertEqual(result['profiles'][0]['facts'][0]['claim'], 'Prefers jasmine tea')
+            await first
+            result = await memory.fetch_profiles(self.session, ['telegram:user:7'])
+            request.assert_awaited_once()
+        self.assertEqual({fact['claim'] for fact in result['profiles'][0]['facts']},
+            {'Enjoys hiking', 'Prefers jasmine tea'})
         async with self.store.pool.connection() as conn:
             audits = (await (await conn.execute('SELECT count(*) AS n FROM profile_patches')).fetchone())['n']
         self.assertEqual(audits, 1)
@@ -520,7 +530,7 @@ class WorkerWorkflowTests(BusinessTestCase):
         self.assertEqual((await self.store.get_profile(self.session, 'telegram:user:7'))[0]['claim'], 'Prefers calm replies')
         self.assertEqual(await self.profile_jobs(), [])
 
-    async def test_lazy_batches_preserve_order_across_unicode_parts(self):
+    async def test_profile_batches_preserve_order_across_unicode_parts(self):
         from tgchatbot.domain.models import MessagePart, PartKind
         self.worker.limits = replace(self.worker.limits, profile_request_bytes=4)
         original = ConversationMessage.user_text('喜喜', metadata={'source': 'telegram', 'source_chat_id': '100',
@@ -628,7 +638,7 @@ class WorkerWorkflowTests(BusinessTestCase):
             {'offset': 0, 'text': 'Please keep your replies calm and concise.'}])
         self.assertEqual(len(self.provider.requests), before)
 
-    async def test_lazy_subject_selection_does_not_spend_its_batch_on_unrelated_old_backlog(self):
+    async def test_explicit_subject_refresh_does_not_spend_its_batch_on_unrelated_old_backlog(self):
         older = await self.source('Unrelated older material. ' * 100, 1, actor='telegram:user:8')
         requested = await self.source('I prefer jasmine tea.', 2)
         memory = MemoryService(self.store, self.embeddings)
@@ -636,6 +646,7 @@ class WorkerWorkflowTests(BusinessTestCase):
         self.provider.responses = [self.patch_response([{'subject_actor_id': 'telegram:user:7',
             'asserted_by': 'telegram:user:7', 'claim': 'Prefers jasmine tea', 'kind': 'explicit',
             'source_ids': [requested.db_id], 'valid_from': None, 'valid_to': None, 'supersedes': None}])]
+        await self.worker.refresh_profiles(self.session, ['telegram:user:7', 'agent'])
         result = await memory.fetch_profiles(self.session, ['telegram:user:7'])
         evidence = json.loads(self.provider.requests[-1]['messages'][0].parts[0].text)['original_evidence']
         self.assertEqual({row['message_id'] for row in evidence}, {requested.db_id})
@@ -644,7 +655,7 @@ class WorkerWorkflowTests(BusinessTestCase):
             pending = (await (await conn.execute('SELECT pending_bytes FROM profile_inputs WHERE message_id=%s', (older.db_id,))).fetchone())['pending_bytes']
         self.assertGreater(pending, 0)
 
-    async def test_lazy_subject_request_leaves_unrelated_pending_job_to_background(self):
+    async def test_explicit_subject_refresh_leaves_unrelated_pending_job_to_background(self):
         older = await self.source('I enjoy hiking.', 1, actor='telegram:user:8')
         job = (await self.profile_jobs())[0]
         await self.store.defer_job(job, payload=job['payload'], delay_seconds=0)
@@ -652,6 +663,7 @@ class WorkerWorkflowTests(BusinessTestCase):
         memory = MemoryService(self.store, self.embeddings)
         memory.worker = self.worker
         before = len(self.provider.requests)
+        await self.worker.refresh_profiles(self.session, ['telegram:user:7', 'agent'])
         result = await memory.fetch_profiles(self.session, ['telegram:user:7'])
         self.assertEqual(len(self.provider.requests), before)
         self.assertEqual(result['profiles'][0]['facts'], [])
@@ -712,6 +724,7 @@ class WorkerWorkflowTests(BusinessTestCase):
             'asserted_by': 'telegram:user:7', 'claim': 'Prefers option 0', 'kind': 'explicit',
             'source_ids': [originals[0].db_id], 'valid_from': None, 'valid_to': None, 'supersedes': None}])]
         before = len(self.provider.requests)
+        await self.worker.refresh_profiles(self.session, ['telegram:user:7', 'agent'])
         result = await memory.fetch_profiles(self.session, ['telegram:user:7'])
         self.assertEqual(len(self.provider.requests), before + 1)
         request = json.loads(self.provider.requests[-1]['messages'][0].parts[0].text)

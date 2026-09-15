@@ -57,6 +57,7 @@ class ProfileSourceChronologyWorkflows(BusinessTestCase):
         self.provider.responses = [self.response(
             self.fact(11, 'Prefers unsweetened jasmine tea', [sources[101], sources[102]]),
             self.fact(22, 'Prefers coffee', [sources[103]]))]
+        await self.worker.refresh_profiles(self.session, ['telegram:user:11', 'telegram:user:22', 'agent'])
         initial = await self.memory.fetch_profiles(self.session, ['telegram:user:11', 'telegram:user:22'])
         self.assertNotIn('refresh_error', initial)
         self.assertEqual(len(self.provider.requests), 1)
@@ -88,6 +89,7 @@ class ProfileSourceChronologyWorkflows(BusinessTestCase):
             return self.response(self.fact(11, 'Collects fountain pens', [sources[3]]))
 
         with patch.object(self.provider, 'generate', AsyncMock(side_effect=learn_older_evidence)) as model:
+            await self.worker.refresh_profiles(self.session, ['telegram:user:11', 'telegram:user:22', 'agent'])
             result = await self.memory.fetch_profiles(self.session, ['telegram:user:11', 'telegram:user:22'])
         model.assert_awaited_once()
         self.assertNotIn('refresh_error', result)
@@ -111,6 +113,7 @@ class ProfileSourceChronologyWorkflows(BusinessTestCase):
         valid_from = f'{next_year}-01-01T00:00:00+08:00'
         self.provider.responses = [self.response(self.fact(11, 'Use work email for invitations',
             [sources[1]], valid_from=valid_from))]
+        await self.worker.refresh_profiles(self.session, ['telegram:user:11', 'agent'])
         initial = await self.memory.fetch_profiles(self.session, ['telegram:user:11'])
         self.assertNotIn('refresh_error', initial)
         self.assertEqual(initial['profiles'][0]['facts'], [], 'A future preference is not yet active.')

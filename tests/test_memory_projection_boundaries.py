@@ -115,3 +115,78 @@ class MemoryProjectionBoundaryTests(BusinessTestCase):
         self.assertEqual(page['next_offset'], offset + length)
         self.assertEqual(page['total_characters'], len(body))
         self.assertTrue(page['partial'])
+
+    async def test_complete_visible_slice_does_not_request_hidden_provenance(self):
+        prefix, text = '[Message provenance: generated identity]', 'Are you there? 👋'
+        source = await self.original(1, parts=[
+            MessagePart(PartKind.TEXT, text=prefix, origin='provenance'),
+            MessagePart(PartKind.TEXT, text=text),
+        ])
+        offset = len(prefix) + 1
+        read = (await self.tool('memory_read', {'message_ids': [source.db_id],
+            'offset': offset, 'length': len(text)}))['messages'][0]
+        self.assertEqual(read['fragments'], [{'offset': offset, 'text': text}])
+        self.assertNotIn('partial', read)
+        self.assertNotIn('next_offset', read)
+        self.embeddings.enabled = True
+        await self.store.create_excerpt(self.session, [source.db_id],
+            spans=[{'message_id': source.db_id, 'start': offset, 'end': offset + len(text)}],
+            embedding=vector(), model=self.embeddings.space_id)
+        search = await self.tool('memory_search', {'query': 'unmatchedlexicalcontrol'})
+        self.assertEqual(search['messages'][0], read)
+
+        # A request landing in hidden metadata still follows canonical offsets.
+        first = (await self.tool('memory_read', {'message_ids': [source.db_id],
+            'offset': 0, 'length': offset}))['messages'][0]
+        self.assertEqual(first['fragments'], [])
+        self.assertTrue(first['partial'])
+        self.assertEqual(first['next_offset'], offset)
+        self.assertEqual(first['total_characters'], offset + len(text))
+
+    async def test_missing_words_or_application_notes_still_mark_evidence_partial(self):
+        text, note = 'The spare key is blue.', '[Attachment unavailable]'
+        source = await self.original(1, parts=[
+            MessagePart(PartKind.TEXT, text=text),
+            MessagePart(PartKind.TEXT, text='[hidden identity]', origin='provenance'),
+            MessagePart(PartKind.TEXT, text=note, origin='auto_note'),
+        ])
+        read = (await self.tool('memory_read', {'message_ids': [source.db_id],
+            'length': len(text)}))['messages'][0]
+        self.assertTrue(read['partial'], 'Application evidence is still missing')
+        self.assertEqual(read['fragments'], [{'offset': 0, 'text': text}])
+        self.assertEqual(read['next_offset'], len(text))
+        full = (await self.tool('memory_read', {'message_ids': [source.db_id]}))['messages'][0]
+        self.assertNotIn('partial', full)
+        self.assertEqual(full['annotations'], [{'kind': 'application', 'text': note}])
+
+        literal = await self.original(2, '[Message provenance: this is literal user text]')
+        clipped = (await self.tool('memory_read', {'message_ids': [literal.db_id],
+            'length': 10}))['messages'][0]
+        self.assertTrue(clipped['partial'])
+        self.assertEqual(clipped['fragments'][0]['text'], message_body(literal.message)[:10])
+
+    async def test_hidden_middle_and_suffix_do_not_make_all_visible_words_incomplete(self):
+        source = await self.original(1, parts=[
+            MessagePart(PartKind.TEXT, text='First'),
+            MessagePart(PartKind.TEXT, text='[hidden middle]', origin='provenance'),
+            MessagePart(PartKind.TEXT, text='Second'),
+            MessagePart(PartKind.TEXT, text='[hidden suffix]', origin='provenance'),
+        ])
+        self.embeddings.enabled = True
+        second = message_body(source.message).index('Second')
+        for start, end in ((0, 5), (second, second + 6)):
+            await self.store.create_excerpt(self.session, [source.db_id],
+                spans=[{'message_id': source.db_id, 'start': start, 'end': end}],
+                embedding=vector(), model=self.embeddings.space_id)
+        search = await self.tool('memory_search', {'query': 'unmatchedlexicalcontrol'})
+        record = search['messages'][0]
+        self.assertEqual(record['fragments'], [
+            {'offset': 0, 'text': 'First'}, {'offset': second, 'text': 'Second'}])
+        self.assertNotIn('partial', record)
+        page = (await self.tool('memory_read', {'message_ids': [source.db_id],
+            'length': second + 6}))['messages'][0]
+        self.assertNotIn('partial', page)
+        self.assertEqual(page['next_offset'], second + 6)
+        clipped = (await self.tool('memory_read', {'message_ids': [source.db_id],
+            'length': second + 5}))['messages'][0]
+        self.assertTrue(clipped['partial'], 'The last visible character is absent')

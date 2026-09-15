@@ -328,7 +328,9 @@ class PostgresStore:
 
     async def reset_context(self, session_id: str) -> dict[str, int]:
         async with self.pool.connection() as conn:
-            await self._session(conn, session_id, lock=True)
+            scope = await self._session(conn, session_id, lock=True)
+            from tgchatbot.storage.profiles import request_catchup
+            await request_catchup(conn, session_id=session_id, scope=scope)
             row = await (await conn.execute('''UPDATE sessions SET context_id=context_id+1,
                 revision=revision+1,context_version=context_version+1,compaction_version=0,
                 profile_refresh_version=0,updated_at=now() WHERE session_id=%s RETURNING *''', (session_id,))).fetchone()
@@ -431,12 +433,13 @@ class PostgresStore:
 
     async def append_message(self, session_id: str, message: ConversationMessage, estimated_tokens: int | None = None,
                              *, expected_scope: Mapping[str, Any] | None = None,
-                             generation_only: bool = False, intake: bool = False) -> StoredConversationMessage:
+                             generation_only: bool = False, intake: bool = False,
+                             context_owner_message_id: int | None = None) -> StoredConversationMessage:
         encoded = await self._encode_message(session_id, message)
         async with self.pool.connection() as conn:
             return await self._append_encoded_message(conn, session_id, message, encoded,
                 estimated_tokens=estimated_tokens, expected_scope=expected_scope,
-                generation_only=generation_only, intake=intake)
+                generation_only=generation_only, intake=intake, context_owner_message_id=context_owner_message_id)
 
     async def append_messages(self, session_id: str, messages: Sequence[ConversationMessage], *,
                               expected_scope: Mapping[str, Any] | None = None) -> list[StoredConversationMessage]:
@@ -455,7 +458,8 @@ class PostgresStore:
     async def _append_encoded_message(self, conn: AsyncConnection, session_id: str, message: ConversationMessage,
                                       encoded: tuple, *, estimated_tokens: int | None = None,
                                       expected_scope: Mapping[str, Any] | None = None,
-                                      generation_only: bool = False, intake: bool = False) -> StoredConversationMessage:
+                                      generation_only: bool = False, intake: bool = False,
+                                      context_owner_message_id: int | None = None) -> StoredConversationMessage:
         body, parts, metadata, fingerprint, previews = encoded
         canonical = self._canonical(message)
         if canonical['source_message_id'] is not None and canonical['source_chat_id'] is None:
@@ -501,6 +505,12 @@ class PostgresStore:
         if message.metadata.get('provider_native'):
             await conn.execute("UPDATE messages SET presentation=COALESCE(presentation,'{}'::jsonb)||%s WHERE id=%s",
                 (Jsonb({'provider_native': message.metadata['provider_native']}), message_id))
+        if context_owner_message_id is not None:
+            if message.role != MessageRole.ASSISTANT:
+                raise ValueError('Only delivered assistant speech can share its model replay owner')
+            from tgchatbot.storage.assistant_delivery import link_replay_owner
+            await link_replay_owner(conn, session_id=session_id, scope=scope,
+                message_id=message_id, owner_message_id=context_owner_message_id)
         searchable = []
         # Context controls and memory lookups remain replayable history, but
         # are derived from existing evidence and do not get their own search vote.
@@ -535,6 +545,8 @@ class PostgresStore:
 
     def _message(self, row: Mapping[str, Any], *, presentation: bool = False) -> StoredConversationMessage:
         body, part_data, metadata = row['body'], row['parts'], dict(row['metadata'])
+        if row.get('context_owner_message_id') is not None and not row.get('context_replay_detached'):
+            metadata['context_owner_message_id'] = row['context_owner_message_id']
         if presentation and row.get('presentation'):
             projection = row['presentation']
             if 'presentation_version' in projection:
@@ -544,6 +556,9 @@ class PostgresStore:
                 metadata['tool_evidence'] = True
             if projection.get('provider_native'):
                 metadata['provider_native'] = projection['provider_native']
+            for field in ('portable_tool_history', 'provider_native_skip_same_provider'):
+                if field in projection:
+                    metadata[field] = projection[field]
         parts = []
         for original in part_data:
             item = dict(original)
@@ -567,11 +582,13 @@ class PostgresStore:
 
     @staticmethod
     def _select_message(*, include_content: bool = True) -> str:
-        columns = ('m.*,s.context_version AS db_context_version,r.body,r.parts,r.metadata,r.estimated_tokens,r.edited_at'
+        columns = ('m.*,s.context_version AS db_context_version,r.body,r.parts,r.metadata,r.estimated_tokens,r.edited_at,'
+                   'replay.owner_message_id AS context_owner_message_id,replay.detached AS context_replay_detached'
                    if include_content else 'm.id,m.source_revision,m.generation')
         return f'''SELECT {columns}
             FROM messages m JOIN sessions s ON s.session_id=m.session_id AND s.generation=m.generation
-            JOIN message_revisions r ON (r.message_id,r.revision)=(m.id,m.source_revision)'''
+            JOIN message_revisions r ON (r.message_id,r.revision)=(m.id,m.source_revision)
+            LEFT JOIN message_replay_owners replay ON replay.message_id=m.id'''
 
     async def _read_ids(self, conn: AsyncConnection, session_id: str, ids: list[int], *,
                         current_context: bool = False, include_hidden: bool = False,
@@ -617,7 +634,7 @@ class PostgresStore:
             query += ' AND m.id < %s'
             parameters.append(before_message_id)
         if uncompacted:
-            query += ' AND m.compacted_by_block_id IS NULL'
+            query += ' AND m.compacted_by_block_id IS NULL AND (replay.message_id IS NULL OR replay.detached)'
         query += ' ORDER BY m.id DESC LIMIT %s'
         parameters.append(_limit(limit, self.config.read_page_size))
         async with self.pool.connection() as conn:
@@ -704,6 +721,7 @@ class PostgresStore:
                 await cursor.execute(self._select_message() + '''
                     WHERE m.session_id=%s AND m.context_id=s.context_id
                     AND NOT m.hidden AND NOT m.deleted AND m.compacted_by_block_id IS NULL
+                    AND (replay.message_id IS NULL OR replay.detached)
                     ORDER BY m.id''', (session_id,))
                 while rows := await cursor.fetchmany(self.config.history_page_size):
                     messages.extend(self._message(row, presentation=True) for row in rows)
@@ -749,7 +767,8 @@ class PostgresStore:
             state = CompactionWorkingSet(session_id=session_id, loaded=True,
                 through_message_id=through_message_id, database_version=session['context_version'])
             raw_query = self._select_message() + ''' WHERE m.session_id=%s AND m.context_id=s.context_id
-                AND NOT m.hidden AND NOT m.deleted AND m.compacted_by_block_id IS NULL AND m.id<=%s'''
+                AND NOT m.hidden AND NOT m.deleted AND m.compacted_by_block_id IS NULL AND m.id<=%s
+                AND (replay.message_id IS NULL OR replay.detached)'''
             page = await (await conn.execute(raw_query + ' ORDER BY m.id LIMIT %s',
                 (session_id, through_message_id, self.config.history_page_size + 1))).fetchall()
             rows = page[:self.config.history_page_size]
@@ -785,7 +804,8 @@ class PostgresStore:
             state.raw_messages = [self._message(row, presentation=True) for row in rows]
             last_id = rows[-1]['id'] if rows else 0
             state.more_raw = bool((await (await conn.execute(raw_query.replace(
-                self._select_message(), 'SELECT 1 FROM messages m JOIN sessions s ON s.session_id=m.session_id AND s.generation=m.generation')
+                self._select_message(), 'SELECT 1 FROM messages m JOIN sessions s ON s.session_id=m.session_id AND s.generation=m.generation '
+                'LEFT JOIN message_replay_owners replay ON replay.message_id=m.id')
                 + ' AND m.id>%s LIMIT 1', (session_id, through_message_id, last_id))).fetchone()))
             block_boundary = last_id if state.more_raw else through_message_id
             root_query = self._root_block_query()
@@ -814,7 +834,9 @@ class PostgresStore:
         async with self.pool.connection() as conn:
             raw = await (await conn.execute('''SELECT count(*) AS total FROM messages m JOIN sessions s
                 ON s.session_id=m.session_id AND s.generation=m.generation AND s.context_id=m.context_id
+                LEFT JOIN message_replay_owners replay ON replay.message_id=m.id
                 WHERE m.session_id=%s AND NOT m.hidden AND NOT m.deleted
+                AND (replay.message_id IS NULL OR replay.detached)
                 AND m.compacted_by_block_id IS NULL AND m.id<=%s''',
                 (session_id, through_message_id))).fetchone()
             blocks = await (await conn.execute('SELECT count(*) AS total FROM (' + self._root_block_query()
@@ -958,6 +980,8 @@ class PostgresStore:
             return (await self._read_ids(conn, session_id, [row['id']], presentation=True))[0]
 
     async def _invalidate_sources(self, conn: AsyncConnection, session_id: str, generation: int, ids: list[int]) -> None:
+        from tgchatbot.storage.assistant_delivery import detach_replay_owners
+        ids = await detach_replay_owners(conn, session_id=session_id, generation=generation, source_ids=ids)
         # A multi-person excerpt or unfinished tail may contain unaffected
         # originals. Rebuild their projections rather than losing that coverage.
         survivors: set[int] = set()

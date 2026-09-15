@@ -56,21 +56,10 @@ class MemoryService:
             subjects.append('agent')
         if scope is not None:
             await self.store.assert_scope(session_id, scope)
-        refresh_error = None
-        worker = getattr(self, 'worker', None)
-        if worker is not None and subjects:
-            try:
-                await worker.refresh_profiles(session_id, subjects)
-            except Exception as exc:
-                logger.warning('memory.profile_refresh_unavailable error=%s', type(exc).__name__)
-                refresh_error = 'Learning was unavailable; these are the last committed profiles.'
         snapshot = await self.store.fetch_profile_snapshot(session_id, subjects,
             expected_scope=scope)
         result = {'ok': True, 'as_of': snapshot['as_of'],
             'profiles': [chat_profile(profile) for profile in snapshot['profiles']]}
-        if refresh_error:
-            result['refresh_error'] = refresh_error
-
         return present_tool_output('user_profile_fetch', result, zone.key)
 
     async def search(self, session_id: str, query: str, *, scope=None, actor_id=None,
@@ -289,7 +278,8 @@ class MemoryReadTool:
         self.spec = ToolSpec('memory_read',
             'Read original message_ids or the supporting originals for profile_fact_ids from user_profile_fetch. '
             'Returns the same message records as memory_search; profile evidence reads do not run learning. '
-            'Paginate long text with offset and length; include_neighbors adds reply and nearby context. '
+            'Paginate long text with offset and length, following next_offset to continue a partial read. '
+            'include_neighbors adds reply and nearby context. '
             'Images remain descriptions unless image_ids selects them for visual examination. '
             'Each selected image must belong to an explicitly requested original, not an incidental neighbor. '
             'Results report unavailable or omitted evidence.',
@@ -332,9 +322,8 @@ class UserProfileFetchTool:
     def __init__(self, memory: MemoryService) -> None:
         self.memory = memory
         self.spec = ToolSpec('user_profile_fetch',
-            'Fetch current source-backed profiles for explicit actor IDs and, by default, the agent\'s continuing style preferences. '
+            'Fetch asynchronously updated, source-backed profiles for explicit actor IDs and, by default, the agent\'s continuing style preferences. '
             'Use when personal context matters and earlier profile evidence is missing or stale. '
-            'A fetch can learn at most one pending batch before returning committed profiles. '
             'Claims keep their kind and known validity dates; asserted_by defaults to the containing actor_id. '
             'Use memory_read(profile_fact_ids=[fact_id]) to inspect supporting originals. '
             'Names never select identities. Empty facts do not mean no preferences.',

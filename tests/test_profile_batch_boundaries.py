@@ -6,7 +6,6 @@ import json
 from types import SimpleNamespace
 
 from tests.business_helpers import BusinessTestCase
-from tgchatbot.core.memory import MemoryService
 from tgchatbot.core.memory_worker import MemoryWorker
 from tgchatbot.domain.models import ConversationMessage, ProviderResponse
 
@@ -17,8 +16,6 @@ class ProfileBatchBoundaries(BusinessTestCase):
         await self.settings()
         self.worker = MemoryWorker(store=self.store, embeddings=SimpleNamespace(enabled=False),
             providers={'openai': self.provider}, config=self.config)
-        self.memory = MemoryService(self.store, SimpleNamespace(enabled=False))
-        self.memory.worker = self.worker
         self.evidence = []
         self.actor = 'telegram:user:7'
 
@@ -76,13 +73,13 @@ class ProfileBatchBoundaries(BusinessTestCase):
             'spans': [{'start': 0, 'end': len(text)}], 'pending_bytes': len(text.encode())})
         self.assertEqual(await self.store.get_profile(self.session, self.actor), [])
         before = len(self.evidence)
-        await self.memory.fetch_profiles(self.session, [self.actor])
-        self.assertEqual(len(self.evidence), before + 1, 'Lazy refresh processes one batch')
+        await self.worker.refresh_profiles(self.session, [self.actor, 'agent'])
+        self.assertEqual(len(self.evidence), before + 1, 'Explicit refresh processes one batch')
         facts = await self.store.get_profile(self.session, self.actor)
         self.assertEqual([(fact['claim'], fact['source_ids']) for fact in facts],
             [('Prefers quiet evening walks.', [declaration.db_id])])
         self.assertEqual(self.evidence[-1][0]['fragments'], [{'offset': 0, 'text': text}])
-        await self.memory.fetch_profiles(self.session, [self.actor])
+        await self.worker.refresh_profiles(self.session, [self.actor, 'agent'])
         self.assertEqual(len(self.evidence), before + 1, 'Consumed evidence is not learned again')
         self.assertEqual((await self.store.read_messages(self.session, [declaration.db_id]))[0].message,
             declaration.message)
@@ -96,7 +93,7 @@ class ProfileBatchBoundaries(BusinessTestCase):
             correction: ('Prefers evening cycling.', 'Prefers quiet evening walks.')})
         old_source = await self.source(1, old)
         await self.source(2, tea)
-        await self.memory.fetch_profiles(self.session, [self.actor])
+        await self.worker.refresh_profiles(self.session, [self.actor, 'agent'])
         earlier = await self.store.get_profile(self.session, self.actor)
         self.assertEqual({fact['claim'] for fact in earlier},
             {'Prefers quiet evening walks.', 'Prefers jasmine tea.'})
@@ -107,7 +104,7 @@ class ProfileBatchBoundaries(BusinessTestCase):
         self.assertEqual((await self.pending(corrected))['pending_bytes'], len(correction.encode()))
         self.assertEqual({fact['claim'] for fact in await self.store.get_profile(self.session, self.actor)},
             {'Prefers quiet evening walks.', 'Prefers jasmine tea.'})
-        await self.memory.fetch_profiles(self.session, [self.actor])
+        await self.worker.refresh_profiles(self.session, [self.actor, 'agent'])
         current = await self.store.get_profile(self.session, self.actor)
         self.assertEqual({fact['claim'] for fact in current},
             {'Prefers evening cycling.', 'Prefers jasmine tea.'})
@@ -132,7 +129,7 @@ class ProfileBatchBoundaries(BusinessTestCase):
         self.assertEqual((await self.pending(original))['pending_bytes'], len(text.encode()))
         while (await self.pending(original))['pending_bytes']:
             before = (await self.pending(original))['pending_bytes']
-            await self.memory.fetch_profiles(self.session, [self.actor])
+            await self.worker.refresh_profiles(self.session, [self.actor, 'agent'])
             self.assertLess((await self.pending(original))['pending_bytes'], before)
         fragments = [item for batch in self.evidence for item in batch if item['message_id'] == original.db_id]
         self.assertGreater(len(fragments), 1)

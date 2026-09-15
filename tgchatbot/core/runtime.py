@@ -282,10 +282,13 @@ class AgentRuntime:
         await self._append_live_message(state, stored)
         return stored
 
-    async def record_assistant_text(self, *, session_id: str, text: str, metadata: dict[str, Any] | None = None, expected_scope: dict[str, int] | None = None) -> StoredConversationMessage:
+    async def record_assistant_text(self, *, session_id: str, text: str, metadata: dict[str, Any] | None = None,
+                                    expected_scope: dict[str, int] | None = None,
+                                    context_owner_message_id: int | None = None) -> StoredConversationMessage:
         state = await self._get_live_state(session_id)
         message = ConversationMessage.assistant_text(text, metadata=metadata)
-        stored = await self._append_stored(session_id, message, expected_scope=expected_scope)
+        stored = await self._append_stored(session_id, message, expected_scope=expected_scope,
+            context_owner_message_id=context_owner_message_id)
         await self._append_live_message(state, stored)
         return stored
 
@@ -615,17 +618,7 @@ class AgentRuntime:
                         total_steps,
                         len(tool_turn_text),
                     )
-                    if emit is not None:
-                        await emit(
-                            RuntimeEvent(
-                                kind='assistant_text',
-                                title='Assistant',
-                                detail=tool_turn_text,
-                                payload={'text': tool_turn_text},
-                            )
-                        )
-                        emitted_tool_text = True
-                    else:
+                    if emit is None:
                         deferred_tool_texts.append(tool_turn_text)
                 accumulated_items.extend(response.continuation_items)
                 native_items = persistent_history_items
@@ -646,6 +639,16 @@ class AgentRuntime:
                 stored_calls = await self.store.append_messages(session_id, calls, expected_scope=_turn_scope.get())
                 for stored_call in stored_calls:
                     await self._append_live_message(state, stored_call)
+                if tool_turn_text and emit is not None:
+                    # The native batch owns replay before Telegram records its
+                    # actually delivered words as searchable assistant evidence.
+                    owner = (stored_calls[0].db_id
+                        if self._provider_visible_text_parts_from_items(native_items) else None)
+                    await emit(RuntimeEvent(kind='assistant_text', title='Assistant', detail=tool_turn_text,
+                        payload={'text': tool_turn_text, 'context_owner_message_id': owner,
+                            'provider': provider.name, 'model': settings.model,
+                            'scope': _turn_scope.get()}))
+                    emitted_tool_text = True
                 for tool_call, stored_call in zip(response.tool_calls, stored_calls, strict=True):
                     logger.info('tool.call sid=%s name=%s call=%s args=%s', self._session_log_id(session_id), tool_call.name, clip_for_log(tool_call.call_id, limit=32), self._tool_argument_summary(tool_call.arguments))
                     # The current request is the authority for executable tools.
@@ -1181,6 +1184,11 @@ class AgentRuntime:
             await self._reload_live_state(state)
             return
         state.database_version = stored_message.context_version
+        if stored_message.message.metadata.get('context_owner_message_id') is not None:
+            # This committed original is searchable, but its model batch already
+            # owns the exact working presentation. Match DB reconstruction.
+            state.cache_revision += 1
+            return
         if state.raw_messages and stored_message.db_id <= state.raw_messages[-1].db_id:
             state.raw_messages = sorted([item for item in state.raw_messages if item.db_id != stored_message.db_id]
                 + [stored_message], key=lambda item: item.db_id)
@@ -1355,8 +1363,18 @@ class AgentRuntime:
         try:
             recent = await self.store.list_recent_participant_messages(session_id, expected_scope=_turn_scope.get())
             actor_ids = state.active_participant_ids(recent, trigger_message)
+            refresh_error = None
+            worker = getattr(self.memory, 'worker', None)
+            if worker is not None:
+                try:
+                    await worker.refresh_profiles(session_id, [*actor_ids, 'agent'])
+                except Exception as exc:
+                    logger.warning('memory.profile_refresh_unavailable error=%s', type(exc).__name__)
+                    refresh_error = 'Learning was unavailable; these are the last committed profiles.'
             output = await self.memory.fetch_profiles(session_id, actor_ids,
                 scope=_turn_scope.get(), timezone=self.config.default_metadata_timezone)
+            if refresh_error:
+                output['refresh_error'] = refresh_error
         except QueryCanceled:
             # Automatic enrichment is best effort. Preserve the existing
             # stored-input/answer path when an optional query times out.

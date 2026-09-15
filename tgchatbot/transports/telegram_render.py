@@ -319,7 +319,8 @@ class TelegramMessageRenderer:
     async def _send_new_live_text(self, text: str) -> None:
         await self._send_exact_chunks(_chunk_text_for_telegram_with_continuation(text), update_current=True)
 
-    async def _send_exact_chunks(self, chunks: list[TelegramText], *, update_current: bool = False) -> Message | None:
+    async def _send_exact_chunks(self, chunks: list[TelegramText], *, update_current: bool = False,
+                                 delivered_messages: list[Message] | None = None) -> Message | None:
         target = self._delivery_target()
         bot = target.get_bot()
         last_message: Message | None = None
@@ -327,6 +328,8 @@ class TelegramMessageRenderer:
         for chunk in chunks:
             safe_chunk = chunk or '...'
             last_message = await self._send_text_via_bot(bot, target.chat.id, safe_chunk)
+            if delivered_messages is not None:
+                delivered_messages.append(last_message)
             last_text = safe_chunk
         if update_current and last_message is not None:
             self.message = last_message
@@ -433,8 +436,10 @@ class TelegramMessageRenderer:
         if len(chunks) > 1:
             await self._send_exact_chunks(chunks[1:])
 
-    async def send_text(self, text: str) -> None:
-        await self._send_exact_chunks(_chunk_text_for_telegram(text))
+    async def send_text(self, text: str) -> list[Message]:
+        delivered_messages = []
+        await self._send_exact_chunks(_chunk_text_for_telegram(text), delivered_messages=delivered_messages)
+        return delivered_messages
 
     async def _fallback_send_text(self, text: TelegramContent) -> None:
         original_message = self.message

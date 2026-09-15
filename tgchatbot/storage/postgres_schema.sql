@@ -81,6 +81,15 @@ CREATE INDEX IF NOT EXISTS messages_time ON messages (session_id, generation, se
 CREATE INDEX IF NOT EXISTS messages_topic_time ON messages (session_id, generation, topic_id, sent_at, id)
     WHERE NOT hidden AND NOT deleted;
 
+-- Delivered speech is canonical assistant evidence. A model batch can already
+-- own its working-context representation, so the original must not replay twice.
+CREATE TABLE IF NOT EXISTS message_replay_owners (
+    message_id bigint PRIMARY KEY REFERENCES messages(id),
+    owner_message_id bigint NOT NULL REFERENCES messages(id),
+    detached boolean NOT NULL DEFAULT false
+);
+CREATE INDEX IF NOT EXISTS message_replay_owners_owner ON message_replay_owners (owner_message_id);
+
 -- Extra Telegram answer chunks map to one canonical body. The first chunk
 -- uses messages' existing source identity index, avoiding a row for single-part replies.
 CREATE TABLE IF NOT EXISTS message_source_aliases (

@@ -157,6 +157,7 @@ class QuotedEvidenceWorkflows(BusinessTestCase):
         self.provider.responses = [ProviderResponse(final_text=json.dumps({'additions': [fact], 'removals': []}))]
         memory = MemoryService(self.store, SimpleNamespace(enabled=False), config=self.config.memory)
         memory.worker = worker
+        await worker.refresh_profiles(self.session, ['telegram:user:7', 'agent'])
         result = await memory.fetch_profiles(self.session, ['telegram:user:7'])
         self.assertEqual(result['profiles'][0]['facts'][0]['claim'], 'Prefers tea and reading')
         supplied = json.loads(self.provider.requests[-1]['messages'][0].parts[0].text)['original_evidence']

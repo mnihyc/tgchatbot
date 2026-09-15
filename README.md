@@ -96,9 +96,10 @@ The agent can open selected images with `memory_read`. Compressed image evidence
 stays in PostgreSQL after prompt compaction and `/reset`; `/reset_full` makes the
 old generation audit-only. Missing exported image files remain unavailable.
 
-`user_profile_fetch` returns concise profiles with fact references. The agent can
+`user_profile_fetch` reads asynchronously updated profiles with fact references. The agent can
 open their supporting originals with `memory_read(profile_fact_ids=[...])`;
-reading evidence does not trigger profile learning.
+neither read triggers profile learning. Profiles learn in background batches;
+compaction can process a pending batch, and `/reset` queues catch-up without waiting.
 
 Stickers require an explicitly built catalog. The agent retrieves candidates,
 inspects available evidence, and chooses a sticker or text. Query previews are
