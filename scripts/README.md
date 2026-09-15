@@ -189,6 +189,20 @@ transfers without duplicating messages. Parsable images included beside the expo
 compression path and remain available to memory reads. Missing image files and
 unsupported attachments remain references.
 
+For a private conversation with an old bot, add `--user-only` and use **your
+Telegram user ID** as the destination:
+
+```sh
+docker compose run --rm --no-deps bot python -m tgchatbot.tools.import_desktop \
+  --file /app/data/imports/result.json --chat-id=123456789 --user-only
+```
+
+Only messages sent by that user are retained for memory and profile learning;
+bot replies and service events are skipped. Original text, identity, dates and
+available attachments are preserved. Reruns deduplicate within the exported
+conversation, separately from live messages. Old Telegram reply IDs are not
+resolved in this mode.
+
 For a large import, keep the bot stopped and prepare its working context before
 resuming it:
 

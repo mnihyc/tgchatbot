@@ -178,6 +178,95 @@ class DesktopImportWorkflows(unittest.IsolatedAsyncioTestCase):
         revisions = await self.store.list_message_revisions(self.session, first.db_id)
         self.assertEqual(len(revisions), 2)
 
+    async def test_user_only_private_import_preserves_owner_evidence_and_skips_other_work(self):
+        self.chat_id, self.session = 11, 'telegram:11'
+        content = export([
+            record(1, ['我喜欢 ', {'type': 'bold', 'text': '茉莉花茶'}], from_id='user11'),
+            # A skipped bot record must not reach text validation or media work.
+            record(2, None, from_id='user99', photo='missing-private-bot-photo.jpg'),
+            record(3, '原样转发', from_id='user11', forwarded_from='Quoted person',
+                   forwarded_from_id='user33', forwarded_message_id=7,
+                   reply_to_message_id=2, reply_to_peer_id='user99'),
+            record(4, '/reset_full', from_id='user11'),
+            record(5, 'not the owner', from_id='user22'),
+            record(6, None, type='service', from_id='user11', action='clear_history'),
+            record(7, 'unknown sender', from_id=None),
+        ], chat_id=99)
+        content['type'] = 'bot_chat'
+        self.path.write_text(json.dumps(content, ensure_ascii=False), encoding='utf-8')
+        await self.store.get_or_create_session(self.session, SessionSettings(system_prompt='Keep this preset.'))
+        scope = await self.store.get_scope(self.session)
+        with patch('tgchatbot.tools.import_desktop._import_visual',
+                   side_effect=AssertionError('Skipped media must not be processed')), \
+             patch('tgchatbot.tools.import_desktop._sync_import_attachment',
+                   side_effect=AssertionError('Skipped media must not be synchronized')):
+            result = await self.import_messages(user_only=True)
+        self.assertEqual(result.messages, 3)
+        rows = await self.store.list_canonical_messages(self.session)
+        self.assertEqual([row.message.parts[0].text for row in rows], ['我喜欢 茉莉花茶', '原样转发', '/reset_full'])
+        self.assertTrue(all(row.message.role == MessageRole.USER for row in rows))
+        self.assertTrue(all(row.message.metadata['actor_id'] == 'telegram:user:11' for row in rows))
+        self.assertTrue(all(row.message.metadata['actor_name'] == 'Alex' for row in rows))
+        self.assertEqual(rows[0].message.metadata['sent_at'], '2025-01-01T00:00:00+00:00')
+        self.assertEqual(rows[0].message.metadata['entities'], [{'type': 'bold', 'offset': 4, 'length': 4}])
+        self.assertEqual(rows[1].message.metadata['forward_origin']['actor_id'], 'telegram:user:33')
+        self.assertEqual(rows[1].message.metadata['desktop']['reply_to_message_id'], 2)
+        self.assertEqual((await self.store.get_scope(self.session))['generation'], scope['generation'])
+        self.assertEqual((await self.store.get_or_create_session(self.session, SessionSettings())).system_prompt,
+                         'Keep this preset.')
+        self.assertEqual(len(await self.store.search_messages(self.session, '茉莉花茶',
+                         actor_id='telegram:user:11')), 1)
+        jobs = await self.store.claim_jobs(10, kind='memory_ingest')
+        self.assertEqual({mid for job in jobs for mid in job['source_ids']}, {row.db_id for row in rows})
+        async with self.store.pool.connection() as conn:
+            queued = await (await conn.execute('SELECT message_id,actor_id,pending_bytes FROM profile_inputs')).fetchall()
+        self.assertEqual({row['message_id'] for row in queued}, {row.db_id for row in rows})
+        self.assertTrue(all(row['actor_id'] == 'telegram:user:11' and row['pending_bytes'] > 0 for row in queued))
+
+    async def test_user_only_private_sources_do_not_collide_with_live_ids_or_other_exports(self):
+        from tgchatbot.storage.relationships import expand_message_ids
+
+        self.chat_id, self.session = 11, 'telegram:11'
+        for old_bot in (99, 88):
+            content = export([record(1, f'History with bot {old_bot}', reply_to_message_id=77,
+                                     reply_to_peer_id=f'user{old_bot}'),
+                              record(77, 'Old bot reply', from_id=f'user{old_bot}')], chat_id=old_bot)
+            content['type'] = 'bot_chat'
+            self.path.write_text(json.dumps(content), encoding='utf-8')
+            self.assertEqual((await self.import_messages(user_only=True)).messages, 1)
+            self.assertEqual((await self.import_messages(user_only=True)).messages, 1)
+        imported = await self.store.list_canonical_messages(self.session)
+        self.assertEqual(len(imported), 2)
+        self.assertEqual(len({row.message.metadata['source_chat_id'] for row in imported}), 2)
+        for row in imported:
+            metadata = row.message.metadata
+            self.assertEqual(metadata['source'], 'telegram_desktop')
+            self.assertEqual(metadata['source_message_id'], '1')
+            self.assertEqual(metadata['desktop']['reply_to_message_id'], 77)
+            for field in ('telegram_message_id', 'reply_to_source_id', 'reply_to_source_chat_id'):
+                self.assertIsNone(metadata.get(field))
+        live_rows = []
+        for number in (1, 77):
+            live = desktop_message(record(number, f'Unrelated live message {number}'),
+                                   ExportChat({}, None), chat_id=self.chat_id)
+            for field in ('imported', 'desktop', 'export_chat'):
+                live.metadata.pop(field)
+            live_rows.append(await self.store.append_message(self.session, live))
+        rows = await self.store.list_canonical_messages(self.session)
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(len({row.db_id for row in rows}), 4)
+        for row in rows:
+            self.assertEqual(len(await self.store.list_message_revisions(self.session, row.db_id)), 1)
+        for row in imported:
+            self.assertEqual(await expand_message_ids(self.store, self.session, [row.db_id], neighbors=0), [row.db_id],
+                'Historical Desktop replies must not accidentally resolve to live Bot API message IDs.')
+        self.assertEqual((await self.import_messages(user_only=True)).messages, 1)
+        self.assertEqual(len(await self.store.list_canonical_messages(self.session)), 4)
+        for row in live_rows:
+            self.assertEqual((await self.store.read_messages(self.session, [row.db_id]))[0].message.parts[0].text,
+                             row.message.parts[0].text)
+            self.assertEqual(len(await self.store.list_message_revisions(self.session, row.db_id)), 1)
+
     async def test_upgraded_group_history_preserves_negative_source_ids_and_reply_links(self):
         from tgchatbot.storage.relationships import expand_message_ids
 

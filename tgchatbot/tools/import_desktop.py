@@ -1,8 +1,9 @@
 """Stream one Telegram Desktop JSON conversation through ordinary message intake.
 
 Desktop's export uses bare peer IDs and mixed string/entity text. The explicit
-destination chat supplies the live Bot API namespace; original export metadata
-is retained. Import never invokes Telegram handlers, agent tools, or model interpretation.
+destination chat owns the imported memory; user-only private archives keep their
+message IDs separate from live Telegram IDs. Original export metadata is retained.
+Import never invokes Telegram handlers, agent tools, or model interpretation.
 Available ordinary files use the same remote upload path as live intake.
 """
 from __future__ import annotations
@@ -62,6 +63,7 @@ class ImportResult:
     messages: int
     batches: int
     generation: int
+    skipped: int = 0
 
 
 def inspect_export(path: Path, export_chat_id: str | None = None) -> ExportChat:
@@ -475,6 +477,7 @@ def _batches(records: Iterator[dict[str, Any]], options: ImportConfig) -> Iterat
 
 async def import_file(store: PostgresStore, path: Path, *, chat_id: int,
                       export_chat_id: str | None = None, bot_user_id: int | None = None,
+                      user_only: bool = False,
                       defaults: SessionSettings | None = None,
                       options: ImportConfig | None = None,
                       telegram_config: TelegramConfig | None = None,
@@ -482,18 +485,44 @@ async def import_file(store: PostgresStore, path: Path, *, chat_id: int,
                       timezone: str | None = None,
                       progress: Callable[[ImportResult], None] | None = None) -> ImportResult:
     options = options if options is not None else from_env(ImportConfig, 'IMPORT')
+    if user_only and chat_id <= 0:
+        raise ValueError('--user-only needs the positive Telegram user ID as --chat-id')
+    chat = inspect_export(path, export_chat_id)
+    if user_only and chat.metadata.get('id') is None:
+        raise ValueError('--user-only needs the exported chat ID in the JSON header')
     session_id = f'telegram:{chat_id}'
     await store.get_or_create_session(session_id, defaults or SessionSettings())
     timezone = resolve_timezone(timezone).key
     scope = await store.get_scope(session_id)
-    chat = inspect_export(path, export_chat_id)
     export_root = path.parent.resolve()
-    processed = batches = 0
-    for batch in _batches(iter_records(path, chat), options):
+    processed = batches = skipped = 0
+
+    def selected_records():
+        nonlocal skipped
+        for record in iter_records(path, chat):
+            # Select the human by stable identity, never by display name or
+            # the current token's bot identity. Skipped media does no work.
+            if user_only and (record.get('type') != 'message'
+                    or record.get('from_id') != f'user{chat_id}'):
+                skipped += 1
+                continue
+            yield record
+
+    for batch in _batches(selected_records(), options):
         source_ids = []
         for record in batch:
-            message = desktop_message(record, chat, chat_id=chat_id, bot_user_id=bot_user_id,
+            message = desktop_message(record, chat, chat_id=chat_id,
+                bot_user_id=None if user_only else bot_user_id,
                 timezone=timezone)
+            if user_only:
+                # Private Desktop IDs belong to the exporting account, not the
+                # bot's live message sequence. This stable archive key permits
+                # reruns and multiple old bot chats without inventing live IDs.
+                message.metadata['source'] = 'telegram_desktop'
+                message.metadata['source_chat_id'] = f'user{chat_id}:peer{chat.metadata["id"]}'
+                for key in ('telegram_message_id', 'reply_to_source_id',
+                            'reply_to_source_chat_id', 'reply_to_peer_id'):
+                    message.metadata.pop(key, None)
             previous = None
             attachment = _attachment(record)
             if attachment is not None:
@@ -502,8 +531,8 @@ async def import_file(store: PostgresStore, path: Path, *, chat_id: int,
                     telegram_config = load_config(require_telegram=False).telegram
                 is_file = not record.get('photo') and attachment[0] != 'sticker'
                 if is_file:
-                    previous = await store.read_message_by_source(session_id, source='telegram',
-                        source_chat_id=str(chat_id), source_message_id=message.metadata['source_message_id'],
+                    previous = await store.read_message_by_source(session_id, source=message.metadata['source'],
+                        source_chat_id=message.metadata['source_chat_id'], source_message_id=message.metadata['source_message_id'],
                         expected_scope=scope, generation_only=True)
                     if remote_workspace and remote_workspace.enabled and (previous is None
                             or not _same_import_source(previous.message, message)):
@@ -524,9 +553,9 @@ async def import_file(store: PostgresStore, path: Path, *, chat_id: int,
         await store.coalesce_memory_jobs(session_id, source_ids=source_ids, expected_scope=scope)
         batches += 1
         if progress is not None:
-            progress(ImportResult(processed, batches, scope['generation']))
+            progress(ImportResult(processed, batches, scope['generation'], skipped))
         await asyncio.sleep(0)
-    return ImportResult(processed, batches, scope['generation'])
+    return ImportResult(processed, batches, scope['generation'], skipped)
 
 
 async def _run(args: argparse.Namespace) -> None:
@@ -545,6 +574,7 @@ async def _run(args: argparse.Namespace) -> None:
         result = await import_file(store, args.file, chat_id=args.chat_id,
             export_chat_id=args.export_chat_id,
             bot_user_id=int(token_id) if token_id.isdigit() else None,
+            user_only=args.user_only,
             defaults=config.default_session_settings(),
             telegram_config=config.telegram, remote_workspace=remote_workspace, artifact_store=artifact_store,
             timezone=config.default_metadata_timezone,
@@ -554,7 +584,8 @@ async def _run(args: argparse.Namespace) -> None:
         if remote_workspace is not None:
             await remote_workspace.aclose()
         await store.close()
-    print(f'Import complete: {result.messages} messages processed. New or changed messages are queued for memory processing.')
+    skipped = f' {result.skipped} other messages skipped.' if args.user_only else ''
+    print(f'Import complete: {result.messages} messages processed.{skipped} New or changed messages are queued for memory processing.')
 
 
 def main() -> None:
@@ -562,6 +593,8 @@ def main() -> None:
     parser.add_argument('--file', type=Path, required=True, help='Telegram Desktop JSON export')
     parser.add_argument('--chat-id', type=int, required=True, help='Destination Telegram chat ID used by the bot')
     parser.add_argument('--export-chat-id', help='Select one chat ID from a full chats.list export')
+    parser.add_argument('--user-only', action='store_true',
+        help='Keep only messages sent by the user identified by --chat-id; skip bot replies and old Telegram reply links')
     args = parser.parse_args()
     if args.chat_id == 0 or not args.file.is_file():
         parser.error('--chat-id must be nonzero and --file must be an existing JSON file')

@@ -129,6 +129,35 @@ class DesktopAttachmentImportTests(BusinessTestCase):
         self.assertEqual((self.bundle / 'notes.txt').read_bytes(), b'File content remains out of prompt')
         self.assertTrue(all(not path.exists() for path in self.staged))
 
+    async def test_user_only_attachment_rerun_preserves_committed_remote_receipt(self):
+        raw = b'An original document for later reading'
+        (self.bundle / 'notes.txt').write_bytes(raw)
+        self.export_path.write_text(json.dumps({
+            'type': 'bot_chat', 'id': 99, 'name': 'Previous bot', 'messages': [
+                record(1, 'Keep my notes', from_id='user100', file='notes.txt',
+                    mime_type='text/plain', media_type='document'),
+                record(2, 'A bot document', from_id='user99', file='missing.pdf',
+                    mime_type='application/pdf', media_type='document'),
+            ]}), encoding='utf-8')
+
+        async def import_again():
+            return await import_file(self.store, self.export_path, chat_id=100, user_only=True,
+                telegram_config=self.config.telegram, remote_workspace=self.remote,
+                artifact_store=self.artifacts)
+
+        result = await import_again()
+        self.assertEqual((result.messages, result.skipped), (1, 1))
+        original = (await self.store.list_canonical_messages(self.session))[0]
+        revisions = await self.store.list_message_revisions(self.session, original.db_id)
+        await import_again()
+        restored = await self.store.list_canonical_messages(self.session)
+        self.assertEqual(restored, [original])
+        self.assertEqual(await self.store.list_message_revisions(self.session, original.db_id), revisions)
+        attachment = next(part for part in original.message.parts if part.kind == PartKind.FILE)
+        self.assertEqual(self.remote_files, {attachment.artifact_path: raw})
+        self.assertTrue(all(not path.exists() for path in self.staged))
+        self.assertEqual(self.provider.requests, [])
+
     async def test_import_uses_original_dates_and_retains_remote_receipts_across_reimport(self):
         await self.settings()
         # These UTC instants straddle midnight in the configured UTC+8 zone.
