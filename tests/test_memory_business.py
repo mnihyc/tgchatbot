@@ -556,7 +556,7 @@ class MemoryBusinessTests(BusinessTestCase):
         self.assertEqual(await self.store.get_profile(self.session, "telegram:user:7"), [])
         self.assertEqual((await self.memory.read(self.session, [source.db_id]))["unavailable_ids"], [source.db_id])
 
-    async def test_chat_memory_tools_share_existing_round_budget_and_preserve_exact_prompt(self):
+    async def test_chat_memory_tools_share_soft_round_limit_and_preserve_exact_prompt(self):
         await self.settings(mode=ChatMode.CHAT, max_interaction_rounds=1,
             system_prompt="  Keep my exact voice.  ", prompt_injection_mode=PromptInjectionMode.EXACT)
         source = await self.ingest("I prefer jasmine tea.")
@@ -567,23 +567,27 @@ class MemoryBusinessTests(BusinessTestCase):
         self.assertEqual(result.text, "You prefer jasmine tea.")
         self.assertEqual({tool.name for tool in self.provider.requests[0]["tools"]}, {"memory_search", "memory_read", "user_profile_fetch"})
         self.assertEqual(self.provider.requests[0]["instructions"], "Keep my exact voice.")
-        self.assertTrue(self.provider.requests[1]["instructions"].startswith("Keep my exact voice.\n\n[Internal control note]"))
-        self.assertEqual(self.provider.requests[1]["tools"], [])
+        self.assertEqual(self.provider.requests[1]["instructions"], "Keep my exact voice.")
+        self.assertEqual(self.provider.requests[1]["tools"], self.provider.requests[0]["tools"])
         self.tools.list_tools.assert_not_called()
         self.tools.runner.run.assert_not_awaited()
         output = self.provider.requests[1]["extra_input_items"][-1]["output"]
         self.assertEqual(output["messages"][0]["speaker"]["id"], "person_id:7")
+        self.assertEqual(output['application_note'],
+            'Tool-call limit reached for this turn. Finish the reply using the available results.')
 
-    async def test_final_round_cannot_execute_an_extra_memory_read(self):
+    async def test_soft_round_limit_allows_another_memory_read(self):
         await self.settings(mode=ChatMode.CHAT, max_interaction_rounds=1)
         source = await self.ingest("I prefer jasmine tea.")
         self.memory.read = AsyncMock(wraps=self.memory.read)
         self.provider.responses = [ProviderResponse(tool_calls=[ToolCall("memory_read", f"read-{i}", {"message_ids": [source.db_id]})]) for i in range(2)]
-        with self.assertRaisesRegex(RuntimeError, "Interaction-round limit"):
-            await self.runtime.run_turn_from_stored(session_id=self.session, user_display_name="Alex", trigger_message_id=source.db_id)
-        self.assertEqual(self.memory.read.await_count, 1)
-        self.assertEqual(len(self.provider.requests), 2)
-        self.assertEqual(self.provider.requests[1]["tools"], [])
+        self.provider.responses.append(ProviderResponse(final_text='You prefer jasmine tea.'))
+        result = await self.runtime.run_turn_from_stored(session_id=self.session,
+            user_display_name="Alex", trigger_message_id=source.db_id)
+        self.assertEqual(result.text, 'You prefer jasmine tea.')
+        self.assertEqual(self.memory.read.await_count, 2)
+        self.assertEqual(len(self.provider.requests), 3)
+        self.assertEqual(self.provider.requests[1]["tools"], self.provider.requests[0]["tools"])
 
     async def test_durable_reply_target_counts_against_request_budget(self):
         source = await self.ingest("I prefer jasmine tea.")

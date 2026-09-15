@@ -177,7 +177,7 @@ class RuntimeWorkflowTests(BusinessTestCase):
         self.tools.list_tools.assert_not_called()
         self.tools.runner.run.assert_not_awaited()
 
-    async def test_tool_round_records_observations_and_forces_final_answer(self):
+    async def test_tool_round_records_observations_and_requests_final_answer(self):
         await self.settings(mode=ChatMode.ASSIST, max_interaction_rounds=1, sticker_mode=StickerMode.OFF)
         self.provider.responses = [
             ProviderResponse(final_text="Checking.", tool_calls=[ToolCall("shell_exec", "c1", {"command": "mock"})], continuation_items=[{"type": "function_call", "call_id": "c1"}]),
@@ -187,21 +187,34 @@ class RuntimeWorkflowTests(BusinessTestCase):
         self.assertEqual(result.text, "Checking.\n\nDone.")
         self.tools.list_tools.assert_called_once_with(allow_python_exec=True, allow_stickers=False)
         self.tools.runner.run.assert_awaited_once()
-        self.assertEqual(self.provider.requests[1]["tools"], [])
-        self.assertIn("final interaction round", self.provider.requests[1]["instructions"])
+        self.assertEqual(self.provider.requests[1]["tools"], self.provider.requests[0]["tools"])
+        self.assertEqual(self.provider.requests[1]["instructions"], self.provider.requests[0]["instructions"])
+        output = self.provider.requests[1]["extra_input_items"][-1]["output"]
+        self.assertEqual(output['application_note'],
+            'Tool-call limit reached for this turn. Finish the reply using the available results.')
         self.assertEqual(self.provider.requests[1]["extra_input_items"][-1]["call_id"], "c1")
         messages = await self.store.list_messages(self.session)
         self.assertEqual([m.role for m in messages], [MessageRole.USER, MessageRole.USER, MessageRole.TOOL, MessageRole.TOOL])
         self.assertEqual(messages[1].metadata["synthetic_role"], "reply_target")
         self.assertEqual([m.metadata["tool_phase"] for m in messages[2:]], ["call", "result"])
+        self.assertEqual(messages[-1].metadata['tool_payload']['output'], output)
 
-    async def test_final_round_cannot_extend_tool_execution(self):
+    async def test_soft_round_limit_allows_continuation_without_repeating_the_notice(self):
         await self.settings(mode=ChatMode.AGENT, max_interaction_rounds=1)
         self.provider.responses = [ProviderResponse(tool_calls=[ToolCall("shell_exec", f"c{i}", {})]) for i in range(2)]
-        with self.assertRaisesRegex(RuntimeError, "Interaction-round limit"):
-            await self.turn()
-        self.assertEqual(len(self.provider.requests), 2)
-        self.tools.runner.run.assert_awaited_once()
+        self.provider.responses.append(ProviderResponse(final_text='Done after checking.'))
+        result = await self.turn()
+        self.assertEqual(result.text, 'Done after checking.')
+        self.assertEqual(len(self.provider.requests), 3)
+        self.assertEqual(self.tools.runner.run.await_count, 2)
+        outputs = [message.metadata['tool_payload']['output']
+            for message in await self.store.list_messages(self.session)
+            if message.metadata.get('tool_phase') == 'result']
+        self.assertIn('application_note', outputs[0])
+        self.assertNotIn('application_note', outputs[1])
+        for request in self.provider.requests[1:]:
+            self.assertEqual(request['instructions'], self.provider.requests[0]['instructions'])
+            self.assertEqual(request['tools'], self.provider.requests[0]['tools'])
 
     async def test_unadvertised_tool_is_rejected_even_when_registered(self):
         await self.settings(mode=ChatMode.ASSIST)

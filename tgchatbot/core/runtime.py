@@ -511,23 +511,19 @@ class AgentRuntime:
         deferred_tool_texts: list[str] = []
         emitted_tool_text = False
 
-        total_steps = max_tool_rounds + 1
-        for iteration in range(total_steps):
+        iteration = 0
+        while True:
             await self._check_turn_scope(session_id)
             if self.preview_cache is not None:
                 history = await self.preview_cache.materialize_many(session_id, history,
                     vision=provider.capabilities.multimodal_input)
-            final_iteration = iteration == max_tool_rounds
-            current_tools = [] if final_iteration or not provider.capabilities.function_tools else tools
-            iteration_instructions = instructions
-            if final_iteration and tools:
-                # End tool interaction without requiring extra prose when an
-                # already selected sticker fulfills the request.
-                iteration_instructions = instructions + "\n\n[Internal control note]: this is the final interaction round for this turn. Keep the established personality and preset voice exactly as intended by the system prompt. This note is not a user message. Do not call any more tools. Finish the current reply in the requested form using the available results. A selected sticker can be the entire reply; add text only when it fits the request."
+            # The round threshold is a one-time reminder, not an execution
+            # cutoff. Keep the system prompt and tool declarations stable.
+            current_tools = tools if provider.capabilities.function_tools else []
             raw_request_estimate = provider.estimate_request_tokens(
                 settings=settings,
                 messages=history,
-                instructions=iteration_instructions,
+                instructions=instructions,
                 tools=current_tools,
                 extra_input_items=accumulated_items or None,
             )
@@ -538,11 +534,10 @@ class AgentRuntime:
                 tool_history_mode=settings.tool_history_mode,
             )
             logger.info(
-                'turn.iter sid=%s step=%s/%s final=%s tools=%s extra=%s est_req=%s raw_req=%s bias=%.3f',
+                'turn.iter sid=%s step=%s soft_limit=%s tools=%s extra=%s est_req=%s raw_req=%s bias=%.3f',
                 self._session_log_id(session_id),
                 iteration + 1,
-                total_steps,
-                int(final_iteration),
+                max_tool_rounds,
                 len(current_tools),
                 len(accumulated_items),
                 adjusted_request_estimate.total_tokens,
@@ -550,13 +545,13 @@ class AgentRuntime:
                 self._request_estimate_bias_for(provider_name=provider.name, model=settings.model, tool_history_mode=settings.tool_history_mode),
             )
             if emit and settings.process_visibility != ProcessVisibility.OFF:
-                await emit(RuntimeEvent(kind='phase', title='Step', detail=f'iteration {iteration + 1}/{total_steps}'))
+                await emit(RuntimeEvent(kind='phase', title='Step', detail=f'iteration {iteration + 1}'))
 
             response = await self._generate_with_retries(
                 provider=provider,
                 settings=settings,
                 messages=history,
-                instructions=iteration_instructions,
+                instructions=instructions,
                 tools=current_tools,
                 extra_input_items=accumulated_items or None,
             )
@@ -569,13 +564,13 @@ class AgentRuntime:
                 raw_estimate_total=raw_request_estimate.total_tokens,
                 actual_input_tokens=getattr(last_usage, 'input_tokens', None),
             )
-            logger.info('turn.model sid=%s step=%s/%s tool_calls=%s native_calls=%s continue=%s text_chars=%s usage=%s', self._session_log_id(session_id), iteration + 1, total_steps, len(response.tool_calls), len(getattr(response, 'native_tool_calls', []) or []), len(response.continuation_items), len(response.final_text or ''), self._usage_log_text(last_usage))
+            logger.info('turn.model sid=%s step=%s tool_calls=%s native_calls=%s continue=%s text_chars=%s usage=%s', self._session_log_id(session_id), iteration + 1, len(response.tool_calls), len(getattr(response, 'native_tool_calls', []) or []), len(response.continuation_items), len(response.final_text or ''), self._usage_log_text(last_usage))
             persistent_history_items = provider.persistent_history_items(response) if hasattr(provider, 'persistent_history_items') else []
 
             if emit and settings.process_visibility in {ProcessVisibility.VERBOSE, ProcessVisibility.FULL}:
                 summary = clip_for_log(' | '.join(getattr(response, "reasoning_summaries", [])), limit=220, rlimit=80)
                 if summary:
-                    logger.info('turn.reason sid=%s step=%s/%s token=%s preview=%s', self._session_log_id(session_id), iteration + 1, total_steps, TokenEstimator.estimate_text(summary), summary)
+                    logger.info('turn.reason sid=%s step=%s token=%s preview=%s', self._session_log_id(session_id), iteration + 1, TokenEstimator.estimate_text(summary), summary)
                     for summary in getattr(response, 'reasoning_summaries', [])[:2]:
                         await emit(RuntimeEvent(
                             kind='thinking',
@@ -612,17 +607,16 @@ class AgentRuntime:
                 tool_turn_text = (response.final_text or self._provider_visible_text_from_items(persistent_history_items)).strip()
                 if tool_turn_text:
                     logger.info(
-                        'turn.tool_text sid=%s step=%s/%s chars=%s',
+                        'turn.tool_text sid=%s step=%s chars=%s',
                         self._session_log_id(session_id),
                         iteration + 1,
-                        total_steps,
                         len(tool_turn_text),
                     )
                     if emit is None:
                         deferred_tool_texts.append(tool_turn_text)
                 accumulated_items.extend(response.continuation_items)
                 native_items = persistent_history_items
-                pending_evidence_ids: set[int] = set()
+                pending_context_ids: set[int] = set()
                 admitted_images = admitted_tokens = 0
                 has_tool_evidence = False
                 batch_id = uuid4().hex
@@ -649,11 +643,9 @@ class AgentRuntime:
                             'provider': provider.name, 'model': settings.model,
                             'scope': _turn_scope.get()}))
                     emitted_tool_text = True
-                for tool_call, stored_call in zip(response.tool_calls, stored_calls, strict=True):
+                for tool_index, (tool_call, stored_call) in enumerate(zip(response.tool_calls, stored_calls, strict=True)):
                     logger.info('tool.call sid=%s name=%s call=%s args=%s', self._session_log_id(session_id), tool_call.name, clip_for_log(tool_call.call_id, limit=32), self._tool_argument_summary(tool_call.arguments))
-                    # The current request is the authority for executable tools.
-                    # A model can emit calls even when tools are disabled or the
-                    # final response round explicitly advertises no tools.
+                    # Only registered tools offered in this request may run.
                     evidence_parts = []
                     spec = next((item for item in current_tools if item.name == tool_call.name), None)
                     if spec is None:
@@ -742,6 +734,13 @@ class AgentRuntime:
                         updated_call = await self.store.mark_tool_evidence(session_id, stored_call.db_id,
                             expected_scope=_turn_scope.get())
                         await self._append_live_message(state, updated_call)
+                    limit_notice = (iteration + 1 == max_tool_rounds
+                        and tool_index == len(response.tool_calls) - 1)
+                    if limit_notice:
+                        # Attach once before persistence and serialization; do
+                        # not rewrite results already sent in earlier rounds.
+                        tool_output = {**tool_output, 'application_note':
+                            'Tool-call limit reached for this turn. Finish the reply using the available results.'}
                     stored_result = await self.record_tool_observation(
                         session_id=session_id,
                         name=tool_call.name,
@@ -752,8 +751,8 @@ class AgentRuntime:
                         metadata_update={'tool_batch_id': batch_id, 'tool_model': settings.model, 'tool_call_message_id': stored_call.db_id,
                             **({'tool_evidence': True} if evidence_parts else {})},
                     )
-                    if evidence_parts:
-                        pending_evidence_ids.update((stored_call.db_id,stored_result.db_id))
+                    if evidence_parts or limit_notice:
+                        pending_context_ids.update((stored_call.db_id,stored_result.db_id))
                     if emit and settings.process_visibility in {ProcessVisibility.VERBOSE, ProcessVisibility.FULL}:
                         await emit(
                             RuntimeEvent(
@@ -774,7 +773,7 @@ class AgentRuntime:
                 continuation_tokens = provider.estimate_request_tokens(settings=settings,messages=next_history,
                     instructions=instructions,tools=tools).total_tokens
                 if has_tool_evidence or continuation_tokens > self._effective_compact_trigger_tokens(settings):
-                    protection = _admission_protected.set(frozenset(pending_evidence_ids))
+                    protection = _admission_protected.set(frozenset(pending_context_ids))
                     try:
                         changed = await self._compact_if_needed(session_id=session_id,settings=settings,provider=provider,
                             state=state,instructions=instructions,tools=tools,emit=emit,native_from_id=turn_history_start)
@@ -794,6 +793,7 @@ class AgentRuntime:
                     history = self._continuation_history(state,settings=settings,provider=provider,
                         native_from_id=turn_history_start)
                     accumulated_items = []
+                iteration += 1
                 continue
 
             final_text = (response.final_text or self._provider_visible_text_from_items(persistent_history_items)).strip()
@@ -819,9 +819,6 @@ class AgentRuntime:
                 provider_history_items=persistent_history_items,
                 reply_target=target,
             )
-
-        logger.warning('turn.limit sid=%s trigger=%s rounds=%s usage=%s', self._session_log_id(session_id), trigger_message_id, max_tool_rounds, self._usage_log_text(last_usage))
-        raise RuntimeError('Interaction-round limit reached without a final response')
 
     async def describe_settings(self, session_id: str) -> dict[str, Any]:
         settings = await self.store.get_or_create_session(session_id, self.config.default_session_settings())
@@ -3363,6 +3360,8 @@ class AgentRuntime:
                     details.append(f'stderr={stderr!r}')
         elif payload:
             details.append(self._clip_inline(self._compact_json(payload, limit=220), 220))
+        if output.get('application_note'):
+            details.append('Application: ' + str(output['application_note']))
         prefix = f'Tool {name} result'
         return prefix + (': ' + '; '.join(details) if details else ' recorded')
 
