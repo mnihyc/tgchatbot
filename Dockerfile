@@ -20,7 +20,7 @@ LABEL org.opencontainers.image.title="tgchatbot" \
 COPY build/tgchatbot-*.whl /opt/tgchatbot-wheel/
 RUN python -m pip install --no-cache-dir --no-deps --no-index /opt/tgchatbot-wheel/*.whl
 COPY --chmod=755 deploy/entrypoint.sh /usr/local/bin/tgchatbot-entrypoint
-COPY deploy/configure_database.py /usr/local/lib/tgchatbot-deploy-configure.py
+COPY --chmod=644 deploy/configure_database.py /usr/local/lib/tgchatbot-deploy-configure.py
 
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
     APP_DATA_DIR=/app/data APP_TEMP_DIR=/tmp HOME=/app/data/home

@@ -29,6 +29,10 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: uv run --frozen python .github/package_release.py --tag "$RELEASE_TAG"
+      - name: Test packaged deployment with updater file permissions
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: uv run --frozen python .github/smoke_release.py "dist/tgchatbot-deploy-$RELEASE_TAG.tar.gz"
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
