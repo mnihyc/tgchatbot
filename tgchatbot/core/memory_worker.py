@@ -178,9 +178,9 @@ For an explicit withdrawal use status "retracted" and supersedes; its evidence c
 Use validity dates only if the original evidence establishes them; otherwise null.
 Retire facts through removals only when redundant or no longer useful in the compact profile, with a short reason.
 Do not retire a fact merely because this batch does not mention it. Preserve distinctive, actionable preferences over generic detail.
-Each entire per-actor profile object, including identity, IDs and attribution, must fit {profile_bytes} UTF-8 bytes.
-Prefer concise additions. Merge or retire redundant existing facts when space is needed; never accumulate an unlimited fact list.
-The current profile documents contain all supplied existing facts. Reasons are audit-only and source_dates is learning-only; neither enters the bounded chat profile.
+Aim for about {profile_bytes} UTF-8 bytes per actor, including identity, IDs and attribution; this is a soft target.
+Keep distinctive, useful facts even if they exceed the target. Consolidate redundant detail during these updates rather than growing the profile indefinitely.
+The current profile documents contain all supplied existing facts. Reasons are audit-only and source_dates is learning-only; neither enters the chat profile.
 Return only the requested structured patch; no tools or conversation reply.'''
 
 
@@ -586,7 +586,7 @@ class MemoryWorker:
             raise ValueError('The selected memory generation provider is not configured')
         model = os.getenv('MEMORY_MODEL', '').strip() or (settings.model if provider_name == settings.provider else self.config.default_model_for_provider(provider_name))
         profile_settings = replace(settings, provider=provider_name, model=model, mode=ChatMode.CHAT,
-                                   max_output_tokens=self.limits.profile_output_tokens)
+                                   native_web_search_mode='off', max_output_tokens=self.limits.profile_output_tokens)
         evidence, actors = [], set(job['payload'].get('reconcile_actors', []))
         by_id = {row.db_id: row for row in rows}
         for span in job['payload']['spans']:

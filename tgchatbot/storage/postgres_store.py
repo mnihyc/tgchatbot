@@ -1443,10 +1443,9 @@ class PostgresStore:
                 asserted_by=asserted_by, claim=claim, source_ids=source_ids, kind=kind, status=status,
                 valid_from=valid_from, valid_to=valid_to, claim_key=claim_key, supersedes=supersedes,
                 expected_source_revisions=expected_source_revisions)
-            from tgchatbot.operational import MemoryConfig
             from tgchatbot.storage.profiles import publish_current
             await publish_current(self, conn, scope, session_id, subject_actor_id,
-                add_ids=[row['id']], max_bytes=from_env(MemoryConfig, 'MEMORY').profile_bytes)
+                add_ids=[row['id']], max_bytes=None)
             return row
 
     async def _save_profile_fact(self, conn, scope, session_id: str, *, subject_actor_id: str, asserted_by: str,
@@ -1522,9 +1521,9 @@ class PostgresStore:
 
     async def fetch_profile_snapshot(self, session_id: str, actor_ids: Sequence[str], *,
                                      expected_scope: Mapping[str, Any] | None = None,
-                                     max_bytes: int, for_learning: bool = False,
+                                     max_bytes: int | None = None, for_learning: bool = False,
                                      include_pending: bool = False) -> dict[str, Any]:
-        """Read bounded documents and their internal evidence from one committed snapshot."""
+        """Read selected profiles and their internal evidence from one committed snapshot."""
         from psycopg import AsyncServerCursor
         from tgchatbot.domain.profiles import profile_document
         from tgchatbot.storage.profiles import _identity, add_source_dates
@@ -1542,23 +1541,14 @@ class PostgresStore:
                 identity, accepted = None, []
                 if scope is not None and actor_id != 'unknown':
                     identity = await _identity(conn, session_id, scope['generation'], actor_id)
-                document = profile_document(actor_id, identity, [], max_bytes=max_bytes, known_agent=scope is not None)
                 if scope is not None and actor_id != 'unknown':
                     async with AsyncServerCursor(conn, name='profile_snapshot') as cursor:
                         cursor.itersize = self.config.read_page_size
                         await cursor.execute('SELECT f.* ' + self._current_profile_query(include_future=for_learning) + ' ORDER BY f.id DESC',
                             (session_id, actor_id, as_of) if for_learning else (session_id, actor_id, as_of, as_of))
                         async for fact in cursor:
-                            try:
-                                # Learning sees only the prior selected membership,
-                                # bounded at publication, including when reducing
-                                # its configured target. It never reads audit facts.
-                                candidate = profile_document(actor_id, identity, [*accepted, fact],
-                                    max_bytes=None if for_learning else max_bytes, known_agent=True, strict=True)
-                            except ValueError:
-                                break
                             accepted.append(fact)
-                            document = candidate
+                document = profile_document(actor_id, identity, accepted, known_agent=scope is not None)
                 profiles.append(document)
                 facts.extend(accepted)
             if for_learning:

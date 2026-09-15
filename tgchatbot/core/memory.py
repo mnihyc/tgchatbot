@@ -304,7 +304,7 @@ class UserProfileFetchTool:
         self.spec = ToolSpec('user_profile_fetch',
             'Fetch current source-backed profiles for explicit actor IDs and, by default, the agent\'s continuing style preferences. '
             'Use when personal context matters and earlier profile evidence is missing or stale. '
-            'A fetch can learn at most one pending batch before returning bounded, committed profiles. '
+            'A fetch can learn at most one pending batch before returning committed profiles. '
             'Names never select identities. Empty facts do not mean no preferences; check the facts\' sources and dates.',
             {'type': 'object', 'properties': {
                 'actor_ids': {'type': 'array', 'items': {'type': 'string'},

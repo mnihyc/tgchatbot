@@ -104,16 +104,20 @@ class MemoryBusinessTests(BusinessTestCase):
         self.assertEqual(self.provider.requests, [])
         self.embeddings.embed_query.assert_not_awaited()
 
-    async def test_profile_fetch_is_bounded_without_paging_or_modifying_original_evidence(self):
-        source = await self.ingest('I have several durable preferences.')
+    async def test_profile_target_does_not_clip_identity_or_selected_facts_or_modify_evidence(self):
+        name = 'Alex 安静' * 100
+        source = await self.ingest('I have several durable preferences.', actor_name=name)
         facts = [await self.store.save_profile_fact(self.session, subject_actor_id='telegram:user:7',
-            asserted_by='telegram:user:7', claim=f'Preference {number}: ' + '喜欢安静的地方。' * 30,
+            asserted_by='telegram:user:7', claim=f'Preference {number}: ' + '喜欢安静的地方。' * 70,
             source_ids=[source.db_id]) for number in range(3)]
         memory = MemoryService(self.store, self.embeddings, config=replace(self.memory.config, profile_bytes=1600))
         profile = (await memory.fetch_profiles(self.session, ['telegram:user:7'],
             include_agent_preferences=False))['profiles'][0]
-        self.assertLessEqual(len(json.dumps(profile, ensure_ascii=False).encode('utf-8')), 1600)
-        self.assertTrue(profile['facts'])
+        self.assertGreater(len(json.dumps(profile, ensure_ascii=False).encode('utf-8')), 4096)
+        self.assertEqual(profile['identity']['actor_name'], name)
+        self.assertEqual([fact['id'] for fact in profile['facts']], [fact['id'] for fact in reversed(facts)])
+        self.assertEqual([fact['claim'] for fact in profile['facts']], [fact['claim'] for fact in reversed(facts)])
+        self.assertEqual(self.provider.requests, [])
         self.assertNotIn('next_before_fact_id', profile)
         self.assertNotIn('truncated', profile)
         async with self.store.pool.connection() as conn:

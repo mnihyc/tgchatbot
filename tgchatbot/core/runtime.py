@@ -2787,7 +2787,7 @@ class AgentRuntime:
                        for actor_id in known) for claim in candidate.get('user_profile', []))
 
     async def _generate_structured_candidate(self, provider: ModelProvider, settings: SessionSettings, messages: list[ConversationMessage], *, mode: str) -> dict[str, Any] | None:
-        compaction_settings = replace(settings, mode=ChatMode.CHAT)
+        compaction_settings = replace(settings, mode=ChatMode.CHAT, native_web_search_mode='off')
         actor_ids = list(dict.fromkeys(str(actor) for message in messages
             for actor in message.metadata.get('compaction_actor_ids', []) if actor))
         # This is a new summarization task over historical evidence, not an

@@ -203,7 +203,8 @@ class WorkerWorkflowTests(BusinessTestCase):
         evidence = json.loads(request['messages'][0].parts[0].text)
         self.assertEqual(len(evidence['original_evidence']), 205)
         self.assertTrue(all(not profile['facts'] for profile in evidence['current_profiles']))
-        self.assertIn('must fit 8192 UTF-8 bytes', request['instructions'])
+        self.assertIn('8192 UTF-8 bytes', request['instructions'])
+        self.assertNotIn('must fit', request['instructions'])
         self.assertEqual(request['settings'].max_output_tokens, 8192)
         self.assertEqual(len(await self.store.get_profile(self.session, 'telegram:user:7', limit=100)), 23)
 
@@ -344,7 +345,7 @@ class WorkerWorkflowTests(BusinessTestCase):
             audits = (await (await conn.execute('SELECT count(*) AS n FROM profile_patches')).fetchone())['n']
         self.assertEqual(audits, 1)
 
-    async def test_over_budget_patch_preserves_previous_profile_and_retryable_originals(self):
+    async def test_valid_patch_above_soft_target_commits_once_and_preserves_retired_evidence(self):
         first = await self.source('I prefer tea.', 1)
         old = await self.store.save_profile_fact(self.session, subject_actor_id='telegram:user:7',
             asserted_by='telegram:user:7', claim='Prefers tea', source_ids=[first.db_id])
@@ -353,12 +354,23 @@ class WorkerWorkflowTests(BusinessTestCase):
             'asserted_by': 'telegram:user:7', 'claim': '安静' * 1000, 'kind': 'explicit',
             'source_ids': [second.db_id], 'valid_from': None, 'valid_to': None, 'supersedes': None}],
             [{'fact_id': old['id'], 'reason': 'Replace redundant detail.'}])]
-        with self.assertRaisesRegex(ValueError, 'MEMORY_PROFILE_BYTES'):
-            await self.worker._profile(await self.profile_jobs())
-        self.assertEqual([fact['id'] for fact in await self.store.get_profile(self.session, 'telegram:user:7')], [old['id']])
+        await self.worker._profile(await self.profile_jobs())
+        facts = await self.store.get_profile(self.session, 'telegram:user:7')
+        self.assertEqual([fact['claim'] for fact in facts], ['安静' * 1000])
+        self.assertEqual(facts[0]['source_ids'], [second.db_id])
+        memory = MemoryService(self.store, self.embeddings)
+        memory.worker = self.worker
+        result = await memory.fetch_profiles(self.session, ['telegram:user:7'])
+        self.assertEqual(result['profiles'][0]['facts'][0]['claim'], '安静' * 1000)
+        self.assertEqual(len(self.provider.requests), 1, 'Size alone must not spend another request')
         async with self.store.pool.connection() as conn:
             pending = (await (await conn.execute('SELECT sum(pending_bytes) AS n FROM profile_inputs')).fetchone())['n']
-        self.assertGreater(pending, 0)
+            audit = await (await conn.execute('SELECT claim,retired_at FROM profile_facts WHERE id=%s', (old['id'],))).fetchone()
+            patches = (await (await conn.execute('SELECT count(*) AS n FROM profile_patches')).fetchone())['n']
+        self.assertEqual(pending, 0)
+        self.assertEqual(patches, 1)
+        self.assertEqual(audit['claim'], 'Prefers tea')
+        self.assertIsNotNone(audit['retired_at'])
 
     async def test_structured_retirement_keeps_audit_and_withdrawal_restores_if_evidence_is_hidden(self):
         first = await self.source('I prefer tea.', 1)
@@ -454,6 +466,19 @@ class WorkerWorkflowTests(BusinessTestCase):
             seen.extend(fragment['text'] for item in evidence for fragment in item['fragments'])
         self.assertEqual(''.join(seen), '喜喜AB')
 
+    async def test_profile_input_batch_too_small_for_unicode_keeps_source_pending(self):
+        source = await self.source('喜', 1)
+        with self.assertRaisesRegex(ValueError, 'PROFILE_REQUEST_BYTES must fit one source character'):
+            await self.store.claim_profile_batch(session_id=self.session, lazy=True,
+                max_bytes=1, lease_seconds=self.worker.limits.lease_seconds)
+        async with self.store.pool.connection() as conn:
+            pending = (await (await conn.execute('SELECT pending_bytes FROM profile_inputs WHERE message_id=%s',
+                (source.db_id,))).fetchone())['pending_bytes']
+            jobs = (await (await conn.execute("SELECT count(*) AS n FROM jobs WHERE kind='memory_profile'")).fetchone())['n']
+        self.assertEqual(pending, 3)
+        self.assertEqual(jobs, 0)
+        self.assertEqual(self.provider.requests, [])
+
     async def test_generated_service_and_attachment_descriptions_are_not_profile_declarations(self):
         for number, origin in enumerate(('attachment_excerpt', 'attachment_reference', 'service_event'), start=1):
             message = ConversationMessage.user_text('I prefer the service-generated description.', metadata={
@@ -487,7 +512,7 @@ class WorkerWorkflowTests(BusinessTestCase):
         self.assertEqual(audits, 1, 'The stale retirement must not publish another audit patch')
         self.assertGreater(pending, 0)
 
-    async def test_lower_profile_bound_reconciles_previous_membership_once_without_new_messages(self):
+    async def test_lower_profile_target_preserves_human_membership_without_new_paid_request(self):
         source = await self.source('I prefer quiet places and calm, concise replies.', 1)
         old = [await self.store.save_profile_fact(self.session, subject_actor_id='telegram:user:7',
             asserted_by='telegram:user:7', claim=f'Preference {number}: ' + '安静' * 80,
@@ -497,25 +522,15 @@ class WorkerWorkflowTests(BusinessTestCase):
         self.worker.config = replace(self.config, memory=replace(self.config.memory, profile_bytes=900))
         memory = MemoryService(self.store, self.embeddings, config=self.worker.config.memory)
         memory.worker = self.worker
-        self.provider.responses = [self.patch_response([{'subject_actor_id': 'telegram:user:7',
-            'asserted_by': 'telegram:user:7', 'claim': 'Prefers quiet places and calm, concise replies.',
-            'kind': 'explicit', 'source_ids': [source.db_id], 'valid_from': None, 'valid_to': None, 'supersedes': None}],
-            [{'fact_id': fact['id'], 'reason': 'Consolidate the supported preference under the smaller profile budget.'} for fact in old])]
         before = len(self.provider.requests)
-        profile = (await memory.fetch_profiles(self.session, ['telegram:user:7']))['profiles'][0]
-        self.assertEqual(len(self.provider.requests), before + 1)
+        for _ in range(2):
+            profile = (await memory.fetch_profiles(self.session, ['telegram:user:7']))['profiles'][0]
+            self.assertEqual([fact['id'] for fact in profile['facts']], [fact['id'] for fact in reversed(old)])
+            self.assertGreater(len(json.dumps(profile, ensure_ascii=False).encode('utf-8')), 900)
+        self.assertEqual(len(self.provider.requests), before)
+        self.assertEqual(await self.profile_jobs(), [])
 
-        self.assertLessEqual(len(json.dumps(profile, ensure_ascii=False).encode('utf-8')), 900)
-        self.assertEqual(len(profile['facts']), 1)
-        generation_input = json.loads(self.provider.requests[-1]['messages'][0].parts[0].text)
-        self.assertEqual(generation_input['original_evidence'], [])
-        current = next(profile for profile in generation_input['current_profiles']
-                       if profile['actor_id'] == 'telegram:user:7')
-        self.assertEqual(len(current['facts']), 3)
-        await memory.fetch_profiles(self.session, ['telegram:user:7'])
-        self.assertEqual(len(self.provider.requests), before + 1)
-
-    async def test_agent_only_budget_reconciliation_preserves_human_assertor(self):
+    async def test_lower_agent_profile_target_preserves_human_assertor_without_new_paid_request(self):
         source = await self.source('Please keep your replies calm and concise.', 1)
         old = [await self.store.save_profile_fact(self.session, subject_actor_id='agent',
             asserted_by='telegram:user:7', claim=f'Reply preference {number}: ' + '安静' * 80,
@@ -525,19 +540,15 @@ class WorkerWorkflowTests(BusinessTestCase):
         self.worker.config = replace(self.config, memory=replace(self.config.memory, profile_bytes=900))
         memory = MemoryService(self.store, self.embeddings, config=self.worker.config.memory)
         memory.worker = self.worker
-        self.provider.responses = [self.patch_response([{'subject_actor_id': 'agent',
-            'asserted_by': 'telegram:user:7', 'claim': 'Use calm, concise replies.',
-            'kind': 'explicit', 'source_ids': [source.db_id], 'valid_from': None, 'valid_to': None, 'supersedes': None}],
-            [{'fact_id': fact['id'], 'reason': 'Consolidate the same human-supported reply preference.'} for fact in old])]
         before = len(self.provider.requests)
         result = await memory.fetch_profiles(self.session, ['agent'])
         self.assertNotIn('refresh_error', result)
         profile = result['profiles'][0]
-        self.assertEqual(len(self.provider.requests), before + 1)
-        self.assertLessEqual(len(json.dumps(profile, ensure_ascii=False).encode('utf-8')), 900)
-        self.assertEqual(len(profile['facts']), 1)
-        self.assertEqual(profile['facts'][0]['asserted_by'], 'telegram:user:7')
-        self.assertEqual(profile['facts'][0]['source_ids'], [source.db_id])
+        self.assertEqual(len(self.provider.requests), before)
+        self.assertGreater(len(json.dumps(profile, ensure_ascii=False).encode('utf-8')), 900)
+        self.assertEqual([fact['id'] for fact in profile['facts']], [fact['id'] for fact in reversed(old)])
+        self.assertTrue(all(fact['asserted_by'] == 'telegram:user:7' and fact['source_ids'] == [source.db_id]
+                            for fact in profile['facts']))
 
     async def test_lazy_subject_selection_does_not_spend_its_batch_on_unrelated_old_backlog(self):
         older = await self.source('Unrelated older material. ' * 100, 1, actor='telegram:user:8')

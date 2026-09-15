@@ -238,7 +238,7 @@ Inspection, queueing and audit commands themselves make no model requests.
 `status` without a chat selector discovers existing sessions. `jobs` streams saved
 errors, attempts, scheduling and provider checkpoint details; filter by `--job-id`,
 `--kind`, `--status` or `--generation`. It defaults to the current generation.
-`profiles` discovers participant IDs and shows their current bounded profiles,
+`profiles` discovers participant IDs and shows their current profiles,
 evidence and pending learning material; `--actor-id` focuses on one participant.
 It never triggers a refresh. `context` shows current raw-message counts and the
 remaining compaction summaries with source ranges and layers, without dumping

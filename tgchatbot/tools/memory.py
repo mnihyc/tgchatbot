@@ -338,7 +338,7 @@ async def job_records(store: PostgresStore, session_id: str, *, status: str | No
 async def profile_records(store: PostgresStore, session_id: str, *, max_bytes: int,
                           actor_id: str | None = None,
                           options: OperationsConfig | None = None) -> AsyncIterator[dict[str, Any]]:
-    """Inspect current bounded profiles and pending material without refreshing them."""
+    """Inspect current profiles and pending material without refreshing them."""
     from tgchatbot.domain.profiles import present_profile
     options = options if options is not None else from_env(OperationsConfig, 'MEMORY_OPERATIONS')
     scope = await existing_scope(store, session_id)

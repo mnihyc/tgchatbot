@@ -8,7 +8,6 @@ import uuid
 from psycopg.types.json import Jsonb
 
 from tgchatbot.domain.models import MessageRole
-from tgchatbot.domain.profiles import profile_document, profile_size
 
 
 async def queue_input(conn, *, session_id, generation, message_id, revision, message, body, parts, canonical, force=False):
@@ -45,7 +44,7 @@ async def reconcile_sources(conn, session_id, generation, source_ids):
 
 
 async def publish_current(store, conn, scope, session_id, actor_id, *, add_ids=(), remove_ids=(), max_bytes):
-    """Select a bounded current profile; immutable facts remain its evidence ledger."""
+    """Publish selected current facts; immutable revisions remain the evidence ledger."""
     current = await (await conn.execute('''SELECT fact_ids FROM profile_current
         WHERE session_id=%s AND generation=%s AND actor_id=%s FOR UPDATE''',
         (session_id, scope['generation'], actor_id))).fetchone()
@@ -55,10 +54,6 @@ async def publish_current(store, conn, scope, session_id, actor_id, *, add_ids=(
         AND session_id=%s AND generation=%s AND subject_actor_id=%s AND valid
         AND status IN ('active','superseded') AND (valid_to IS NULL OR valid_to>now()) ORDER BY id DESC''',
         (list(selected), session_id, scope['generation'], actor_id))).fetchall()
-    identity = await _identity(conn, session_id, scope['generation'], actor_id)
-    # Future-dated selected claims reserve space too; time passing cannot expand
-    # current membership beyond the bound without another accepted patch.
-    profile_document(actor_id, identity, rows, max_bytes=max_bytes, known_agent=True, strict=True)
     await conn.execute('''INSERT INTO profile_current(session_id,generation,actor_id,fact_ids)
         VALUES (%s,%s,%s,%s) ON CONFLICT(session_id,generation,actor_id)
         DO UPDATE SET fact_ids=excluded.fact_ids,updated_at=now()''',
@@ -155,31 +150,17 @@ async def claim_batch(store, *, max_bytes, lease_seconds, session_id=None, actor
                 break
             if remaining == 0:
                 break
-        reconcile = []
-        # Only selected current membership is inspected here, never the fact
-        # ledger. Lowering an operational bound can reconcile that prior bounded
-        # selection in the same one lazy patch, even without new messages.
-        for actor in profile_actor_ids:
-            at = datetime.now(timezone.utc)
-            current = await (await conn.execute('SELECT f.* ' + store._current_profile_query(include_future=True)
-                + ' ORDER BY f.id DESC', (session_id, actor, at))).fetchall()
-            identity = await _identity(conn, session_id, scope['generation'], actor)
-            document = profile_document(actor, identity, current, max_bytes=None, known_agent=True)
-            if current and profile_size(document) > profile_bytes:
-                reconcile.append(actor)
-                for fact in current:
-                    revisions.update(fact['source_revisions'])
-        if not spans and not reconcile:
-            return None
         if rows and not spans:
             raise ValueError('MEMORY_WORKER_PROFILE_REQUEST_BYTES must fit one source character')
+        if not spans:
+            return None
         return await (await conn.execute('''INSERT INTO jobs
             (session_id,generation,context_id,scope_revision,kind,policy,source_ids,source_revisions,payload,
              status,attempts,lease_token,lease_until)
             VALUES (%s,%s,%s,%s,'memory_profile','memory',%s,%s,%s,'running',1,%s,
              now()+(%s * interval '1 second')) RETURNING *''',
             (session_id, scope['generation'], scope['context_id'], scope['revision'], list(map(int, revisions)),
-             Jsonb(revisions), Jsonb({'spans': spans, 'cursors': cursors, 'reconcile_actors': reconcile}),
+             Jsonb(revisions), Jsonb({'spans': spans, 'cursors': cursors}),
              str(uuid.uuid4()), lease_seconds))).fetchone()
 
 
