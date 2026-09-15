@@ -968,9 +968,13 @@ class PostgresStore:
             WHERE c.session_id=%s AND c.generation=%s''', (session_id, generation))
         await conn.execute('DELETE FROM excerpt_tails WHERE session_id=%s AND generation=%s AND source_ids && %s::bigint[]',
             (session_id, generation, ids))
-        await conn.execute('''UPDATE jobs SET status='stale',finished_at=now(),lease_token=NULL
-            WHERE session_id=%s AND generation=%s AND status IN ('pending','running') AND source_ids && %s::bigint[]''',
-            (session_id, generation, ids))
+        retired_jobs = await (await conn.execute('''UPDATE jobs SET status='stale',finished_at=now(),lease_token=NULL
+            WHERE session_id=%s AND generation=%s AND status IN ('pending','running') AND source_ids && %s::bigint[]
+            RETURNING kind,source_ids''', (session_id, generation, ids))).fetchall()
+        # Coalesced intake may not have produced an excerpt or tail yet. Its
+        # untouched originals need the same reconstruction as existing excerpts.
+        survivors.update(mid for job in retired_jobs if job['kind'] == 'memory_ingest'
+            for mid in job['source_ids'] if mid not in ids)
         await conn.execute("UPDATE profile_inputs SET spans='[]',pending_bytes=0 WHERE message_id=ANY(%s)", (ids,))
         if profile_survivors:
             from tgchatbot.storage.profiles import reconcile_sources

@@ -171,6 +171,75 @@ class WorkerWorkflowTests(BusinessTestCase):
         self.assertEqual(pending['n'], 0)
         self.embeddings.submit_batch.assert_not_awaited()
 
+    async def _edited_coalesced_import_preserves_untouched_originals(self, *, running):
+        originals = [await self.source('Original first preference.', 1),
+                     await self.source('I enjoy jasmine tea.', 2, actor='telegram:user:8'),
+                     await self.source('I cycle to work.', 3)]
+        ids = {source.db_id for source in originals}
+        batch = await self.store.coalesce_memory_jobs(self.session, source_ids=sorted(ids))
+        self.assertEqual(set(batch['source_ids']), ids)
+        if running:
+            jobs = await self.store.claim_jobs(kind='memory_ingest', limit=16, lease_seconds=900)
+            self.assertEqual([job['id'] for job in jobs], [batch['id']])
+            building, release = asyncio.Event(), asyncio.Event()
+            build = self.worker.builder.build
+            async def paused_build(*args, **kwargs):
+                building.set()
+                await release.wait()
+                return await build(*args, **kwargs)
+            with patch.object(self.worker.builder, 'build', side_effect=paused_build):
+                task = asyncio.create_task(self.worker._guarded(jobs, self.worker._ingest))
+                try:
+                    await asyncio.wait_for(building.wait(), timeout=5)
+                    edited = await self.source('Corrected first preference.', 1)
+                finally:
+                    release.set()
+                self.assertFalse(await task, 'The retired owner must not publish stale excerpts')
+            self.assertEqual(self.worker.last_error, 'StaleScopeError')
+            self.assertFalse(await self.store.renew_job(jobs[0], lease_seconds=900))
+            self.assertFalse(await self.store.complete_job(jobs[0]))
+        else:
+            edited = await self.source('Corrected first preference.', 1)
+        self.assertEqual(edited.db_id, originals[0].db_id)
+        async with self.store.pool.connection() as conn:
+            retired = await (await conn.execute('SELECT status,lease_token FROM jobs WHERE id=%s',
+                (batch['id'],))).fetchone()
+            self.assertEqual(retired, {'status': 'stale', 'lease_token': None})
+            self.assertEqual((await (await conn.execute('SELECT count(*) AS n FROM excerpts')).fetchone())['n'], 0)
+        self.assertIsNone(await self.store.get_excerpt_tail(self.session))
+        jobs = await self.store.claim_jobs(kind='memory_ingest', limit=16, lease_seconds=900)
+        queued_ids = [mid for job in jobs for mid in job['source_ids']]
+        self.assertCountEqual(queued_ids, ids, 'Every current original must remain queued exactly once')
+        revisions = {key: value for job in jobs for key, value in job['source_revisions'].items()}
+        self.assertEqual(revisions, {str(source.db_id): 2 if index == 0 else 1
+            for index, source in enumerate(originals)})
+        self.assertTrue(await self.worker._guarded(jobs, self.worker._ingest))
+        async with self.store.pool.connection() as conn:
+            await conn.execute("UPDATE excerpt_tails SET updated_at=now()-(%s * interval '1 second')",
+                (self.worker.limits.tail_idle_seconds + 1,))
+        jobs = await self.store.claim_jobs(kind='memory_tail', limit=16, lease_seconds=900)
+        self.assertTrue(await self.worker._guarded(jobs, self.worker._tail))
+        jobs = await self.store.claim_jobs(kind='memory_embed', limit=16, lease_seconds=900)
+        self.assertTrue(await self.worker._guarded(jobs, self.worker._embed))
+        async with self.store.pool.connection() as conn:
+            excerpts = await (await conn.execute('SELECT source_ids,source_revisions,embedding IS NOT NULL AS embedded '
+                'FROM excerpts WHERE valid')).fetchall()
+        self.assertEqual({mid for excerpt in excerpts for mid in excerpt['source_ids']}, ids)
+        self.assertTrue(all(excerpt['embedded'] for excerpt in excerpts))
+        self.assertEqual({key: value for excerpt in excerpts for key, value in excerpt['source_revisions'].items()}, revisions)
+        embedded_text = ' '.join(document.text for call in self.embeddings.embed_documents.await_args_list
+            for document in call.args[0])
+        self.assertIn('Corrected first preference.', embedded_text)
+        self.assertNotIn('Original first preference.', embedded_text)
+        self.assertIn('I enjoy jasmine tea.', embedded_text)
+        self.assertIn('I cycle to work.', embedded_text)
+
+    async def test_edit_before_coalesced_import_runs_preserves_untouched_originals(self):
+        await self._edited_coalesced_import_preserves_untouched_originals(running=False)
+
+    async def test_edit_during_coalesced_import_preserves_untouched_originals_and_retires_old_owner(self):
+        await self._edited_coalesced_import_preserves_untouched_originals(running=True)
+
     async def test_configured_large_ingest_and_profile_groups_retain_every_original_and_fact(self):
         originals = [await self.source(f'I prefer option {index}.', index)
                      for index in range(1, 206)]
