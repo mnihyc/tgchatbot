@@ -28,20 +28,20 @@ work=$root/tmp/update
 # Only this updater's fixed scratch files are removed, including after failure.
 cleanup() {
   rm -f -- "$work/deploy.tar.gz" \
-    "$work/compose.next.yml" "$work/compose.before.yml" "$work/update.next.sh" "$work/update.install.sh"
+    "$work/compose.next.yml" "$work/update.next.sh" "$work/update.install.sh"
   rm -rf -- "$work/build-context"
 }
 trap cleanup EXIT
 cleanup
 download() { curl --fail --location --retry 3 --connect-timeout 15 --output "$2" "$1"; }
-# Service changes belong to the selected release's Compose definition. Exclude
-# the separately managed database, including when restoring an older release.
+# Use the operator's Compose configuration throughout, excluding the separately
+# managed database when starting or stopping application services.
 application_services() {
-  docker compose --project-directory "$root" -f "$1" config --services | awk '$0 != "postgres"'
+  docker compose config --services | awk '$0 != "postgres"'
 }
 start() {
   local services
-  services=$(application_services compose.yml)
+  services=$(application_services)
   [[ -n $services ]] || fail 'Deployment has no application services'
   local -a names
   mapfile -t names <<< "$services"
@@ -49,11 +49,11 @@ start() {
 }
 stop_application() {
   local services
-  services=$(application_services "$1")
+  services=$(application_services)
   if [[ -n $services ]]; then
     local -a names
     mapfile -t names <<< "$services"
-    docker compose --project-directory "$root" -f "$1" stop "${names[@]}"
+    docker compose stop "${names[@]}"
   fi
 }
 schema_compatible() {
@@ -69,8 +69,6 @@ active=$(docker image inspect --format '{{.Id}}' tgchatbot:current 2>/dev/null |
 if [[ $target == rollback ]]; then
   [[ -f .env && -f compose.yml ]] || fail 'Run ./update.sh before rollback'
   candidate=$(docker image inspect --format '{{.Id}}' tgchatbot:previous 2>/dev/null) || fail 'No previous image; install an exact release tag instead'
-  [[ -f compose.previous.yml ]] || fail 'No matching previous Compose definition; install an exact release tag instead'
-  cp compose.previous.yml "$work/compose.next.yml"
 else
   if [[ $target == latest ]]; then
     url=$(curl --fail --silent --show-error --location --retry 3 --connect-timeout 15 --output /dev/null --write-out '%{url_effective}' "https://github.com/$repository/releases/latest")
@@ -85,9 +83,8 @@ else
   commit=$(tar -xOzf "$work/deploy.tar.gz" RELEASE_COMMIT)
   [[ $commit =~ ^[0-9a-f]{40}$ ]] || fail 'Invalid release commit'
   # Extract only named contents; archive paths/links never choose host paths.
-  tar -xOzf "$work/deploy.tar.gz" compose.yml > "$work/compose.next.yml"
   tar -xOzf "$work/deploy.tar.gz" update.sh > "$work/update.next.sh"
-  [[ -s "$work/compose.next.yml" && -s "$work/update.next.sh" ]] || fail 'Incomplete deployment bundle'
+  [[ -s "$work/update.next.sh" ]] || fail 'Incomplete deployment bundle'
   bash -n "$work/update.next.sh" || fail 'Invalid release updater'
   # Transfer control before interpreting the new deployment, not after trying
   # to activate it with old service/schema assumptions. Re-opening descriptor 9
@@ -98,15 +95,19 @@ else
     log 'Continuing with the release updater'
     exec bash "$root/update.sh" "$target"
   fi
-  [[ -f compose.yml ]] || cp "$work/compose.next.yml" compose.yml
+  if [[ ! -f compose.yml ]]; then
+    tar -xOzf "$work/deploy.tar.gz" compose.yml > "$work/compose.next.yml"
+    [[ -s "$work/compose.next.yml" ]] || fail 'Missing Compose template'
+    cp "$work/compose.next.yml" compose.yml
+  fi
   if [[ ! -f .env ]]; then
     tar -xOzf "$work/deploy.tar.gz" .env.example > .env
     chmod 600 .env
     install_updater
-    log 'Created .env and compose.yml. Fill in the Telegram token and one provider key/model, then run ./update.sh again.'
+    log 'Created .env. Fill in the Telegram token and one provider key/model, then run ./update.sh again.'
     exit 0
   fi
-  docker compose --project-directory "$root" -f "$work/compose.next.yml" config --quiet
+  docker compose config --quiet
   mapfile -t wheels < <(tar -tzf "$work/deploy.tar.gz" | awk '/^build\/tgchatbot-[0-9A-Za-z_.+-]+-py3-none-any\.whl$/')
   [[ ${#wheels[@]} == 1 ]] || fail 'Release must contain one CPU-neutral tgchatbot wheel'
   mkdir -p "$work/build-context/build" "$work/build-context/deploy"
@@ -122,21 +123,18 @@ else
   candidate=$(docker image inspect --format '{{.Id}}' "$image")
 fi
 
-cp compose.yml "$work/compose.before.yml"
 activation_started=0
 on_failure() {
   trap - ERR INT TERM
   if [[ $activation_started == 0 ]]; then
-    cp "$work/compose.before.yml" compose.yml
     log 'Preparation failed; existing application services were not restarted.' >&2
     exit 1
   fi
   log 'Activation failed; stopping attempted services' >&2
-  stop_application compose.yml || true
+  stop_application || true
   # Database state is never rolled back by swapping an image. The previous
   # application must prove it can read the current schema before it may restart.
   if [[ -n $active ]] && schema_compatible "$active"; then
-    cp "$work/compose.before.yml" compose.yml
     docker tag "$active" tgchatbot:current
     if start; then log 'Restored the prior image'; else log 'Restart failed; inspect docker compose logs' >&2; fi
   else
@@ -145,7 +143,6 @@ on_failure() {
   exit 1
 }
 trap on_failure ERR INT TERM
-cp "$work/compose.next.yml" compose.yml
 # Compose owns dotenv parsing. The published helper sees the resolved bot
 # environment and creates only a missing local database password, without
 # printing credentials or requiring Python on the Docker host.
@@ -165,7 +162,7 @@ case "$database_mode" in
 esac
 schema_compatible "$candidate"
 activation_started=1
-if [[ -n $active ]]; then stop_application "$work/compose.before.yml"; fi
+if [[ -n $active ]]; then stop_application; fi
 if [[ $database_mode == external ]]; then
   # The previous bot may still have used this database until it stopped above.
   docker compose stop postgres
@@ -173,24 +170,11 @@ fi
 # Keep a named recovery image before current changes, even if power is lost
 # before the health check can finish. Reinstalling one image keeps the prior tag.
 if [[ -n $active && $active != "$candidate" ]]; then
-  cp "$work/compose.before.yml" compose.previous.yml
   docker tag "$active" tgchatbot:previous
 fi
 docker tag "$candidate" tgchatbot:current
 start
 if [[ $target != rollback ]]; then
-  # Remove only retired, already-stopped application containers after success.
-  # Their mounted data and images remain intact; no orphan/volume sweep is used.
-  old_services=$(application_services "$work/compose.before.yml")
-  new_services=$(application_services compose.yml)
-  while IFS= read -r service; do
-    [[ -n $service ]] || continue
-    if ! printf '%s\n' "$new_services" | awk -v wanted="$service" '$0 == wanted { found=1 } END { exit !found }'; then
-      if ! docker compose --project-directory "$root" -f "$work/compose.before.yml" rm -f "$service"; then
-        log "Retired service $service is stopped but its container could not be removed" >&2
-      fi
-    fi
-  done <<< "$old_services"
   install_updater
 fi
 trap - ERR INT TERM

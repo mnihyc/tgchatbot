@@ -133,14 +133,16 @@ class ReleaseUpdaterTests(unittest.TestCase):
         for tag in ("v0.1.0", "v0.2.0"):
             self.make_release(tag)
 
-    def make_release(self, tag):
+    def make_release(self, tag, *, compose=None):
         directory = self.assets / tag
-        directory.mkdir(parents=True)
+        directory.mkdir(parents=True, exist_ok=True)
         with tarfile.open(directory / f"tgchatbot-deploy-{tag}.tar.gz", "w:gz") as archive:
             files = {"RELEASE_TAG": tag.encode(), "RELEASE_COMMIT": COMMIT.encode(),
                      ".env.example": b"TGBOT_TOKEN=\nOPENAI_API_KEY=\n"}
             for name in ("compose.yml", "update.sh"):
                 files[name] = (REPO / "deploy" / name).read_bytes()
+            if compose is not None:
+                files['compose.yml'] = compose
             for name in ("Dockerfile", ".dockerignore", "deploy/entrypoint.sh", "deploy/configure_database.py"):
                 files[name] = (REPO / name).read_bytes()
             files["build/runtime-requirements.txt"] = b"locked third-party dependencies fixture"
@@ -168,6 +170,24 @@ class ReleaseUpdaterTests(unittest.TestCase):
     def image_tag(self, alias):
         state = json.loads(self.docker_state.read_text())
         return state["images"][state["tags"][alias]]["tag"]
+
+    def operator_compose(self):
+        content = (REPO / 'deploy/compose.yml').read_text().replace(
+            '  postgres:\n', '  postgres:\n    ports: ["127.0.0.1:15432:5432"]\n', 1)
+        content += '\n  operator-worker:\n    image: tgchatbot:current\n    mem_limit: 256m\n'
+        content += '\n# Operator-maintained networking and services.\n'
+        encoded = content.encode()
+        (self.install / 'compose.yml').write_bytes(encoded)
+        return encoded
+
+    def assert_compose_preserved(self, expected):
+        self.assertEqual((self.install / 'compose.yml').read_bytes(), expected)
+
+    def assert_only_local_compose_used(self, calls):
+        for call in calls:
+            if call[:2] == ['docker', 'compose'] and '-f' in call:
+                self.assertEqual((self.install / call[call.index('-f') + 1]).resolve(),
+                                 (self.install / 'compose.yml').resolve())
 
     def assert_simple_layout(self):
         self.assertFalse((self.install / "runtime").exists())
@@ -205,10 +225,19 @@ class ReleaseUpdaterTests(unittest.TestCase):
         (self.install / "update.sh").chmod(0o644)
         result = self.run_update()
         self.assertEqual((self.install / ".env").read_text(), "TGBOT_TOKEN=\nOPENAI_API_KEY=\n")
-        self.assertTrue((self.install / "compose.yml").is_file())
+        self.assertEqual((self.install / "compose.yml").read_bytes(),
+                         (REPO / 'deploy/compose.yml').read_bytes())
         self.assertTrue(os.access(self.install / "update.sh", os.X_OK))
         self.assertFalse(any("build" in call or "up" in call for call in self.calls()))
         self.assertFalse(any("tgchatbot-linux-" in call[-1] for call in self.calls() if call[0] == "curl"))
+        self.assert_simple_layout()
+
+    def test_bootstrap_preserves_existing_operator_compose_when_env_is_missing(self):
+        expected = self.operator_compose()
+        (self.install / '.env').unlink()
+        self.run_update()
+        self.assert_compose_preserved(expected)
+        self.assertFalse(any('build' in call or 'up' in call for call in self.calls()))
         self.assert_simple_layout()
 
     def test_bundled_release_updater_takes_over_before_obsolete_activation_logic(self):
@@ -223,38 +252,42 @@ class ReleaseUpdaterTests(unittest.TestCase):
         self.assert_data_preserved()
         self.assert_simple_layout()
 
-    def test_removed_service_is_stopped_then_removed_only_after_new_bot_is_healthy(self):
+    def test_update_uses_operator_services_and_preserves_networking_despite_new_release_template(self):
         self.run_update('v0.1.0')
-        compose = self.install / 'compose.yml'
-        old = compose.read_text() + '\n  retired-search:\n    image: tgchatbot:current\n'
-        compose.write_text(old)
+        expected = self.operator_compose()
+        released = (REPO / 'deploy/compose.yml').read_bytes()
+        released += b'\n  new-release-service:\n    image: tgchatbot:current\n'
+        self.make_release('v0.2.0', compose=released)
         prior = len(self.calls())
         self.run_update('v0.2.0')
         calls = self.calls()[prior:]
-        stopped = next(i for i, call in enumerate(calls) if 'stop' in call and 'retired-search' in call)
+        stopped = next(i for i, call in enumerate(calls) if 'stop' in call and 'operator-worker' in call)
         started = next(i for i, call in enumerate(calls) if 'up' in call and 'bot' in call)
-        removed = next(i for i, call in enumerate(calls) if 'rm' in call and 'retired-search' in call)
         self.assertLess(stopped, started)
-        self.assertLess(started, removed)
-        self.assertNotIn('retired-search', calls[started])
-        self.assertEqual((self.install / 'compose.previous.yml').read_text(), old)
+        self.assertIn('operator-worker', calls[started])
+        self.assertFalse(any('new-release-service' in call for call in calls))
+        self.assertFalse(any('rm' in call and 'operator-worker' in call for call in calls))
+        self.assert_compose_preserved(expected)
+        self.assertFalse((self.install / 'compose.previous.yml').exists())
+        self.assert_only_local_compose_used(calls)
         self.assert_data_preserved()
-        self.run_update('rollback')
-        self.assertEqual(compose.read_text(), old)
-        self.assertIn('retired-search', [call for call in self.calls() if 'up' in call and 'bot' in call][-1])
+        self.assert_simple_layout()
 
-    def test_failed_replacement_restores_old_service_and_does_not_remove_it(self):
+    def test_failed_replacement_recovers_prior_image_using_unchanged_operator_services(self):
         self.run_update('v0.1.0')
-        compose = self.install / 'compose.yml'
-        old = compose.read_text() + '\n  retired-search:\n    image: tgchatbot:current\n'
-        compose.write_text(old)
+        expected = self.operator_compose()
         prior = len(self.calls())
         self.run_update('v0.2.0', success=False, FAIL_TAG='v0.2.0')
         calls = self.calls()[prior:]
-        self.assertFalse(any('rm' in call and 'retired-search' in call for call in calls))
-        self.assertEqual(compose.read_text(), old)
-        self.assertIn('retired-search', [call for call in calls if 'up' in call and 'bot' in call][-1])
+        self.assertFalse(any('rm' in call and 'operator-worker' in call for call in calls))
+        self.assert_compose_preserved(expected)
+        app_starts = [call for call in calls if 'up' in call and 'bot' in call]
+        self.assertEqual(len(app_starts), 2)
+        self.assertTrue(all('operator-worker' in call for call in app_starts))
+        self.assertEqual(self.image_tag('tgchatbot:current'), 'v0.1.0')
+        self.assert_only_local_compose_used(calls)
         self.assert_data_preserved()
+        self.assert_simple_layout()
 
     def test_unreadable_bundle_never_builds_or_stops_services(self):
         archive = self.assets / "v0.2.0" / "tgchatbot-deploy-v0.2.0.tar.gz"
@@ -287,7 +320,7 @@ class ReleaseUpdaterTests(unittest.TestCase):
 
     def test_failed_dependency_install_keeps_working_image_and_services_untouched(self):
         self.run_update('v0.1.0')
-        old_compose = (self.install / 'compose.yml').read_bytes()
+        old_compose = self.operator_compose()
         before = len(self.calls())
         self.run_update('v0.2.0', success=False, FAIL_BUILD_TAG='v0.2.0')
         self.assertEqual(self.image_tag('tgchatbot:current'), 'v0.1.0')
@@ -302,27 +335,34 @@ class ReleaseUpdaterTests(unittest.TestCase):
         self.assert_data_preserved()
         self.assert_simple_layout()
 
-    def test_failed_update_restores_current_image_and_compose_without_changing_data(self):
-        self.run_update("v0.1.0")
-        old_compose = (self.install / "compose.yml").read_text() + "\n# local prior file\n"
-        (self.install / "compose.yml").write_text(old_compose)
-        result = self.run_update("v0.2.0", success=False, FAIL_TAG="v0.2.0")
-        self.assertEqual(self.image_tag("tgchatbot:current"), "v0.1.0")
-        self.assertEqual((self.install / "compose.yml").read_text(), old_compose)
-        self.assertEqual(len([call for call in self.calls() if "up" in call and "bot" in call]), 3)
-        self.assert_data_preserved()
-        self.assert_simple_layout()
-
     def test_manual_rollback_swaps_images_without_network_or_deployment_metadata(self):
         self.run_update("v0.1.0")
         self.run_update("v0.2.0")
+        expected = self.operator_compose()
+        self.assertFalse((self.install / 'compose.previous.yml').exists())
         downloads_before = len([call for call in self.calls() if call[0] == "curl"])
         self.run_update("rollback")
         self.assertEqual(self.image_tag("tgchatbot:current"), "v0.1.0")
         self.assertEqual(self.image_tag("tgchatbot:previous"), "v0.2.0")
         self.assertEqual(len([call for call in self.calls() if call[0] == "curl"]), downloads_before)
+        self.assert_compose_preserved(expected)
+        self.assertIn('operator-worker', [call for call in self.calls() if 'up' in call and 'bot' in call][-1])
         self.assert_data_preserved()
         self.assert_simple_layout()
+
+    def test_stale_compose_history_never_overrides_operator_configuration_during_rollback(self):
+        self.run_update('v0.1.0')
+        self.run_update('v0.2.0')
+        expected = self.operator_compose()
+        stale = self.install / 'compose.previous.yml'
+        old = b'# Retained artifact from a former updater; not active configuration.\n'
+        stale.write_bytes(old)
+        self.run_update('rollback')
+        self.assert_compose_preserved(expected)
+        self.assertEqual(stale.read_bytes(), old)
+        self.assertEqual(self.image_tag('tgchatbot:current'), 'v0.1.0')
+        self.assert_only_local_compose_used(self.calls())
+        self.assert_data_preserved()
 
     def test_failed_first_start_stops_services_and_retains_data(self):
         self.run_update("v0.1.0", success=False, FAIL_TAG="v0.1.0")
@@ -407,6 +447,21 @@ class ReleaseUpdaterTests(unittest.TestCase):
         self.assertRegex(bot_env['POSTGRES_PASSWORD'], r'^[0-9a-f]{64}$')
         self.assertEqual(bot_env['DEFAULT_SYSTEM_PROMPT'].replace('$$', '$'), 'literal $cash $(not-a-command)\r\nPOSTGRES_PASSWORD=prompt-text')
 
+    def test_real_compose_renders_operator_postgres_port_after_application_update(self):
+        docker = shutil.which('docker')
+        if not docker or subprocess.run([docker, 'compose', 'version'], capture_output=True).returncode:
+            self.skipTest('Docker Compose is unavailable')
+        expected = self.operator_compose()
+        self.run_update('v0.2.0')
+        configuration = json.loads(subprocess.check_output([
+            docker, 'compose', '--project-directory', str(self.install),
+            '--profile', 'local-database', 'config', '--format', 'json'], stderr=subprocess.PIPE))
+        port = configuration['services']['postgres']['ports'][0]
+        self.assertEqual((port['host_ip'], port['published'], port['target']),
+                         ('127.0.0.1', '15432', 5432))
+        self.assertIn('operator-worker', configuration['services'])
+        self.assert_compose_preserved(expected)
+
     def test_external_database_does_not_start_local_postgres_or_create_password(self):
         self.env_content += 'DATABASE_URL=postgresql://fixture:secret@database.example/tgchatbot\n'
         (self.install / '.env').write_text(self.env_content)
@@ -416,6 +471,7 @@ class ReleaseUpdaterTests(unittest.TestCase):
         self.assert_data_preserved()
 
     def test_existing_database_without_password_never_gets_a_replacement(self):
+        expected = self.operator_compose()
         cluster = self.install / 'data' / 'postgres'
         cluster.mkdir()
         (cluster / 'PG_VERSION').write_text('17\n')
@@ -423,6 +479,7 @@ class ReleaseUpdaterTests(unittest.TestCase):
         self.assertIn('original POSTGRES_PASSWORD', result.stderr)
         self.assertEqual((self.install / '.env').read_text(), self.env_content)
         self.assertFalse(any('up' in call or 'stop' in call for call in self.calls()))
+        self.assert_compose_preserved(expected)
 
     def test_failed_external_database_preflight_does_not_stop_previous_local_database(self):
         self.run_update('v0.1.0')
@@ -436,28 +493,34 @@ class ReleaseUpdaterTests(unittest.TestCase):
 
     def test_incompatible_candidate_does_not_stop_working_application(self):
         self.run_update('v0.1.0')
+        expected = self.operator_compose()
         prior_calls = len(self.calls())
         self.run_update('v0.2.0', success=False, FAIL_SCHEMA_TAG='v0.2.0')
         self.assertEqual(self.image_tag('tgchatbot:current'), 'v0.1.0')
         self.assertFalse(any('stop' in call and 'bot' in call for call in self.calls()[prior_calls:]))
+        self.assert_compose_preserved(expected)
 
     def test_failed_activation_cannot_restart_prior_image_after_incompatible_schema_change(self):
         self.run_update('v0.1.0')
+        expected = self.operator_compose()
         prior_calls = len(self.calls())
         result = self.run_update('v0.2.0', success=False, FAIL_TAG='v0.2.0', INCOMPATIBLE_AFTER_FAILURE='v0.1.0')
         self.assertIn('no compatible prior image', result.stderr)
         app_starts = [call for call in self.calls()[prior_calls:] if 'up' in call and 'bot' in call]
         self.assertEqual(len(app_starts), 1)
         self.assertEqual(self.image_tag('tgchatbot:current'), 'v0.2.0')
+        self.assert_compose_preserved(expected)
         self.assert_data_preserved()
 
     def test_manual_rollback_checks_schema_before_stopping_current_application(self):
         self.run_update('v0.1.0')
         self.run_update('v0.2.0')
+        expected = self.operator_compose()
         prior_calls = len(self.calls())
         self.run_update('rollback', success=False, FAIL_SCHEMA_TAG='v0.1.0')
         self.assertEqual(self.image_tag('tgchatbot:current'), 'v0.2.0')
         self.assertFalse(any('stop' in call and 'bot' in call for call in self.calls()[prior_calls:]))
+        self.assert_compose_preserved(expected)
 
     def test_previous_image_is_saved_before_current_changes(self):
         self.run_update("v0.1.0")

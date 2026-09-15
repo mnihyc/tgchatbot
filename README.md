@@ -16,7 +16,7 @@ Download and unpack the [latest deployment bundle](https://github.com/mnihyc/tgc
 then run `./update.sh` from the extracted directory.
 
 The first run creates `.env`. Set `TGBOT_TOKEN` and a provider key, then run
-`./update.sh` again. Existing `.env` settings are retained. The updater configures
+`./update.sh` again. Existing `compose.yml` and `.env` settings are retained. The updater configures
 the bundled PostgreSQL database; an explicit `DATABASE_URL` selects your own
 PostgreSQL database with pgvector.
 

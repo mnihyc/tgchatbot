@@ -1,7 +1,7 @@
 # Deployment
 
 Keep the deployment directory separate from the optional source checkout.
-Docker runs the bot and PostgreSQL; `.env` and retained data belong to the
+Docker runs the bot and PostgreSQL; `compose.yml`, `.env` and retained data belong to the
 installation and survive application updates.
 
 ## Install and update
@@ -29,14 +29,26 @@ Docker installs the dependencies on the first run and caches them for updates.
 
 The existing bot keeps running while Docker prepares the candidate image.
 The updater checks database compatibility before switching, waits for application
-health, and retains the previous image with its matching Compose definition.
+health, and retains the previous image.
 Failed activation may restore that previous compatible application. Rollback
 does not reverse database changes or external actions.
 Use `./update.sh` to start stopped services or apply changes to `.env`.
 
+The bundle supplies a `compose.yml` template for new installations. Edit your
+installed file directly; updates and rollbacks preserve it. Apply any later
+Compose changes manually. Rollback switches the application image using your
+current Compose configuration.
+
 An explicit `DATABASE_URL` selects an existing PostgreSQL database with pgvector.
 Otherwise the updater starts the bundled database. No separate Compose profile
-setting is required. The bundled database exposes no host port.
+setting is required. The bundled database exposes no host port by default.
+To allow local database clients, add this under `services.postgres` in your
+`compose.yml`, then run `./update.sh`:
+
+```yaml
+ports:
+  - "127.0.0.1:5432:5432"
+```
 
 ## Upgrading older installations
 
@@ -48,8 +60,7 @@ tar -xzf /path/to/tgchatbot-deploy-vX.Y.Z.tar.gz update.sh
 ./update.sh
 ```
 
-Keep the existing `compose.yml` until the updater runs; it is needed for service
-cleanup and rollback. Keep `.env` and `data/` in place.
+Keep your existing `compose.yml`, `.env` and `data/` in place.
 
 This version requires a fresh conversation schema. An older database is rejected
 without changing its records. Automatic database migration is not provided;
