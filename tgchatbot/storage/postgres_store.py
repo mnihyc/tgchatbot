@@ -37,6 +37,7 @@ from tgchatbot.domain.models import (
 from tgchatbot.operational import from_env
 from tgchatbot.domain.provenance import AGENT_PRESENTATION_VERSION
 from tgchatbot.domain.attachments import generated_attachment_reference
+from tgchatbot.domain.identities import actor_observation
 
 SCHEMA_VERSION = 3
 EMBEDDING_DIMENSIONS = 1536
@@ -1195,8 +1196,8 @@ class PostgresStore:
         details = dict(row['details'])
         allowed = {field.name for field in fields(MemoryBlock)} - {'block_id', 'sequence_no', 'summary_text', 'estimated_tokens', 'compaction_version'}
         details = {key: value for key, value in details.items() if key in allowed}
-        for key in ('parent_block_ids', 'actor_labels', 'topic_labels'):
-            if key in details:
+        for key in ('parent_block_ids', 'actor_labels', 'topic_labels', 'actor_identities'):
+            if key in details and details[key] is not None:
                 details[key] = tuple(details[key])
         if 'source_message_count' not in details:
             details['source_message_count'] = row['source_count'] if 'source_count' in row else len(row['source_ids'])
@@ -1211,12 +1212,47 @@ class PostgresStore:
                 ORDER BY b.sequence_no DESC LIMIT %s''', (session_id, _limit(limit, self.config.memory_block_page_size)))).fetchall()
             return [self._block(row) for row in reversed(rows)]
 
+    async def memory_block_actor_identities(self, session_id: str, block_ids: Sequence[int]) -> list[dict]:
+        """Resolve selected legacy parents once, without loading their original bodies.
+
+        Newly compacted blocks carry these observations forward. Match the
+        revisions the parent saw, rather than borrowing a later identity edit.
+        """
+        if not block_ids:
+            return []
+        async with self.pool.connection() as conn:
+            rows = await (await conn.execute('''WITH source_refs AS MATERIALIZED (
+                SELECT b.id AS block_id,b.generation,unnest(b.source_ids) AS message_id
+                FROM memory_blocks b JOIN sessions s ON s.session_id=b.session_id
+                    AND s.generation=b.generation AND s.context_id=b.context_id
+                WHERE b.session_id=%s AND b.id=ANY(%s) AND b.valid),
+                latest AS MATERIALIZED (
+                SELECT DISTINCT ON (m.actor_id) source.block_id,
+                    m.id,m.source_revision,m.actor_id,m.actor_kind,m.actor_name,m.sent_at
+                FROM source_refs source JOIN LATERAL (
+                    SELECT id,source_revision,actor_id,actor_kind,actor_name,sent_at,
+                        session_id,generation,hidden,deleted
+                    FROM messages WHERE id=source.message_id
+                    -- Keep one primary-key lookup per source even before a
+                    -- large fresh import has planner statistics. No rows are skipped.
+                    OFFSET 0) m ON true
+                WHERE m.session_id=%s AND m.generation=source.generation
+                    AND NOT m.hidden AND NOT m.deleted AND m.actor_id IS NOT NULL AND m.actor_id<>'unknown'
+                ORDER BY m.actor_id,m.sent_at DESC,m.id DESC)
+                SELECT latest.*,r.metadata->>'actor_username' AS actor_username
+                FROM latest JOIN memory_blocks b ON b.id=latest.block_id
+                JOIN message_revisions r ON r.message_id=latest.id AND r.revision=latest.source_revision
+                    AND r.revision=(b.source_revisions->>latest.id::text)::integer''',
+                (session_id, list(block_ids), session_id))).fetchall()
+        return [actor_observation(row, row['id']) for row in rows]
+
     async def create_memory_block(self, session_id: str, *, summary_text: str, estimated_tokens: int,
                                    source_message_ids: Sequence[int], level: int = 1, kind: str = 'episode',
                                    lifecycle: str = 'sealed', source_kind: str = 'raw',
                                    source_message_count: int | None = None, start_message_id: int | None = None,
                                    end_message_id: int | None = None, parent_block_ids: Sequence[int] | None = None,
                                    topic_labels: Sequence[str] | None = None, actor_labels: Sequence[str] | None = None,
+                                   actor_identities: Sequence[dict] | None = None,
                                    time_start: str | None = None, time_end: str | None = None,
                                    retained_raw_excerpt_count: int = 0, validator_status: str | None = None,
                                    validator_score: float | None = None, structured_data: dict | None = None,
@@ -1264,6 +1300,8 @@ class PostgresStore:
                 time_end=time_end, retained_raw_excerpt_count=retained_raw_excerpt_count,
                 validator_status=validator_status, validator_score=validator_score, structured_data=structured_data or {},
                 presentation_version=AGENT_PRESENTATION_VERSION)
+            if actor_identities is not None:
+                details['actor_identities'] = list(actor_identities)
             row = await (await conn.execute('''INSERT INTO memory_blocks
                 (session_id,generation,context_id,sequence_no,summary_text,estimated_tokens,source_ids,source_revisions,details)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *''',

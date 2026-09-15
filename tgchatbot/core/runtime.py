@@ -42,7 +42,8 @@ from tgchatbot.logging_config import clip_for_log
 from tgchatbot.domain.provenance import (attributed_message, attribution, evidence_part_spans,
     message_evidence, present_attribution, present_image_evidence, present_tool_output, utc_time,
     AGENT_PRESENTATION_VERSION)
-from tgchatbot.domain.identities import actor_reference, canonical_actor_id
+from tgchatbot.domain.identities import (actor_reference, canonical_actor_id, actor_observation,
+                                        latest_actor_observations, format_actor_labels)
 from tgchatbot.domain.attachments import attachment_description
 from tgchatbot.providers.base import ModelProvider, ProviderOutcomeError, RequestTokenEstimate
 from tgchatbot.settings_schema import (
@@ -1921,7 +1922,7 @@ class AgentRuntime:
                     skipped_message_ids.update(skipped_ids)
                     logger.info('compact.l0.skip sid=%s raw_messages=%s skipped=%s', self._session_log_id(session_id), len(tool_slice), len(skipped_ids))
                     continue
-                block_text = self._render_memory_block_text('toolspan', candidate['data'], time_start=candidate['time_start'], time_end=candidate['time_end'])
+                block_text = self._render_memory_block_text('toolspan', candidate['data'], time_start=candidate['time_start'], time_end=candidate['time_end'], actor_identities=candidate['actor_identities'])
                 block = await self.store.create_memory_block(
                     session_id,
                     summary_text=block_text,
@@ -1937,6 +1938,7 @@ class AgentRuntime:
                     parent_block_ids=[],
                     topic_labels=candidate['topic_labels'],
                     actor_labels=candidate['actor_labels'],
+                    actor_identities=candidate['actor_identities'],
                     time_start=candidate['time_start'],
                     time_end=candidate['time_end'],
                     retained_raw_excerpt_count=len(candidate['data'].get('retained_raw_excerpts', [])),
@@ -1986,7 +1988,7 @@ class AgentRuntime:
                     skipped_block_ids.update(skipped_blocks)
                     logger.info('compact.episode.skip sid=%s raw_messages=%s parent_blocks=%s', self._session_log_id(session_id), len(skipped_ids), len(skipped_blocks))
                     continue
-                block_text = self._render_memory_block_text('episode', candidate['data'], time_start=candidate['time_start'], time_end=candidate['time_end'])
+                block_text = self._render_memory_block_text('episode', candidate['data'], time_start=candidate['time_start'], time_end=candidate['time_end'], actor_identities=candidate['actor_identities'])
                 estimate = TokenEstimator.estimate_text(block_text) + 32
                 raw_ids = [item.db_id for item in history_slice['raw_messages']]
                 parent_ids = [block.block_id for block in history_slice['parent_blocks']]
@@ -2006,6 +2008,7 @@ class AgentRuntime:
                         parent_block_ids=parent_ids,
                         topic_labels=candidate['topic_labels'],
                         actor_labels=candidate['actor_labels'],
+                        actor_identities=candidate['actor_identities'],
                         time_start=candidate['time_start'],
                         time_end=candidate['time_end'],
                         retained_raw_excerpt_count=len(candidate['data'].get('retained_raw_excerpts', [])),
@@ -2037,6 +2040,7 @@ class AgentRuntime:
                         parent_block_ids=[],
                         topic_labels=candidate['topic_labels'],
                         actor_labels=candidate['actor_labels'],
+                        actor_identities=candidate['actor_identities'],
                         time_start=candidate['time_start'],
                         time_end=candidate['time_end'],
                         retained_raw_excerpt_count=len(candidate['data'].get('retained_raw_excerpts', [])),
@@ -2076,13 +2080,13 @@ class AgentRuntime:
                 excluded_parent_signatures=skipped_digest_shards,
             )
             if shard:
-                candidate = await self._make_digest_block_candidate(provider, settings, shard)
+                candidate = await self._make_digest_block_candidate(provider, settings, shard, session_id=session_id)
                 if candidate is None:
                     signature = tuple(block.block_id for block in shard)
                     skipped_digest_shards.add(signature)
                     logger.info('compact.digest.skip sid=%s parent_blocks=%s signature=%s', self._session_log_id(session_id), len(shard), signature)
                     continue
-                block_text = self._render_memory_block_text('digest', candidate['data'], time_start=candidate['time_start'], time_end=candidate['time_end'])
+                block_text = self._render_memory_block_text('digest', candidate['data'], time_start=candidate['time_start'], time_end=candidate['time_end'], actor_identities=candidate['actor_identities'])
                 parent_ids = [block.block_id for block in shard]
                 old_digest_ids = [
                     block.block_id
@@ -2110,6 +2114,7 @@ class AgentRuntime:
                         parent_block_ids=parent_ids,
                         topic_labels=candidate['topic_labels'],
                         actor_labels=candidate['actor_labels'],
+                        actor_identities=candidate['actor_identities'],
                         time_start=candidate['time_start'],
                         time_end=candidate['time_end'],
                         retained_raw_excerpt_count=0,
@@ -2134,6 +2139,7 @@ class AgentRuntime:
                         parent_block_ids=parent_ids,
                         topic_labels=candidate['topic_labels'],
                         actor_labels=candidate['actor_labels'],
+                        actor_identities=candidate['actor_identities'],
                         time_start=candidate['time_start'],
                         time_end=candidate['time_end'],
                         retained_raw_excerpt_count=0,
@@ -2728,6 +2734,7 @@ class AgentRuntime:
         source_messages = [self._compaction_source_message(item) for item in raw_messages]
         originals = await self._compaction_originals(session_id, raw_messages)
         normalized = self._normalize_compaction_messages(source_messages, originals=originals)
+        identities = await self._compaction_actor_identities(session_id, originals, [])
         time_start, time_end = self._raw_message_time_bounds(raw_messages)
         metadata_message = self._compaction_metadata_message(
             mode='toolspan',
@@ -2735,6 +2742,7 @@ class AgentRuntime:
             parent_blocks=[],
             time_start=time_start,
             time_end=time_end,
+            actor_identities=identities,
         )
         model_messages = [metadata_message, *normalized] if metadata_message is not None else normalized
         candidate = await self._generate_structured_candidate(provider, settings, model_messages, mode='toolspan')
@@ -2745,6 +2753,7 @@ class AgentRuntime:
             'score': 1.0,
             'topic_labels': self._candidate_topic_labels(candidate),
             'actor_labels': self._candidate_actor_labels(candidate),
+            'actor_identities': identities,
             'time_start': time_start,
             'time_end': time_end,
         }
@@ -2761,6 +2770,7 @@ class AgentRuntime:
     ) -> dict[str, Any] | None:
         source_lookup = {id(item.message): self._compaction_source_message(item) for item in raw_messages}
         originals = await self._compaction_originals(session_id, raw_messages)
+        identities = await self._compaction_actor_identities(session_id, originals, parent_blocks)
         normalized = self._normalize_compaction_messages(
             [source_lookup.get(id(message), message) for message in source_messages], originals=originals)
         raw_start, raw_end = self._raw_message_time_bounds(raw_messages)
@@ -2773,6 +2783,7 @@ class AgentRuntime:
             parent_blocks=parent_blocks,
             time_start=time_start,
             time_end=time_end,
+            actor_identities=identities,
         )
         model_messages = [metadata_message, *normalized] if metadata_message is not None else normalized
         candidate = await self._generate_structured_candidate(provider, settings, model_messages, mode='episode')
@@ -2784,11 +2795,13 @@ class AgentRuntime:
             'score': 1.0,
             'topic_labels': self._candidate_topic_labels(candidate),
             'actor_labels': self._candidate_actor_labels(candidate),
+            'actor_identities': identities,
             'time_start': time_start,
             'time_end': time_end,
         }
 
-    async def _make_digest_block_candidate(self, provider: ModelProvider, settings: SessionSettings, blocks: list[MemoryBlock]) -> dict[str, Any] | None:
+    async def _make_digest_block_candidate(self, provider: ModelProvider, settings: SessionSettings, blocks: list[MemoryBlock], *, session_id: str) -> dict[str, Any] | None:
+        identities = await self._compaction_actor_identities(session_id, {}, blocks)
         source_messages = [block.render_as_message(timezone=self.config.default_metadata_timezone) for block in blocks]
         time_start, time_end = self._block_time_bounds(blocks)
         metadata_message = self._compaction_metadata_message(
@@ -2797,6 +2810,7 @@ class AgentRuntime:
             parent_blocks=blocks,
             time_start=time_start,
             time_end=time_end,
+            actor_identities=identities,
         )
         model_messages = [metadata_message, *source_messages] if metadata_message is not None else source_messages
         candidate = await self._generate_structured_candidate(provider, settings, model_messages, mode='digest')
@@ -2808,6 +2822,7 @@ class AgentRuntime:
             'score': 1.0,
             'topic_labels': self._candidate_topic_labels(candidate),
             'actor_labels': self._candidate_actor_labels(candidate),
+            'actor_identities': identities,
             'time_start': time_start,
             'time_end': time_end,
         }
@@ -2829,6 +2844,16 @@ class AgentRuntime:
         if len(originals) != len(ids):
             raise StaleScopeError('A selected compaction original is no longer available')
         return originals
+
+    async def _compaction_actor_identities(self, session_id: str,
+            originals: dict[int, ConversationMessage], parents: list[MemoryBlock]) -> list[dict]:
+        observations = [item for block in parents for item in block.actor_identities or ()]
+        legacy = [block.block_id for block in parents if block.actor_identities is None]
+        if legacy:
+            observations.extend(await self.store.memory_block_actor_identities(session_id, legacy))
+        observations.extend(observed for message_id, message in originals.items()
+            if (observed := actor_observation(message.metadata, message_id)) is not None)
+        return latest_actor_observations(observations)
 
     @staticmethod
     def _compaction_profile_has_owners(candidate: dict[str, Any], actor_ids: list[str]) -> bool:
@@ -2901,6 +2926,7 @@ class AgentRuntime:
         parent_blocks: list[MemoryBlock],
         time_start: str | None,
         time_end: str | None,
+        actor_identities: list[dict] | None = None,
     ) -> ConversationMessage:
         participants: list[str] = []
         for item in raw_messages:
@@ -2915,6 +2941,10 @@ class AgentRuntime:
                 label_text = actor_reference(str(label).strip())
                 if label_text and label_text not in participants:
                     participants.append(label_text)
+        for identity in actor_identities or ():
+            label = actor_reference(identity['id'])
+            if label not in participants:
+                participants.append(label)
         lines = ['[Compaction source metadata]']
         time_start = format_timestamp(time_start, self.config.default_metadata_timezone)
         time_end = format_timestamp(time_end, self.config.default_metadata_timezone)
@@ -2926,7 +2956,7 @@ class AgentRuntime:
         elif time_start or time_end:
             lines.append(f'- time_span: {time_start or time_end}')
         if participants:
-            lines.append('- participants: ' + ', '.join(participants))
+            lines.append('- participants: ' + format_actor_labels(participants, actor_identities))
         if mode == 'digest':
             parent_refs = [f'L{block.level}#{block.sequence_no}' for block in parent_blocks]
             if parent_refs:
@@ -2970,7 +3000,7 @@ class AgentRuntime:
         # The current compaction window already bounds source cardinality. Never
         # truncate identifiers or drop later people at an arbitrary actor count.
         return list(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
-    def _render_memory_block_text(self, kind: str, data: dict[str, Any], *, time_start: str | None = None, time_end: str | None = None) -> str:
+    def _render_memory_block_text(self, kind: str, data: dict[str, Any], *, time_start: str | None = None, time_end: str | None = None, actor_identities: list[dict] | None = None) -> str:
         def emit_list(title: str, items: Any) -> list[str]:
             values = [str(item).strip() for item in items if item is not None and str(item).strip()] if isinstance(items, list) else []
             return ['', title, *(f'- {item}' for item in values)] if values else []
@@ -2992,7 +3022,7 @@ class AgentRuntime:
             if data.get('interaction_mode'):
                 lines.append('- Interaction mode: ' + str(data.get('interaction_mode')).strip())
             if data.get('participants'):
-                lines.append('- Participants: ' + ', '.join(str(item).strip() for item in data.get('participants', [])))
+                lines.append('- Participants: ' + format_actor_labels(data['participants'], actor_identities))
             if data.get('topics'):
                 lines.append('- Topics: ' + ', '.join(str(item).strip() for item in data.get('topics', [])))
             lines.extend(emit_list('## User profile', data.get('user_profile', [])))
@@ -3017,7 +3047,7 @@ class AgentRuntime:
             if data.get('interaction_mode'):
                 lines.append('- Interaction mode: ' + str(data.get('interaction_mode')).strip())
             if data.get('participants'):
-                lines.append('- Participants: ' + ', '.join(str(item).strip() for item in data.get('participants', [])))
+                lines.append('- Participants: ' + format_actor_labels(data['participants'], actor_identities))
             if data.get('topics'):
                 lines.append('- Topics: ' + ', '.join(str(item).strip() for item in data.get('topics', [])))
             lines.extend(emit_list('## User profile', data.get('user_profile', [])))
@@ -3042,7 +3072,7 @@ class AgentRuntime:
             if data.get('interaction_modes_seen'):
                 lines.append('- Interaction modes seen: ' + ', '.join(str(item).strip() for item in data.get('interaction_modes_seen', [])))
             if data.get('participants'):
-                lines.append('- Participants: ' + ', '.join(str(item).strip() for item in data.get('participants', [])))
+                lines.append('- Participants: ' + format_actor_labels(data['participants'], actor_identities))
             if data.get('topics'):
                 lines.append('- Topics: ' + ', '.join(str(item).strip() for item in data.get('topics', [])))
             lines.extend(emit_list('## User profile', data.get('user_profile', [])))

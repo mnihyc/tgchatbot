@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from tgchatbot.domain.models import ConversationMessage, MessageRole, PartKind
 from tgchatbot.domain.timestamps import format_timestamp
+from tgchatbot.domain.identities import format_actor_labels
 
 
 def matching_tool_result(call_message: ConversationMessage, result_message: ConversationMessage) -> bool:
@@ -49,6 +50,7 @@ class MemoryBlock:
     parent_block_ids: tuple[int, ...] = ()
     topic_labels: tuple[str, ...] = ()
     actor_labels: tuple[str, ...] = ()
+    actor_identities: tuple[dict[str, Any], ...] | None = None
     time_start: str | None = None
     time_end: str | None = None
     retained_raw_excerpt_count: int = 0
@@ -80,9 +82,9 @@ class MemoryBlock:
                 scope_bits.append(f"time={start}..{end}")
             else:
                 scope_bits.append(f"time={start or end}")
-        if self.actor_labels and '- Participants: ' + ', '.join(self.actor_labels) not in scope_lines:
+        if self.actor_labels and '- Participants: ' + format_actor_labels(self.actor_labels, self.actor_identities) not in scope_lines:
             labels = self.actor_labels if self.presentation_version >= 2 else self.actor_labels[:4]
-            scope_bits.append("actors=" + ", ".join(labels))
+            scope_bits.append("actors=" + format_actor_labels(labels, self.actor_identities))
         if self.topic_labels and '- Topics: ' + ', '.join(self.topic_labels) not in scope_lines:
             labels = self.topic_labels if self.presentation_version >= 2 else self.topic_labels[:4]
             scope_bits.append("topics=" + ", ".join(labels))

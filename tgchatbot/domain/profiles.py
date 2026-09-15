@@ -72,6 +72,8 @@ def profile_document(actor_id: str, identity: dict | None, facts: list[dict], *,
         'subject_kind': 'agent_preferences' if agent else 'actor',
         'facts': [], 'status': 'no_current_facts' if identity or (agent and known_agent) else 'unknown_identity'}
     if identity:
+        if identity.get('actor_username'):
+            document['identity']['actor_username'] = identity['actor_username']
         document['identity']['last_message'] = {key: identity[key] for key in
             ('message_id', 'source_revision', 'sent_at')}
     for fact in facts:

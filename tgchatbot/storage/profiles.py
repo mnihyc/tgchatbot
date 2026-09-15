@@ -237,9 +237,11 @@ async def apply_patch(store, job, additions, removals, *, max_bytes, expected_so
 
 
 async def _identity(conn, session_id, generation, actor_id):
-    return await (await conn.execute('''SELECT id AS message_id,source_revision,sent_at,actor_kind,actor_name
-        FROM messages WHERE session_id=%s AND generation=%s AND actor_id=%s AND NOT hidden AND NOT deleted
-        ORDER BY sent_at DESC,id DESC LIMIT 1''', (session_id, generation, actor_id))).fetchone()
+    return await (await conn.execute('''SELECT m.id AS message_id,m.source_revision,m.sent_at,m.actor_kind,m.actor_name,
+        r.metadata->>'actor_username' AS actor_username
+        FROM messages m JOIN message_revisions r ON (r.message_id,r.revision)=(m.id,m.source_revision)
+        WHERE m.session_id=%s AND m.generation=%s AND m.actor_id=%s AND NOT m.hidden AND NOT m.deleted
+        ORDER BY m.sent_at DESC,m.id DESC LIMIT 1''', (session_id, generation, actor_id))).fetchone()
 
 
 async def add_source_dates(conn, documents):

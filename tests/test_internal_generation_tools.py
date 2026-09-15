@@ -151,7 +151,8 @@ class InternalGenerationToolsWorkflows(BusinessTestCase):
                     result = await self.runtime._make_episode_block_candidate(provider, settings,
                         [source.message], [source], [], session_id=self.session)
                 else:
-                    result = await self.runtime._make_digest_block_candidate(provider, settings, [parent])
+                    result = await self.runtime._make_digest_block_candidate(provider, settings, [parent],
+                        session_id=self.session)
                 self.assertEqual(result['data']['scope'], candidate['scope'])
                 self.assert_internal_request(name, max_output_tokens=24576)
                 self.assertEqual(settings, original_settings)
