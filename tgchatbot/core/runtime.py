@@ -517,8 +517,8 @@ class AgentRuntime:
             if self.preview_cache is not None:
                 history = await self.preview_cache.materialize_many(session_id, history,
                     vision=provider.capabilities.multimodal_input)
-            # The round threshold is a one-time reminder, not an execution
-            # cutoff. Keep the system prompt and tool declarations stable.
+            # Keep prompts and declarations stable. The dispatch boundary
+            # refuses calls beyond the round limit without executing them.
             current_tools = tools if provider.capabilities.function_tools else []
             raw_request_estimate = provider.estimate_request_tokens(
                 settings=settings,
@@ -534,7 +534,7 @@ class AgentRuntime:
                 tool_history_mode=settings.tool_history_mode,
             )
             logger.info(
-                'turn.iter sid=%s step=%s soft_limit=%s tools=%s extra=%s est_req=%s raw_req=%s bias=%.3f',
+                'turn.iter sid=%s step=%s round_limit=%s tools=%s extra=%s est_req=%s raw_req=%s bias=%.3f',
                 self._session_log_id(session_id),
                 iteration + 1,
                 max_tool_rounds,
@@ -643,12 +643,17 @@ class AgentRuntime:
                             'provider': provider.name, 'model': settings.model,
                             'scope': _turn_scope.get()}))
                     emitted_tool_text = True
-                for tool_index, (tool_call, stored_call) in enumerate(zip(response.tool_calls, stored_calls, strict=True)):
+                round_limit_reached = iteration >= max_tool_rounds
+                for tool_call, stored_call in zip(response.tool_calls, stored_calls, strict=True):
                     logger.info('tool.call sid=%s name=%s call=%s args=%s', self._session_log_id(session_id), tool_call.name, clip_for_log(tool_call.call_id, limit=32), self._tool_argument_summary(tool_call.arguments))
                     # Only registered tools offered in this request may run.
                     evidence_parts = []
                     spec = next((item for item in current_tools if item.name == tool_call.name), None)
-                    if spec is None:
+                    if round_limit_reached:
+                        logger.info('tool.blocked sid=%s name=%s reason=round_limit', self._session_log_id(session_id), tool_call.name)
+                        tool_output = {'ok': False, 'application_note':
+                            'Tool-call limit reached for this turn. This call was not executed. Finish the reply using the available results.'}
+                    elif spec is None:
                         logger.warning('tool.unavailable sid=%s name=%s', self._session_log_id(session_id), tool_call.name)
                         tool_output = {'ok': False, 'error': f'Tool unavailable in this round: {tool_call.name}'}
                     else:
@@ -734,13 +739,6 @@ class AgentRuntime:
                         updated_call = await self.store.mark_tool_evidence(session_id, stored_call.db_id,
                             expected_scope=_turn_scope.get())
                         await self._append_live_message(state, updated_call)
-                    limit_notice = (iteration + 1 == max_tool_rounds
-                        and tool_index == len(response.tool_calls) - 1)
-                    if limit_notice:
-                        # Attach once before persistence and serialization; do
-                        # not rewrite results already sent in earlier rounds.
-                        tool_output = {**tool_output, 'application_note':
-                            'Tool-call limit reached for this turn. Finish the reply using the available results.'}
                     stored_result = await self.record_tool_observation(
                         session_id=session_id,
                         name=tool_call.name,
@@ -751,7 +749,7 @@ class AgentRuntime:
                         metadata_update={'tool_batch_id': batch_id, 'tool_model': settings.model, 'tool_call_message_id': stored_call.db_id,
                             **({'tool_evidence': True} if evidence_parts else {})},
                     )
-                    if evidence_parts or limit_notice:
+                    if evidence_parts or round_limit_reached:
                         pending_context_ids.update((stored_call.db_id,stored_result.db_id))
                     if emit and settings.process_visibility in {ProcessVisibility.VERBOSE, ProcessVisibility.FULL}:
                         await emit(

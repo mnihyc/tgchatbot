@@ -556,7 +556,7 @@ class MemoryBusinessTests(BusinessTestCase):
         self.assertEqual(await self.store.get_profile(self.session, "telegram:user:7"), [])
         self.assertEqual((await self.memory.read(self.session, [source.db_id]))["unavailable_ids"], [source.db_id])
 
-    async def test_chat_memory_tools_share_soft_round_limit_and_preserve_exact_prompt(self):
+    async def test_chat_memory_tools_preserve_the_exact_prompt_and_actual_result(self):
         await self.settings(mode=ChatMode.CHAT, max_interaction_rounds=1,
             system_prompt="  Keep my exact voice.  ", prompt_injection_mode=PromptInjectionMode.EXACT)
         source = await self.ingest("I prefer jasmine tea.")
@@ -573,10 +573,9 @@ class MemoryBusinessTests(BusinessTestCase):
         self.tools.runner.run.assert_not_awaited()
         output = self.provider.requests[1]["extra_input_items"][-1]["output"]
         self.assertEqual(output["messages"][0]["speaker"]["id"], "person_id:7")
-        self.assertEqual(output['application_note'],
-            'Tool-call limit reached for this turn. Finish the reply using the available results.')
+        self.assertNotIn('application_note', output)
 
-    async def test_soft_round_limit_allows_another_memory_read(self):
+    async def test_next_memory_read_is_blocked_at_the_round_limit(self):
         await self.settings(mode=ChatMode.CHAT, max_interaction_rounds=1)
         source = await self.ingest("I prefer jasmine tea.")
         self.memory.read = AsyncMock(wraps=self.memory.read)
@@ -585,9 +584,12 @@ class MemoryBusinessTests(BusinessTestCase):
         result = await self.runtime.run_turn_from_stored(session_id=self.session,
             user_display_name="Alex", trigger_message_id=source.db_id)
         self.assertEqual(result.text, 'You prefer jasmine tea.')
-        self.assertEqual(self.memory.read.await_count, 2)
+        self.memory.read.assert_awaited_once()
         self.assertEqual(len(self.provider.requests), 3)
         self.assertEqual(self.provider.requests[1]["tools"], self.provider.requests[0]["tools"])
+        output = self.provider.requests[2]['extra_input_items'][-1]['output']
+        self.assertEqual(output, {'ok': False, 'application_note':
+            'Tool-call limit reached for this turn. This call was not executed. Finish the reply using the available results.'})
 
     async def test_durable_reply_target_counts_against_request_budget(self):
         source = await self.ingest("I prefer jasmine tea.")

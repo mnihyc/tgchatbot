@@ -46,7 +46,7 @@ PARAMETERS = {
     'group_spontaneous_reply_delay_s': Parameter('replies', 'Spontaneous reply delay', 'Wait this long before an eligible spontaneous group reply.', unit='s'),
     'private_reply_delay_s': Parameter('replies', 'Private reply delay', 'Wait for nearby private messages before replying.', unit='s'),
     'group_reply_delay_s': Parameter('replies', 'Group reply delay', 'Wait for nearby triggered group messages before replying.', unit='s'),
-    'max_interaction_rounds': Parameter('tools', 'Soft round limit', 'Tool interaction rounds before a reminder to finish. Tools remain available.'),
+    'max_interaction_rounds': Parameter('tools', 'Tool-round limit', 'Tool rounds that may execute per turn. Further calls return a limit notice.'),
     'native_web_search': Parameter('tools', 'Provider web search', 'Allow the provider’s built-in web search when supported by the current model.'),
     'native_web_search_max': Parameter('tools', 'Provider web search limit', 'Cap built-in web search calls where supported; 0 removes this explicit cap.'),
     'link_prefetch': Parameter('tools', 'Link previews', 'Fetch a title or short snippet for links in incoming messages.', status_key='link_prefetch_mode'),
@@ -154,7 +154,7 @@ def status_view(status: dict, flow: dict, topic: str = '') -> str:
             remote += '; SSH master started' if status.get('remote_master_ready') else '; SSH master not started'
         lines = [
             '🛠 <b>Tools</b>',
-            f"Mode: {_code(status.get('mode'))} · soft round limit: {_number(status.get('max_interaction_rounds'))}",
+            f"Mode: {_code(status.get('mode'))} · tool-round limit: {_number(status.get('max_interaction_rounds'))}",
             f"Stickers: {_text(status.get('stickers'))} · {_number(status.get('sticker_index_count'))} in {_number(status.get('sticker_pack_count'))} packs",
             f"Catalog: {'loaded' if status.get('sticker_index_loaded') else 'not loaded'}",
             f'Remote workspace: {remote}',

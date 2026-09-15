@@ -1,4 +1,4 @@
-"""The tool-round reminder preserves working context and permits completion."""
+"""Excess tool calls are refused without losing results or changing request prefixes."""
 from __future__ import annotations
 
 import copy
@@ -19,7 +19,7 @@ from tgchatbot.providers.openai_responses import OpenAIResponsesProvider
 from tgchatbot.storage.previews import PreviewCache
 
 
-class SoftToolRoundTests(BusinessTestCase):
+class ToolRoundLimitTests(BusinessTestCase):
     def response(self, name, *, calls=(), text='Finished.'):
         if name == 'gemini':
             parts = [{'functionCall': {'name': 'shell_exec', 'id': call_id, 'args': {}}}
@@ -78,7 +78,8 @@ class SoftToolRoundTests(BusinessTestCase):
     async def exercise_continuation(self, name):
         wire = []
         scripts = [self.response(name, calls=('first', 'last')),
-            self.response(name, calls=('needed',)), self.response(name, text='First completed.'),
+            self.response(name, calls=('blocked-1', 'blocked-2')),
+            self.response(name, calls=('retry',)), self.response(name, text='First completed.'),
             self.response(name, calls=('new-turn',)), self.response(name, text='Next completed.'),
             self.response(name), self.response(name)]
         native_responses = copy.deepcopy(scripts)
@@ -91,13 +92,16 @@ class SoftToolRoundTests(BusinessTestCase):
         result = await self.runtime.run_turn(session_id=self.session, user_display_name='Participant',
             incoming_message=ConversationMessage.user_text('Check both notes and resolve differences.'), emit=AsyncMock())
         self.assertEqual(result.text, 'First completed.')
-        self.assertEqual(self.tools.runner.run.await_count, 3)
+        self.assertEqual(self.tools.runner.run.await_count, 2)
         first_results, all_results = self.results(name, wire[1]), self.results(name, wire[2])
-        self.assertNotIn('application_note', first_results['first'])
-        self.assertIn('application_note', first_results['last'])
+        self.assertEqual(first_results, {call_id: {'ok': True, 'value': 'Checked.'}
+            for call_id in ('first', 'last')})
         self.assertEqual(first_results['last'], all_results['last'])
-        self.assertNotIn('application_note', all_results['needed'])
-        self.assertEqual(sum('application_note' in item for item in all_results.values()), 1)
+        refusal = {'ok': False, 'application_note':
+            'Tool-call limit reached for this turn. This call was not executed. Finish the reply using the available results.'}
+        self.assertEqual(all_results['blocked-1'], refusal)
+        self.assertEqual(all_results['blocked-2'], refusal)
+        self.assertEqual(self.results(name, wire[3])['retry'], refusal)
 
         async def record(runtime, completed):
             await runtime.record_assistant_text(session_id=self.session, text=completed.text, metadata={
@@ -108,8 +112,8 @@ class SoftToolRoundTests(BusinessTestCase):
         second = await self.runtime.run_turn(session_id=self.session, user_display_name='Participant',
             incoming_message=ConversationMessage.user_text('Now check another note.'), emit=AsyncMock())
         self.assertEqual(second.text, 'Next completed.')
-        self.assertEqual(self.tools.runner.run.await_count, 4)
-        self.assertIn('application_note', self.results(name, wire[4])['new-turn'])
+        self.assertEqual(self.tools.runner.run.await_count, 3)
+        self.assertEqual(self.results(name, wire[5])['new-turn'], {'ok': True, 'value': 'Checked.'})
         await record(self.runtime, second)
         followup = await self.runtime.ingest_user_message(session_id=self.session,
             incoming_message=ConversationMessage.user_text('Are the checks complete?'))
@@ -125,39 +129,40 @@ class SoftToolRoundTests(BusinessTestCase):
         await restored.run_turn_from_stored(session_id=self.session,
             user_display_name='Participant', trigger_message_id=followup.db_id)
         self.assertEqual(wire[-1], wire[-2])
-        self.assertEqual(self.tools.runner.run.await_count, 4)
+        self.assertEqual(self.tools.runner.run.await_count, 3)
         self.assertFalse(scripts)
 
         history_key = {'gemini': 'contents', 'openai': 'input', 'compatible': 'messages'}[name]
-        for previous, current in zip(wire[:5], wire[1:6]):
+        for previous, current in zip(wire[:-1], wire[1:]):
             self.assertEqual(current[history_key][:len(previous[history_key])], previous[history_key])
         invariant = {key: value for key, value in wire[0].items() if key != history_key}
         for request in wire:
             self.assertEqual({key: value for key, value in request.items() if key != history_key}, invariant)
         if name == 'gemini':
             self.assertEqual(wire[0]['systemInstruction'], {'parts': [{'text': settings.system_prompt}]})
-            original = [body['candidates'][0]['content'] for body in native_responses[:5]]
+            original = [body['candidates'][0]['content'] for body in native_responses[:-2]]
         elif name == 'openai':
             self.assertEqual(wire[0]['instructions'], settings.system_prompt)
-            original = [item for body in native_responses[:5] for item in body['output']]
+            original = [item for body in native_responses[:-2] for item in body['output']]
         else:
             self.assertEqual(wire[0]['messages'][0], {'role': 'system', 'content': settings.system_prompt})
-            original = [body['choices'][0]['message'] for body in native_responses[:5]]
+            original = [body['choices'][0]['message'] for body in native_responses[:-2]]
         for item in original:
             self.assertEqual(wire[-1][history_key].count(item), 1)
 
-    async def test_gemini_parallel_tools_continue_past_reminder_and_restart_identically(self):
+    async def test_gemini_blocks_excess_calls_and_restarts_identically(self):
         await self.exercise_continuation('gemini')
 
-    async def test_responses_parallel_tools_continue_past_reminder_and_restart_identically(self):
+    async def test_responses_blocks_excess_calls_and_restarts_identically(self):
         await self.exercise_continuation('openai')
 
-    async def test_compatible_parallel_tools_continue_past_reminder_and_restart_identically(self):
+    async def test_compatible_blocks_excess_calls_and_restarts_identically(self):
         await self.exercise_continuation('compatible')
 
-    async def test_immediate_compaction_keeps_unsent_reminder_with_its_tool_result(self):
+    async def test_immediate_compaction_keeps_the_unseen_refusal(self):
         wire = []
-        scripts = [self.response('gemini', calls=('last',)), self.response('gemini')]
+        scripts = [self.response('gemini', calls=('last',)),
+            self.response('gemini', calls=('blocked',)), self.response('gemini')]
         provider = await self.make_provider('gemini', scripts, wire)
         await self.settings(provider='gemini', model=provider.config.model, mode=ChatMode.ASSIST,
             max_interaction_rounds=1, compact_trigger_tokens=100000,
@@ -176,6 +181,10 @@ class SoftToolRoundTests(BusinessTestCase):
             state = kwargs['state']
             note_rows = [row for row in state.raw_messages
                 if row.message.metadata.get('tool_payload', {}).get('output', {}).get('application_note')]
+            if not note_rows:
+                # The large successful result must first reach the model; the
+                # next continuation then compacts around the new refusal.
+                return False
             self.assertEqual(len(note_rows), 1)
             note = note_rows[0]
             self.assertIn(note.db_id, _admission_protected.get())
@@ -194,9 +203,11 @@ class SoftToolRoundTests(BusinessTestCase):
         self.assertEqual(result.text, 'Finished.')
         self.assertEqual(len(compacted), 1)
         self.assertEqual(len(await self.store.list_memory_blocks(self.session)), 1)
-        result_output = self.results('gemini', wire[-1])['last']
+        self.tools.runner.run.assert_awaited_once()
+        result_output = self.results('gemini', wire[-1])['blocked']
+        self.assertFalse(result_output['ok'])
         self.assertIn('application_note', result_output)
         stored = await self.store.list_uncompacted_messages(self.session)
         self.assertIn(compacted[0], [row.db_id for row in stored])
-        self.assertEqual(wire[0]['systemInstruction'], wire[1]['systemInstruction'])
-        self.assertEqual(wire[0]['tools'], wire[1]['tools'])
+        self.assertEqual(wire[0]['systemInstruction'], wire[-1]['systemInstruction'])
+        self.assertEqual(wire[0]['tools'], wire[-1]['tools'])
