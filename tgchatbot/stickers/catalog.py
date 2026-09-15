@@ -245,7 +245,7 @@ class StickerCatalog:
         context = self._persona_context(state, plan)
         change = (plan.persona_mode == 'clear_session_persona' or
                   plan.persona_mode == 'merge_and_remember' and bool(plan.persona.as_dict()))
-        if persist_persona and plan.send and change:
+        if persist_persona and change:
             value = context['effective_persona'] if plan.persona_mode != 'clear_session_persona' else {}
             if self.persona_store:
                 kwargs = {'expected_scope': expected_scope} if expected_scope is not None else {}
@@ -302,8 +302,6 @@ class StickerCatalog:
 
     async def achoose(self, *, plan: StickerRetrievalPlan, session_id='default',
                       session_state: SessionStyleState | None = None, persona_context=None):
-        if not plan.send:
-            return []
         await self.aensure_loaded()
         index = self._index
         if not index.assets:

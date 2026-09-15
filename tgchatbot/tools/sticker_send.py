@@ -178,7 +178,6 @@ class StickerQueryTool:
             parameters_schema={
                 'type': 'object',
                 'properties': {
-                    'send': _param('boolean', 'false skips retrieval and preference changes; true inspects without sending.', default=True),
                     'intent_core': _param('string', 'Intended message to the recipient, including direction: offer comfort, request a hug, accept blame or hand it back. Use the exchange, not copied identities or profiles.'),
                     'secondary_goals': _param('array', 'Extra nuances that materially refine the reaction.', items={'type': 'string'}),
                     'reaction_tone': _param('string', 'Reaction tone, for example dry amused, warm, irritated, bashful, or smug.'),
@@ -205,10 +204,6 @@ class StickerQueryTool:
 
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         try:
-            # A skip does no retrieval, media preparation or persona writes.
-            if args.get('send') is False or str(args.get('send', '')).lower() in {'false', '0', 'no', 'off'}:
-                return ToolResult(call_id='', name=self.spec.name,
-                                  output={'ok': True, 'skipped': True, 'reason': 'send=false'})
             plan = StickerRetrievalPlan.from_payload(args, config=self.catalog.config)
             state, persona = await self.catalog.aprepare_query_context(plan=plan, session_id=ctx.session_id,
                 persist_persona=True, expected_scope=ctx.scope)

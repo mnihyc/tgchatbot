@@ -373,13 +373,14 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('attention seeking', sent_queries)
         self.assertEqual(result.output['constraints']['avoid_text_meanings'], ['violent revenge'])
 
-    async def test_skip_does_no_retrieval_or_persona_mutation(self):
+    async def test_obsolete_send_argument_cannot_skip_query_or_explicit_persona_change(self):
+        asset = self.asset()
         result = await self.query(send=False, persona_mode='clear_session_persona')
-        self.assertTrue(result.output['skipped'])
-        self.store.active_revision_id.assert_not_awaited()
-        self.embeddings.embed_query.assert_not_awaited()
-        self.personas.get_sticker_persona.assert_not_awaited()
-        self.personas.clear_sticker_persona.assert_not_awaited()
+        self.assertEqual(result.output['status'], 'candidates')
+        self.assertEqual(result.output['candidates'][0]['sticker_id'], asset.agent_id)
+        self.assertTrue(any(part.kind == PartKind.IMAGE for part in result.evidence_parts))
+        self.assertEqual(result.stickers, [])
+        self.personas.clear_sticker_persona.assert_awaited_once_with('chat-a')
 
     async def test_persona_remember_use_once_clear_and_failed_write(self):
         self.asset()

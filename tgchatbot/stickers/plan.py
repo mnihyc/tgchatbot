@@ -319,7 +319,6 @@ class StickerRetrievalPlan:
     intensity_limits: IntensityLimits = field(default_factory=IntensityLimits)
     forbid: list[str] = field(default_factory=list)
     candidate_budget: int = 5
-    send: bool = True
     preferred_character_family: str = ''
     required_pack: str = ''
     required_character_family: str = ''
@@ -443,7 +442,6 @@ class StickerRetrievalPlan:
             intensity_limits=intensity_limits,
             forbid=forbid,
             candidate_budget=_bounded_int(data.get('candidate_budget'), default=config.candidate_count, minimum=1, maximum=config.max_candidates),
-            send=_norm_bool(data.get('send', True), default=True),
             preferred_character_family=_norm_text(data.get('preferred_character_family')),
             required_pack=_norm_text(data.get('required_pack')),
             required_character_family=_norm_text(data.get('required_character_family')),

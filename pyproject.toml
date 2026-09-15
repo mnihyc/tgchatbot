@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tgchatbot"
-version = "0.5.13"
+version = "0.5.14"
 description = "Persistent Telegram assistant with switchable model providers"
 requires-python = ">=3.12,<3.14"
 license = "Apache-2.0"
