@@ -249,12 +249,11 @@ class MemorySearchTool:
     def __init__(self, memory: MemoryService) -> None:
         self.memory = memory
         self.spec = ToolSpec('memory_search',
-            'Find earlier messages in this chat, including history before /reset. Use a natural-language query and optional participant or time filters. '
+            'Find earlier messages in this chat. Use a natural-language query and optional participant or time filters. '
             'Ordered matches identify contributing message_ids; messages contains their exact fragments in chronological order, each with its speaker and time. '
             'quoted_lines marks 1-based inclusive quoted line ranges, distinct from the sender\'s new assertions. '
             'Use memory_read for omitted text, nearby context or selected images; the returned fragments may already suffice. '
-            'Image references belong to their originals; related_context lists nearby originals separately from ranked matches. '
-            'Earlier /reset_full history is unavailable.',
+            'Image references belong to their originals; related_context lists nearby originals separately from ranked matches.',
             {'type': 'object', 'properties': {
                 'query': {'type': 'string', 'description': 'Describe the event, fact or exchange you need; include distinctive words when known.'},
                 'actor_id': {'type': 'string', 'description': 'Optional participant reference from message provenance, e.g. person_id:123. Finds passages involving this participant; surrounding sources retain their own speakers. Omit when unknown.'},
@@ -277,7 +276,7 @@ class MemoryReadTool:
         self.memory = memory
         self.spec = ToolSpec('memory_read',
             'Read original message_ids or the supporting originals for profile_fact_ids from user_profile_fetch. '
-            'Returns the same message records as memory_search; profile evidence reads do not run learning. '
+            'Returns the same message records as memory_search. '
             'Paginate long text with offset and length, following next_offset to continue a partial read. '
             'include_neighbors adds reply and nearby context. '
             'Images remain descriptions unless image_ids selects them for visual examination. '
@@ -291,7 +290,7 @@ class MemoryReadTool:
                 'image_ids': {'type': 'array', 'items': {'type': 'string'},
                     'description': 'Optional image references beside those originals; include each owning original in message_ids. Absent or empty keeps the read text-only.'},
                 'offset': {'type': 'integer'}, 'length': {'type': 'integer'},
-                'include_neighbors': {'type': 'boolean', 'description': 'Also read explicit reply target and nearby messages in the same topic, within the configured read window'}},
+                'include_neighbors': {'type': 'boolean', 'description': 'Also read explicit reply target and nearby messages in the same topic'}},
              'additionalProperties': False}, self)
 
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:

@@ -86,21 +86,35 @@ media available: the catalog records descriptions and vectors, not another copy
 of the media library. Files uploaded through optional SSH tools reside on the
 configured remote host.
 
-For a bundled-database backup, leave PostgreSQL running while stopping the bot:
+Back up or restore the bundled PostgreSQL application data independently of updates:
 
 ```sh
-docker compose stop bot
+./update.sh backup                         # creates a private SQL file in backups/
+./update.sh backup backups/before-test.sql
+./update.sh restore backups/before-test.sql
+```
+
+PostgreSQL must be running. Backup takes a consistent snapshot while the bot
+stays live. Restore pauses the running application services, replaces the
+application schemas in one transaction, and resumes those services. Tables and
+schemas created after the snapshot are removed; SQL errors roll back the restore.
+If interrupted, inspect PostgreSQL before restarting application services.
+Use SQL dumps produced by the backup command. PostgreSQL roles, server settings,
+schema-independent administration objects, `.env`, `compose.yml` and retained
+files are outside this restoration scope.
+
+Back up retained files separately:
+
+```sh
 mkdir -p backups
 umask 077
 backup_stamp=$(date -u +%Y%m%dT%H%M%SZ)
-docker compose exec -T postgres pg_dump -U tgchatbot -d tgchatbot -Fc > "backups/chat-$backup_stamp.dump"
-tar --exclude=data/postgres -czf "backups/files-$backup_stamp.tar.gz" .env data
-./update.sh
+tar --exclude=data/postgres -czf "backups/files-$backup_stamp.tar.gz" compose.yml .env data
 ```
 
 Copy backups to your recovery storage. For an external database, use its backup
-tooling. Restore into a compatible PostgreSQL/pgvector installation while the
-bot is stopped, retaining the corresponding `.env` and file backup.
+tooling. Retain the corresponding `.env` and file backup when transferring to
+another PostgreSQL/pgvector installation.
 
 ## Optional features and maintenance
 

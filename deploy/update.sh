@@ -7,32 +7,119 @@ fail() { log "$*" >&2; exit 1; }
 valid_tag() { [[ $1 =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; }
 if [[ ${1:-} == -h || ${1:-} == --help ]]; then
   echo 'Usage: ./update.sh [latest|vX.Y.Z|rollback]'
+  echo '       ./update.sh backup [path.sql]'
+  echo '       ./update.sh restore path.sql'
   echo 'Default: build and install the latest code release using Docker and your existing .env.'
+  echo 'Backup/restore use the running bundled PostgreSQL service; restore replaces application schemas.'
   exit 0
 fi
-[[ $# -le 1 ]] || fail 'Expected at most one argument'
 target=${1:-latest}
-case "$target" in latest|rollback) ;; *) valid_tag "$target" || fail 'Expected latest, vX.Y.Z or rollback';; esac
+case "$target" in
+  backup) [[ $# -le 2 ]] || fail 'Usage: ./update.sh backup [path.sql]' ;;
+  restore) [[ $# == 2 ]] || fail 'Usage: ./update.sh restore path.sql' ;;
+  *)
+    [[ $# -le 1 ]] || fail 'Expected at most one argument'
+    case "$target" in latest|rollback) ;; *) valid_tag "$target" || fail 'Expected latest, vX.Y.Z, rollback, backup or restore';; esac
+    ;;
+esac
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$root"
 repository=${TGCHATBOT_RELEASE_REPO:-mnihyc/tgchatbot}
 timeout=${TGCHATBOT_HEALTH_TIMEOUT:-180}
 [[ $repository =~ ^[0-9A-Za-z_.-]+/[0-9A-Za-z_.-]+$ ]] || fail 'Invalid release repository'
 [[ $timeout =~ ^[1-9][0-9]*$ ]] || fail 'Health timeout must be a positive number of seconds'
-for tool in docker curl tar flock cmp; do command -v "$tool" >/dev/null || fail "Missing required tool: $tool"; done
+required_tools=(docker flock)
+if [[ $target != backup && $target != restore ]]; then required_tools+=(curl tar cmp); fi
+for tool in "${required_tools[@]}"; do command -v "$tool" >/dev/null || fail "Missing required tool: $tool"; done
 docker compose version >/dev/null || fail 'Docker Compose v2 with up --wait support is required'
 mkdir -p tmp/update data
 exec 9>tmp/update.lock
 flock -n 9 || fail 'Another update is running'
 work=$root/tmp/update
+backup_pending=
 # Only this updater's fixed scratch files are removed, including after failure.
 cleanup() {
   rm -f -- "$work/deploy.tar.gz" \
     "$work/compose.next.yml" "$work/update.next.sh" "$work/update.install.sh"
   rm -rf -- "$work/build-context"
+  if [[ -n $backup_pending ]]; then rm -f -- "$backup_pending"; fi
 }
 trap cleanup EXIT
 cleanup
+
+if [[ $target == backup || $target == restore ]]; then
+  [[ -f compose.yml ]] || fail 'Run ./update.sh to prepare the deployment first'
+  running=$(docker compose ps --status running --services)
+  printf '%s\n' "$running" | awk '$0 == "postgres" { found=1 } END { exit !found }' \
+    || fail 'The bundled PostgreSQL service must be running'
+  if [[ $target == backup ]]; then
+    destination=${2:-backups/database-$(date -u +%Y%m%dT%H%M%SZ)-$$.sql}
+    mkdir -p -- "$(dirname -- "$destination")"
+    backup_pending=$(mktemp -- "$destination.partial.XXXXXX")
+    # PostgreSQL supplies a consistent snapshot while the application stays live.
+    docker compose exec -T postgres sh -ec \
+      'export PGPASSWORD="$POSTGRES_PASSWORD"; exec pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=plain --clean --if-exists --no-owner --no-privileges' \
+      > "$backup_pending"
+    mv -- "$backup_pending" "$destination"
+    backup_pending=
+    log "Database backup saved: $destination"
+    exit 0
+  fi
+
+  [[ -f $2 && -r $2 && -s $2 ]] || fail 'Restore requires a readable, nonempty SQL backup'
+  running_apps=()
+  while IFS= read -r service; do
+    if [[ -n $service && $service != postgres ]]; then running_apps+=("$service"); fi
+  done <<< "$running"
+  resume_apps() {
+    if [[ ${#running_apps[@]} != 0 ]]; then
+      docker compose start --wait --wait-timeout "$timeout" "${running_apps[@]}"
+    fi
+  }
+  trap 'log "Restore interrupted; its result is unconfirmed. Check PostgreSQL before restarting application services." >&2; exit 130' INT
+  trap 'log "Restore interrupted; its result is unconfirmed. Check PostgreSQL before restarting application services." >&2; exit 143' TERM
+  if [[ ${#running_apps[@]} != 0 ]] && ! docker compose stop "${running_apps[@]}"; then
+    resume_apps || fail 'Application pause and restart failed; restore has not started'
+    fail 'Could not pause application services; restore has not started'
+  fi
+  log 'Restoring application schemas from SQL'
+  restored=0
+  # An explicit final COMMIT also makes a broken input stream roll back instead
+  # of letting psql's automatic single-transaction mode commit a premature EOF.
+  if (
+    cat <<'SQL'
+BEGIN;
+SET LOCAL client_min_messages = warning;
+DO $restore$
+DECLARE item record;
+BEGIN
+  FOR item IN SELECT nspname FROM pg_namespace
+      WHERE nspname !~ '^pg_' AND nspname <> 'information_schema'
+  LOOP
+    EXECUTE format('DROP SCHEMA IF EXISTS %I CASCADE', item.nspname);
+  END LOOP;
+END $restore$;
+CREATE SCHEMA public AUTHORIZATION pg_database_owner;
+GRANT USAGE ON SCHEMA public TO PUBLIC;
+SQL
+    cat -- "$2" || exit 1
+    printf '\nCOMMIT;\n'
+  ) | docker compose exec -T postgres sh -ec \
+      'export PGPASSWORD="$POSTGRES_PASSWORD"; exec psql -X -q -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f -'; then
+    restored=1
+  fi
+  if ! resume_apps; then
+    if [[ $restored == 1 ]]; then
+      fail 'Database restored, but application restart failed; inspect docker compose logs'
+    fi
+    fail 'Restore and application restart failed; inspect PostgreSQL output and docker compose logs'
+  fi
+  [[ $restored == 1 ]] || fail 'Restore failed or its result could not be confirmed; inspect PostgreSQL output'
+  trap - INT TERM
+  log "Database restored: $2"
+  exit 0
+fi
+
 download() { curl --fail --location --retry 3 --connect-timeout 15 --output "$2" "$1"; }
 # Use the operator's Compose configuration throughout, excluding the separately
 # managed database when starting or stopping application services.
