@@ -164,8 +164,9 @@ class StickerEvidenceWorkflowTests(BusinessTestCase):
                 item = next(item for item in self.wire[-1]['input']
                     if item.get('type')=='function_call_output' and item['call_id']=='selected-'+timing.value)
                 output = json.loads(item['output'])
-                self.assertEqual(output['delivery_state'],'sent' if timing==StickerTiming.SEND_NOW else 'queued')
-                self.assertEqual(output['status'],output['delivery_state'])
+                self.assertEqual(output['status'],'sent' if timing==StickerTiming.SEND_NOW else 'queued')
+                self.assertNotIn('delivery_operation_id', output)
+                self.assertNotIn('telegram_message_id', output)
                 if timing==StickerTiming.AFTER_FINAL:
                     bot.send_sticker.assert_not_awaited()
                     await send_sticker(bot,chat_id=100,sticker=result.stickers[0],deliveries=deliveries)

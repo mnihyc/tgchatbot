@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 from tests.business_helpers import BusinessTestCase
 from tests.test_desktop_import import export, record
 from tgchatbot.domain.models import ConversationMessage, PartKind, ProviderResponse
+from tgchatbot.domain.attachments import attachment_description
 from tgchatbot.media.attachments import sync_attachment_parts
 from tgchatbot.media.ingest import extract_message_parts
 from tgchatbot.storage.artifacts import ArtifactStore
@@ -204,9 +205,10 @@ class DesktopAttachmentImportTests(BusinessTestCase):
             self.assertEqual(message.metadata['actor_id'], f'telegram:user:{10 + number}')
             self.assertEqual(message.metadata['source_message_id'], str(number))
             self.assertEqual(Path(attachment.artifact_path).name, f'Original report {number}_0123456789abcdef.txt')
-            self.assertIn(f"{dates[message.metadata['sent_at']]}/{Path(attachment.artifact_path).name}",
-                message_body(message))
-            self.assertIn('paths relative to workspace', message_body(message))
+            self.assertEqual(attachment.workspace_path,
+                f"{dates[message.metadata['sent_at']]}/{Path(attachment.artifact_path).name}")
+            self.assertFalse(any(part.origin == 'auto_note' and 'Attachment synced' in (part.text or '')
+                for part in message.parts))
             self.assertEqual(self.remote_files[attachment.artifact_path], f'Unparsed original {number}'.encode())
         self.assertTrue(all(not path.exists() for path in self.staged))
         self.assertEqual(self.provider.requests, [])
@@ -214,11 +216,11 @@ class DesktopAttachmentImportTests(BusinessTestCase):
         self.provider.responses.append(ProviderResponse(final_text='I can inspect the selected report.'))
         await self.runtime.run_turn(session_id=self.session, user_display_name='Alex',
             incoming_message=ConversationMessage.user_text('Read the first report.'))
-        presented = '\n'.join(part.text or '' for message in self.provider.requests[-1]['messages']
-            for part in message.parts if part.origin == 'auto_note')
+        presented = '\n'.join(attachment_description(part) for message in self.provider.requests[-1]['messages']
+            for part in message.parts if part.kind == PartKind.FILE)
         for remote_path in expected_paths.values():
             self.assertIn(remote_path.removeprefix('/remote/'), presented)
-        self.assertIn('paths relative to workspace', presented)
+        self.assertNotIn('/remote/', presented)
 
     async def test_disabled_remote_and_limits_preserve_sources_without_transfer_or_interpretation(self):
         (self.bundle / 'notes.txt').write_bytes(b'Undisclosed contents')

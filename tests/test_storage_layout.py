@@ -133,8 +133,8 @@ class StorageLayoutTests(BusinessTestCase):
         attachment = next(part for part in stored.parts if part.kind == PartKind.FILE)
         self.assertEqual(attachment.artifact_path, remote_path)
         self.assertTrue(attachment.remote_sync)
-        self.assertIn('paths relative to workspace', stored.parts[0].text)
-        self.assertIn('2026-04-30/report_0123456789abcdef.txt', stored.parts[0].text)
+        self.assertEqual(attachment.workspace_path, '2026-04-30/report_0123456789abcdef.txt')
+        self.assertEqual(len(stored.parts), 1, 'A synced file owns its usable path without a duplicate text note')
         self.assertEqual(RemoteWorkspaceClient(config).session_paths(self.session), remote.session_paths(self.session))
 
     async def test_remote_fetch_stages_in_temp_artifacts(self):

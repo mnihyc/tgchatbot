@@ -67,13 +67,13 @@ class ToolAttributionWorkflows(BusinessTestCase):
         self.assertFalse(any(text.startswith('[Message provenance:') for text in texts),
             'The tool observation is identified by the function, not an invented participant.')
         image_label = next(text for text in texts if text.startswith('[Original image evidence:'))
-        self.assertIn('telegram:user:7', image_label)
+        self.assertIn('person_id:7', image_label)
         self.assertIn('2026-09-13T00:00:20+08:00', image_label)
         result = response['response']['result']['messages'][0]
-        self.assertEqual(result['speaker']['id'], 'telegram:user:7')
+        self.assertEqual(result['speaker']['id'], 'person_id:7')
         self.assertEqual(result['fragments'][0]['text'], literal)
         self.assertEqual([part['inlineData']['data'] for part in response['parts']], [pixels])
         peer_labels = [part['text'] for content in wire[0]['contents'] for part in content['parts']
             if 'text' in part and part['text'].startswith('[Message provenance:')]
-        self.assertTrue(any('telegram:user:8' in label and '"kind": "bot"' in label for label in peer_labels))
+        self.assertTrue(any('person_id:8' in label and '"kind": "bot"' in label for label in peer_labels))
         self.assertEqual((await self.store.read_messages(self.session, [source.db_id]))[0].message, original_before)

@@ -8,6 +8,7 @@ import logging
 
 from tgchatbot.config import OpenAIConfig
 from tgchatbot.core.token_estimator import TokenEstimator
+from tgchatbot.domain.attachments import attachment_description
 from tgchatbot.domain.models import ChatMode, ConversationMessage, MessagePart, MessageRole, PartKind, ProviderResponse, SessionSettings, ToolCall, UsageInfo
 from tgchatbot.providers.base import (ControlDescriptor, ProviderCapabilities, ProviderOutcomeError, RequestTokenEstimate,
     estimate_json_schema_tokens, evidence_text, pending_image_tokens, tool_message_evidence)
@@ -386,14 +387,8 @@ class OpenAIResponsesProvider:
                 if encoded and part.mime_type:
                     content_items.append({'type': 'input_image', 'image_url': f'data:{part.mime_type};base64,{encoded}', 'detail': part.detail or 'auto'})
             elif part.kind == PartKind.FILE:
-                descriptor = f"[Attached file: {part.filename or 'file'}"
-                if part.mime_type:
-                    descriptor += f', {part.mime_type}'
-                if part.size_bytes is not None:
-                    descriptor += f', {part.size_bytes} bytes'
-                if part.artifact_path:
-                    descriptor += f', remote_path={part.artifact_path}'
-                descriptor += ']'
+                descriptor = attachment_description(part,
+                    presentation_version=int(message.metadata.get('presentation_version', 1)))
                 content_items.append({'type': text_item_type, 'text': descriptor})
             elif part.kind == PartKind.STICKER:
                 content_items.append({'type': text_item_type, 'text': part.text or '[Sticker]'})

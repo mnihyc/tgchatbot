@@ -6,6 +6,7 @@ possibilities; the conversation agent judges the actual words and visual evidenc
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from itertools import zip_longest
@@ -31,6 +32,10 @@ class StickerIndexEntry:
     @property
     def sticker_id(self):
         return self.asset.asset_id
+
+    @property
+    def agent_id(self):
+        return self.asset.agent_id
 
     @property
     def summary(self):
@@ -131,6 +136,7 @@ class StickerCatalog:
         self._loaded = False
         self._load_lock = asyncio.Lock()
         self.entries_by_id: dict[str, StickerIndexEntry] = {}
+        self.entries_by_reference: dict[str, StickerIndexEntry] = {}
 
     @property
     def loaded(self):
@@ -171,13 +177,28 @@ class StickerCatalog:
                 pack_descriptions=snapshot.pack_descriptions)
             # All derived arrays and row IDs belong to this snapshot. A query retains
             # its own reference even if another query observes a newly activated head.
-            self._index = replacement
-            self.entries_by_id = {a.asset_id: StickerIndexEntry(a, self.sticker_root / a.aliases[0].path,
+            entries = {a.asset_id: StickerIndexEntry(a, self.sticker_root / a.aliases[0].path,
                 snapshot.revision_id) for a in assets if a.aliases}
+            references = {entry.agent_id: entry for entry in entries.values()}
+            self._index = replacement
+            self.entries_by_id = entries
+            self.entries_by_reference = references
             self._loaded = True
 
     def get_by_sticker_id(self, sticker_id):
-        return self.entries_by_id.get(sticker_id)
+        return self.entries_by_id.get(sticker_id) or self.entries_by_reference.get(sticker_id)
+
+    def agent_sticker_id(self, sticker_id):
+        """Project a loaded original's identity; never invent a runtime mapping."""
+        entry = self.get_by_sticker_id(sticker_id)
+        return entry.agent_id if entry else None
+
+    async def aagent_sticker_id(self, sticker_id):
+        """Historical delivery references belong to the persistent catalog too."""
+        reference = self.agent_sticker_id(sticker_id)
+        if reference is not None or self.store is None:
+            return reference
+        return await self.store.agent_sticker_id(sticker_id)
 
     def reset_session(self, session_id):
         self.style_memory.clear(session_id)
@@ -250,7 +271,7 @@ class StickerCatalog:
 
     async def aget_available(self, sticker_id):
         await self.aensure_loaded()
-        entry = self.entries_by_id.get(sticker_id)
+        entry = self.get_by_sticker_id(sticker_id)
         if entry is None:
             return None
         path = await asyncio.to_thread(self._available_path, entry.asset)
@@ -261,21 +282,21 @@ class StickerCatalog:
         parts = []
         for match in matches:
             entry = match.entry
-            origin = 'sticker_candidate:' + entry.sticker_id
+            origin = 'sticker_candidate:' + entry.agent_id
             try:
                 prepared = await asyncio.to_thread(prepare_media, entry.absolute_path, self.media_config)
                 if prepared.content_hash != entry.asset.content_hash:
                     raise ValueError('asset bytes changed')
-                label = f'Candidate {entry.sticker_id}; animated={prepared.facts["animated"]}'
+                label = f'Candidate {entry.agent_id}; animated={prepared.facts["animated"]}'
                 if prepared.facts['animated']:
                     label += f'; sampled frame times: {prepared.facts["frame_times_s"]} seconds; intermediate animation events may be omitted.'
                 parts.append(MessagePart(kind=PartKind.TEXT, text=label, origin=origin, remote_sync=False))
                 for frame in prepared.frames:
                     parts.append(MessagePart(kind=PartKind.IMAGE, data_b64=frame.data_b64,
-                        mime_type=frame.mime_type, text=f'{entry.sticker_id} at {frame.timestamp_s:g}s',
+                        mime_type=frame.mime_type, text=f'{entry.agent_id} at {frame.timestamp_s:g}s',
                         origin=origin, remote_sync=False))
             except (OSError, ValueError, FFmpegError) as exc:
-                parts.append(MessagePart(kind=PartKind.TEXT, text=f'Candidate {entry.sticker_id}: '
+                parts.append(MessagePart(kind=PartKind.TEXT, text=f'Candidate {entry.agent_id}: '
                     f'visual evidence unavailable ({type(exc).__name__}); description only.', origin=origin, remote_sync=False))
         return parts
 
@@ -313,7 +334,12 @@ class StickerCatalog:
         rankings, best_reading, channel_members = [], {}, {}
         # An asset ID identifies one original. A caption is only a meaning hint;
         # it must not bypass the conversational intent when vectors are available.
-        known_id = [i for i, asset in enumerate(index.assets) if asset.asset_id == plan.intent_core]
+        known_id = [i for i, asset in enumerate(index.assets)
+                    if plan.intent_core in (asset.asset_id, asset.agent_id)]
+        if not known_id and re.fullmatch(r'sid:[1-9][0-9]*', plan.intent_core):
+            # A stale/unknown reference is still an exact lookup, never a
+            # semantic request for a different original or a matching caption.
+            return []
         literal = ' '.join((plan.text_hint or plan.intent_core).casefold().split())
         exact = {i for i in allowed if literal and
                  ' '.join((index.assets[i].card or {}).get('caption', '').casefold().split()) == literal}
@@ -436,7 +462,7 @@ class StickerCatalog:
             channel_members['literal'] = exact
         selected = _interleave(*rankings)
         result = []
-        delivered_vectors = [(a.asset_id, a.image_vector) for a in index.assets
+        delivered_vectors = [(a.asset_id, a.agent_id, a.image_vector) for a in index.assets
             if index.recipe.get('visual_embedding_source') != 'description'
             and a.asset_id in recent and a.image_vector is not None]
         for i in selected:
@@ -445,7 +471,7 @@ class StickerCatalog:
             if verified_path is None:
                 continue
             readings = asset.card.get('readings') or []
-            similar = tuple(asset_id for asset_id, vector in delivered_vectors if asset_id != asset.asset_id
+            similar = tuple(agent_id for asset_id, agent_id, vector in delivered_vectors if asset_id != asset.asset_id
                 and asset.image_vector is not None and float(asset.image_vector @ vector) >= self.config.near_duplicate_similarity)
             result.append(StickerMatch(StickerIndexEntry(asset, verified_path, index.revision_id),
                 tuple(name for name, members in channel_members.items() if i in members),

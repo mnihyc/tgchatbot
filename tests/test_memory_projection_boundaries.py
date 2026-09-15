@@ -97,7 +97,7 @@ class MemoryProjectionBoundaryTests(BusinessTestCase):
             self.assertNotIn(generated, json.dumps(record, ensure_ascii=False))
             self.assertNotIn('partial', record, 'Selecting the full canonical body is a complete read despite omitted provenance')
             self.assertNotIn('next_offset', record)
-            self.assertEqual(record['speaker']['id'], 'telegram:user:101')
+            self.assertEqual(record['speaker']['id'], 'person_id:101')
         self.assertEqual(read['messages'], search['messages'])
         reopened = await self.new_store()
         original = (await reopened.read_messages(self.session, [source.db_id]))[0]

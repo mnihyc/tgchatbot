@@ -325,8 +325,6 @@ async def _sync_import_attachment(message: ConversationMessage, record: dict[str
                 synced = await sync_attachment_parts(session_id, [pending], remote_workspace,
                     sent_at=message.metadata.get('sent_at'))
             descriptor = next(part for part in synced if part.kind == PartKind.FILE)
-            # Keep the shared live workflow's account of the upload.
-            message.parts.extend(part for part in synced if part.kind == PartKind.TEXT)
         except OSError:
             descriptor.detail = 'remote copy unavailable: exported file could not be read'
     message.parts = [part for part in message.parts

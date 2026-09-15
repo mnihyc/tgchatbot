@@ -400,11 +400,14 @@ class RemoteWorkspaceClient:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        stdout_capture: dict[str, bool] = {}
+        stderr_capture: dict[str, bool] = {}
         try:
             stdout, stderr, _ = await asyncio.wait_for(asyncio.gather(
                 self._read_output(proc.stdout, None if full_stdout else
-                    self.ssh.max_stdout_chars if stdout_limit is None else stdout_limit),
-                self._read_output(proc.stderr, self.ssh.max_stderr_chars),
+                    self.ssh.max_stdout_chars if stdout_limit is None else stdout_limit,
+                    capture=stdout_capture),
+                self._read_output(proc.stderr, self.ssh.max_stderr_chars, capture=stderr_capture),
                 proc.wait()), timeout=timeout_s + self.ssh.connect_timeout_s)
         except asyncio.CancelledError:
             with contextlib.suppress(ProcessLookupError):
@@ -423,26 +426,41 @@ class RemoteWorkspaceClient:
             'stdout': stdout,
             'stderr': stderr,
         }
+        for channel, capture in (('stdout', stdout_capture), ('stderr', stderr_capture)):
+            if capture.get('truncated'):
+                result[f'{channel}_truncated'] = True
         level = logger.info if result['ok'] else logger.warning
         level('remote.exec.done rc=%s stdout=%s stderr=%s', result['returncode'], len(result['stdout']), len(result['stderr']))
         return result
 
     @staticmethod
-    async def _read_output(stream: asyncio.StreamReader, limit: int | None) -> str:
+    async def _read_output(stream: asyncio.StreamReader, limit: int | None, *,
+                           capture: dict[str, bool] | None = None) -> str:
         decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
         kept: list[str] = []
         remaining = None if limit is None else max(0, limit)
+        truncated = False
         while chunk := await stream.read(64 * 1024):
+            if remaining == 0:
+                truncated = True
+                continue
+            decoded = decoder.decode(chunk)
             if remaining is None:
-                kept.append(decoder.decode(chunk))
-            elif remaining:
-                text = decoder.decode(chunk)[:remaining]
-                kept.append(text)
+                kept.append(decoded)
+            else:
+                text = decoded[:remaining]
+                if text:
+                    kept.append(text)
                 remaining -= len(text)
+                truncated = truncated or len(text) < len(decoded)
+        final = decoder.decode(b'', final=True)
         if remaining is None:
-            kept.append(decoder.decode(b'', final=True))
-        elif remaining:
-            kept.append(decoder.decode(b'', final=True)[:remaining])
+            kept.append(final)
+        else:
+            kept.append(final[:remaining])
+            truncated = truncated or len(final) > remaining
+        if capture is not None:
+            capture['truncated'] = truncated
         return ''.join(kept)
 
     async def _terminate_process(self, proc: asyncio.subprocess.Process) -> None:

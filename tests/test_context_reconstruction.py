@@ -72,7 +72,12 @@ class ContextReconstructionTests(BusinessTestCase):
             if row.message.metadata.get('tool_phase') == 'result')
         self.assertEqual([item['workspace_path'] for item in prepared['prepared_files']],
             [paths[1]] if partial_preparation else paths)
-        expected_records = [arguments, prepared, *receipts]
+        self.assertEqual([row.message.metadata['tool_payload'] for row in original_rows
+            if row.message.metadata.get('tool_phase') == 'delivery'], receipts,
+            'Original delivery receipts retain transport IDs for audit.')
+        visible_receipts = [{'filename': 'report.txt', 'workspace_path': path, 'status': status,
+            **({'error': 'BadRequest'} if status == 'failed' else {})} for path, status in expected_deliveries]
+        expected_records = [arguments, prepared, *visible_receipts]
         requests = []
 
         def assert_file_records(request):

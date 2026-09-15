@@ -18,10 +18,9 @@ class PythonExecTool:
         self.spec = ToolSpec(
             name='python_exec',
             description=(
-                'Run Python 3 code in this chat\'s persistent remote workspace for structured analysis and file transformations. '
-                'The working directory is TGCHATBOT_SESSION_DIR; synced files are referenced relative to it under YYYY-MM-DD/. '
-                'Use dated or custom subfolders for new files. Files may be overwritten. '
-                'Print useful results. Producing a file does not send it; use file_send when needed.'
+                'Run Python 3 in this chat\'s persistent workspace (TGCHATBOT_SESSION_DIR) for analysis and file transformations. '
+                'Attachment paths are relative to this directory, under YYYY-MM-DD/. '
+                'Use dated or custom folders for new files. Print useful results; use file_send to deliver files.'
             ),
             parameters_schema={
                 'type': 'object',
@@ -70,5 +69,6 @@ class PythonExecTool:
                 'returncode': result['returncode'],
                 'stdout': result['stdout'],
                 'stderr': result['stderr'],
+                **{key: result[key] for key in ('stdout_truncated', 'stderr_truncated') if result.get(key)},
             },
         )

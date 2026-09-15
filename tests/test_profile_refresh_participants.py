@@ -10,6 +10,7 @@ from psycopg.errors import QueryCanceled
 from tests.business_helpers import BusinessTestCase
 from tgchatbot.core.memory import MemoryService
 from tgchatbot.core.runtime import AgentRuntime
+from tgchatbot.domain.identities import canonical_actor_id
 from tgchatbot.domain.models import ConversationMessage, MessageRole
 from tgchatbot.storage.postgres_store import StaleScopeError
 
@@ -43,6 +44,7 @@ class ProfileRefreshParticipantTests(BusinessTestCase):
     async def test_prepare_after_all_humans_compacted_keeps_named_profiles_warm_and_cold(self):
         first = await self.original(1, 'telegram:user:101', name='Person A')
         second = await self.original(2, 'telegram:user:102', name='Person B')
+        canonical_before = await self.store.read_messages(self.session, [first.db_id, second.db_id])
         fact_ids = {}
         for source, actor, claim in ((first, 'telegram:user:101', 'Prefers tea'),
                                      (second, 'telegram:user:102', 'Prefers coffee')):
@@ -55,10 +57,10 @@ class ProfileRefreshParticipantTests(BusinessTestCase):
         await self.runtime.record_assistant_text(session_id=self.session, text='Done.')
         await self.runtime.prepare_context(session_id=self.session)
         args, warm = await self.latest_refresh()
-        self.assertEqual(args['actor_ids'], ['telegram:user:102', 'telegram:user:101'])
-        self.assertEqual({p['actor_id']: p['identity']['actor_name'] for p in warm['profiles']},
+        self.assertEqual([canonical_actor_id(actor) for actor in args['actor_ids']], ['telegram:user:102', 'telegram:user:101'])
+        self.assertEqual({canonical_actor_id(p['actor_id']): p['identity']['actor_name'] for p in warm['profiles']},
             {'telegram:user:101': 'Person A', 'telegram:user:102': 'Person B', 'agent': None})
-        self.assertEqual({p['actor_id']: [fact['fact_id'] for fact in p['facts']] for p in warm['profiles']},
+        self.assertEqual({canonical_actor_id(p['actor_id']): [fact['fact_id'] for fact in p['facts']] for p in warm['profiles']},
             {'telegram:user:101': [fact_ids['telegram:user:101']],
              'telegram:user:102': [fact_ids['telegram:user:102']], 'agent': []})
         # A later tool-only compaction must discover the same original people
@@ -73,7 +75,7 @@ class ProfileRefreshParticipantTests(BusinessTestCase):
         self.assertEqual(cold_args, args)
         self.assertEqual(cold['profiles'], warm['profiles'])
         self.assertEqual([row.message for row in await reopened.read_messages(self.session,
-            [first.db_id, second.db_id])], [first.message, second.message])
+            [first.db_id, second.db_id])], [row.message for row in canonical_before])
         self.assertEqual(self.provider.requests, [])
 
     async def test_recent_original_window_ignores_tool_tail_and_keeps_trigger_priority(self):
@@ -88,12 +90,12 @@ class ProfileRefreshParticipantTests(BusinessTestCase):
             await self.original(10 + number, 'telegram:user:999', synthetic_role='reply_target')
         await self.runtime.prepare_context(session_id=self.session)
         args, _ = await self.latest_refresh()
-        self.assertEqual(args['actor_ids'], ['telegram:user:103', 'telegram:user:102'])
+        self.assertEqual([canonical_actor_id(actor) for actor in args['actor_ids']], ['telegram:user:103', 'telegram:user:102'])
         state = await self.runtime._get_live_state(self.session)
         await self.runtime._refresh_profiles_after_compaction(session_id=self.session, state=state,
             settings=await self.settings(), provider=self.provider, instructions='', tools=[], emit=None, trigger=older)
         args, _ = await self.latest_refresh()
-        self.assertEqual(args['actor_ids'], ['telegram:user:101', 'telegram:user:103', 'telegram:user:102'])
+        self.assertEqual([canonical_actor_id(actor) for actor in args['actor_ids']], ['telegram:user:101', 'telegram:user:103', 'telegram:user:102'])
 
     async def test_reset_and_visibility_boundaries_preserve_explicit_same_chat_reply_only(self):
         await self.original(1, 'telegram:user:201', name='Reply partner')
@@ -116,8 +118,8 @@ class ProfileRefreshParticipantTests(BusinessTestCase):
         await self.compact([first, second])
         await self.runtime.prepare_context(session_id=self.session)
         args, output = await self.latest_refresh()
-        self.assertEqual(args['actor_ids'], ['telegram:user:102', 'telegram:user:101', 'telegram:user:201'])
-        self.assertEqual({p['actor_id'] for p in output['profiles']}, {*args['actor_ids'], 'agent'})
+        self.assertEqual([canonical_actor_id(actor) for actor in args['actor_ids']], ['telegram:user:102', 'telegram:user:101', 'telegram:user:201'])
+        self.assertEqual({canonical_actor_id(p['actor_id']) for p in output['profiles']}, {*(canonical_actor_id(actor) for actor in args['actor_ids']), 'agent'})
         old_scope = await self.store.get_scope(self.session)
         await self.store.reset_context(self.session)
         with self.assertRaises(StaleScopeError):
@@ -127,7 +129,7 @@ class ProfileRefreshParticipantTests(BusinessTestCase):
         await self.compact([fresh])
         await self.runtime.prepare_context(session_id=self.session)
         args, _ = await self.latest_refresh()
-        self.assertEqual(args['actor_ids'], ['telegram:user:401'])
+        self.assertEqual([canonical_actor_id(actor) for actor in args['actor_ids']], ['telegram:user:401'])
         old_scope = await self.store.get_scope(self.session)
         await self.store.reset_full(self.session, self.config.default_session_settings())
         with self.assertRaises(StaleScopeError):

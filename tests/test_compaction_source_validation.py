@@ -8,10 +8,12 @@ from tgchatbot.storage.postgres_store import StaleScopeError
 
 class CompactionSourceValidationTests(BusinessTestCase):
     async def original(self, session, number, text, **metadata):
-        return await self.store.append_message(session, ConversationMessage.user_text(text, metadata={
+        stored = await self.store.append_message(session, ConversationMessage.user_text(text, metadata={
             'source': 'telegram', 'source_chat_id': session.split(':', 1)[1],
             'source_message_id': str(number), 'actor_id': 'telegram:user:101',
             'actor_kind': 'user', 'actor_name': 'Participant', **metadata}))
+        # Capture the canonical evidence before any attempted publication.
+        return (await self.store.read_messages(session, [stored.db_id]))[0]
 
     async def test_unavailable_or_changed_evidence_cannot_partially_publish_a_summary(self):
         cases = ('missing_id', 'hidden', 'deleted', 'other_chat', 'old_context',

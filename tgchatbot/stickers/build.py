@@ -112,6 +112,8 @@ class CatalogBuilder:
             if not root.is_dir():
                 raise ValueError('Sticker source directory does not exist')
             snapshot = await self.store.load_snapshot()
+            if any(identity.startswith('sid:') for identity in regenerate_ids):
+                regenerate_ids = await self.store.resolve_asset_ids(list(regenerate_ids))
             previous = {asset.asset_id: asset for asset in snapshot.assets}
             inventory: dict[str, list[CatalogAlias]] = {}
             paths = {}
@@ -278,7 +280,7 @@ class CatalogBuilder:
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path, help='Original sticker directory (default: APP_DATA_DIR/stickers)')
-    parser.add_argument('--asset-id', action='append', default=[], help='Regenerate this content ID; may repeat')
+    parser.add_argument('--asset-id', action='append', default=[], help='Regenerate this content ID or sid reference; may repeat')
     parser.add_argument('--file', action='append', default=[], help='Regenerate this exact relative file alias; may repeat')
     parser.add_argument('--pack', action='append', default=[], help='Regenerate this exact pack; may repeat')
     parser.add_argument('--corrections', type=Path, help='JSON object keyed by asset ID; replaces explicit correction records')

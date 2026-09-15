@@ -39,7 +39,7 @@ class StickerReviewWorkflows(unittest.IsolatedAsyncioTestCase):
                 'compatibility': {'harshness_level': 0, 'intimacy_level': 0, 'meme_dependence_level': 0}}
         asset = CatalogAsset('sha256:' + digest, digest, (CatalogAlias(path.name, pack),),
             {'animated': animated}, card, {'family_ids': list(family)}, card, {},
-            np.array(image, dtype=np.float32), np.array([reading], dtype=np.float32))
+            np.array(image, dtype=np.float32), np.array([reading], dtype=np.float32), sticker_number=position + 1)
         self.assets.append(asset)
         return asset
 
@@ -49,7 +49,7 @@ class StickerReviewWorkflows(unittest.IsolatedAsyncioTestCase):
         self.embeddings.embed_query.side_effect = RuntimeError('Embedding provider unavailable')
         result = await StickerQueryTool(self.catalog).run({'intent_core': '好好 休息'}, self.ctx)
         self.assertTrue(result.output['ok'])
-        self.assertEqual([item['sticker_id'] for item in result.output['candidates']], [selected.asset_id])
+        self.assertEqual([item['sticker_id'] for item in result.output['candidates']], [selected.agent_id])
         self.assertEqual(result.output['candidates'][0]['caption'], '好好\n休息')
         self.embeddings.embed_query.assert_not_awaited()
         self.assertTrue(result.evidence_parts)
@@ -57,9 +57,9 @@ class StickerReviewWorkflows(unittest.IsolatedAsyncioTestCase):
     async def test_exact_content_identity_needs_no_embedding_request(self):
         selected = self.asset('Greeting', [1, 0, 0], [1, 0, 0])
         self.embeddings.enabled = False
-        result = await StickerQueryTool(self.catalog).run({'intent_core': selected.asset_id}, self.ctx)
+        result = await StickerQueryTool(self.catalog).run({'intent_core': selected.agent_id}, self.ctx)
         self.assertTrue(result.output['ok'])
-        self.assertEqual(result.output['candidates'][0]['sticker_id'], selected.asset_id)
+        self.assertEqual(result.output['candidates'][0]['sticker_id'], selected.agent_id)
         self.embeddings.embed_query.assert_not_awaited()
 
     async def test_two_candidate_budget_keeps_global_and_requested_family_with_two_vector_channels(self):
@@ -68,10 +68,10 @@ class StickerReviewWorkflows(unittest.IsolatedAsyncioTestCase):
         familiar = self.asset('Familiar fitting variant', [.6, .8, 0], [.6, .8, 0], family=['round-cat'])
         result = await StickerQueryTool(self.catalog).run({'intent_core': 'Express welcome',
             'preferred_character_family': 'round-cat', 'candidate_budget': 2}, self.ctx)
-        self.assertEqual([item['sticker_id'] for item in result.output['candidates']], [global_reading.asset_id, familiar.asset_id])
+        self.assertEqual([item['sticker_id'] for item in result.output['candidates']], [global_reading.agent_id, familiar.agent_id])
         single = await StickerQueryTool(self.catalog).run({'intent_core': 'Express welcome',
             'preferred_character_family': 'round-cat', 'candidate_budget': 1}, self.ctx)
-        self.assertEqual(single.output['candidates'][0]['sticker_id'], global_reading.asset_id)
+        self.assertEqual(single.output['candidates'][0]['sticker_id'], global_reading.agent_id)
 
     async def test_strict_nullable_advanced_controls_do_not_erase_explicit_animation_and_pack(self):
         selected = self.asset('Animated acknowledgement', [1, 0, 0], [1, 0, 0], pack='familiar', animated=True)
@@ -83,7 +83,7 @@ class StickerReviewWorkflows(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan.prefer_pack, 'familiar')
         result = await StickerQueryTool(self.catalog).run(payload, self.ctx)
         self.assertTrue(result.output['ok'])
-        self.assertEqual(result.output['candidates'][0]['sticker_id'], selected.asset_id)
+        self.assertEqual(result.output['candidates'][0]['sticker_id'], selected.agent_id)
 
     async def test_null_advanced_groups_preserve_explicit_compatibility_exclusions(self):
         self.asset('A caption', [1, 0, 0], [1, 0, 0])

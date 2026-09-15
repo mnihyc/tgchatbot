@@ -47,7 +47,7 @@ class MemoryInspectionWorkflowTests(BusinessTestCase):
                 message_ids=[original.db_id], offset=first['messages'][0]['next_offset'])
         self.assertEqual(first['messages'][0]['fragments'][0]['text'] +
             next_page['messages'][0]['fragments'][0]['text'], 'Cobalt suitcase with a green handle.')
-        self.assertEqual(first['messages'][0]['speaker']['id'], 'telegram:user:7')
+        self.assertEqual(first['messages'][0]['speaker']['id'], 'person_id:7')
         await self.store.reset_full(self.session, self.config.default_session_settings())
         empty = await query_memory(self.store, self.config, None, self.session, query='Cobalt', lexical_only=True)
         self.assertEqual(empty['matches'], [])

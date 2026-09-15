@@ -32,8 +32,13 @@ class _PreviewHTMLParser(HTMLParser):
         self.title_parts: list[str] = []
         self.description: str | None = None
         self.body_text: list[str] = []
+        self.excluded_tag: str | None = None
 
     def handle_starttag(self, tag: str, attrs):
+        tag = tag.lower()
+        if tag in {'script', 'style'}:
+            self.excluded_tag = tag
+            return
         attrs = {k.lower(): (v or '') for k, v in attrs}
         if tag.lower() == 'title':
             self.in_title = True
@@ -46,10 +51,14 @@ class _PreviewHTMLParser(HTMLParser):
                     self.description = content
 
     def handle_endtag(self, tag: str):
+        if tag.lower() == self.excluded_tag:
+            self.excluded_tag = None
         if tag.lower() == 'title':
             self.in_title = False
 
     def handle_data(self, data: str):
+        if self.excluded_tag:
+            return
         text = _normalize(data)
         if not text:
             return
@@ -195,7 +204,7 @@ def previews_to_parts(previews: list[LinkPreviewData], *, mode: str) -> list[Mes
             lines.append(f'Title: {preview.title}')
         if preview.description:
             lines.append(f'Description: {preview.description}')
-        if mode == 'snippet' and preview.snippet:
+        if mode == 'snippet' and preview.snippet and preview.snippet != preview.description:
             lines.append(f'Snippet: {preview.snippet}')
         parts.append(MessagePart(kind=PartKind.TEXT, text='\n'.join(lines), remote_sync=False, origin='auto_note'))
     return parts

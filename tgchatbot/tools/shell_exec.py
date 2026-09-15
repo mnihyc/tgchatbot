@@ -18,11 +18,10 @@ class ShellExecTool:
         self.spec = ToolSpec(
             name='shell_exec',
             description=(
-                'Run POSIX sh commands in this chat\'s persistent remote workspace for file inspection and command-line tasks. '
-                'The working directory is the session root. '
-                'TGCHATBOT_SESSION_DIR is the root; synced files are referenced relative to it under YYYY-MM-DD/. '
-                'Use dated or custom subfolders for new files. Files may be overwritten. '
-                'Inspect stdout, stderr and returncode; use file_send for files the user should receive.'
+                'Run POSIX sh in this chat\'s persistent workspace (TGCHATBOT_SESSION_DIR). '
+                'Attachment paths are relative to this directory, under YYYY-MM-DD/. '
+                'Use dated or custom folders for new files. Inspect stdout, stderr and returncode; '
+                'use file_send to deliver files.'
             ),
             parameters_schema={
                 'type': 'object',
@@ -67,5 +66,6 @@ class ShellExecTool:
                 'returncode': result['returncode'],
                 'stdout': result['stdout'],
                 'stderr': result['stderr'],
+                **{key: result[key] for key in ('stdout_truncated', 'stderr_truncated') if result.get(key)},
             },
         )

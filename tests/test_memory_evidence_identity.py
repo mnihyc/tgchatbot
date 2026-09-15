@@ -63,7 +63,7 @@ class MemoryEvidenceIdentityTests(BusinessTestCase):
         self.assertEqual(result['matches'], [{'message_ids': [source.db_id]}])
         self.assertEqual(excerpt['spans'], [span])
         self.assertEqual(len(result['messages']), 1)
-        self.assertEqual(result['messages'][0]['speaker']['id'], 'telegram:user:101')
+        self.assertEqual(result['messages'][0]['speaker']['id'], 'person_id:101')
         self.assertEqual(result['messages'][0]['fragments'], [{'offset': 0, 'text': message_body(source.message)}])
         read = await self.tool('memory_read', result['matches'][0])
         self.assertEqual(read['messages'], result['messages'])
@@ -127,8 +127,8 @@ class MemoryEvidenceIdentityTests(BusinessTestCase):
         read = await self.tool('memory_read', {'message_ids': [source.db_id for source in sources]})
         self.assertEqual(read['messages'], result['messages'])
         identities = {row['message_id']: row['speaker']['id'] for row in read['messages']}
-        self.assertEqual(identities, {sources[0].db_id: 'telegram:user:101',
-            sources[1].db_id: 'telegram:user:102', sources[2].db_id: 'telegram:user:101'})
+        self.assertEqual(identities, {sources[0].db_id: 'person_id:101',
+            sources[1].db_id: 'person_id:102', sources[2].db_id: 'person_id:101'})
 
     async def test_question_answer_context_remains_distinct_from_lexical_question(self):
         question = await self.original('Where did the cobalt key go?', 1)
@@ -142,7 +142,7 @@ class MemoryEvidenceIdentityTests(BusinessTestCase):
         self.assertEqual([row['message_id'] for row in result['messages']], [question.db_id, answer.db_id])
         self.assertEqual([row['fragments'] for row in result['messages']],
             [[{'offset': 0, 'text': message_body(source.message)}] for source in (question, answer)])
-        self.assertEqual([row['speaker']['id'] for row in result['messages']], ['telegram:user:101', 'telegram:user:102'])
+        self.assertEqual([row['speaker']['id'] for row in result['messages']], ['person_id:101', 'person_id:102'])
 
     async def test_duplicate_semantic_representation_cannot_outvote_independent_lexical_support(self):
         repeated = await self.original('The key is in a drawer.', 1)

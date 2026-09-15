@@ -8,6 +8,7 @@ import httpx
 
 from tgchatbot.config import GeminiConfig
 from tgchatbot.core.token_estimator import TokenEstimator
+from tgchatbot.domain.attachments import attachment_description
 from tgchatbot.domain.models import ConversationMessage, MessagePart, MessageRole, PartKind, ProviderResponse, SessionSettings, ToolCall, UsageInfo
 from tgchatbot.providers.base import (ControlDescriptor, ProviderCapabilities, ProviderOutcomeError, RequestTokenEstimate,
     estimate_json_schema_tokens, evidence_text, pending_image_tokens, tool_message_evidence)
@@ -557,7 +558,7 @@ class GeminiProvider:
                 return [{'role': 'model', 'parts': [part]}]
             if (provider_name == self.name or framework_refresh or portable_evidence) and phase == 'result' and message.name:
                 return self._tool_result_items(ToolCall(message.name, str(payload.get('call_id') or ''), {}),
-                    payload.get('output') or {}, tool_message_evidence(message), allow_images=tool_images)
+                    payload.get('output') or {}, tool_message_evidence(message, images=tool_images), allow_images=tool_images)
         role = 'model' if message.role in {MessageRole.ASSISTANT, MessageRole.TOOL} else 'user'
         parts: list[dict[str, Any]] = []
         for part in message.parts:
@@ -568,14 +569,8 @@ class GeminiProvider:
                 if encoded and part.mime_type:
                     parts.append({'inlineData': {'mimeType': part.mime_type, 'data': encoded}})
             elif part.kind == PartKind.FILE:
-                descriptor = f"[Attached file: {part.filename or 'file'}"
-                if part.mime_type:
-                    descriptor += f', {part.mime_type}'
-                if part.size_bytes is not None:
-                    descriptor += f', {part.size_bytes} bytes'
-                if part.artifact_path:
-                    descriptor += f', remote_path={part.artifact_path}'
-                descriptor += ']'
+                descriptor = attachment_description(part,
+                    presentation_version=int(message.metadata.get('presentation_version', 1)))
                 parts.append({'text': descriptor})
             elif part.kind == PartKind.STICKER:
                 parts.append({'text': part.text or '[Sticker]'})

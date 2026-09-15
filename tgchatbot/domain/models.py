@@ -87,6 +87,7 @@ class MessagePart:
     remote_sync: bool = True
     origin: str | None = None
     preview_ref: str | None = None
+    workspace_path: str | None = None
 
 
 @dataclass(slots=True)

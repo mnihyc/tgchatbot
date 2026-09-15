@@ -9,7 +9,11 @@ from collections.abc import Mapping
 
 from tgchatbot.domain.models import ConversationMessage, MessagePart, MessageRole, PartKind
 from tgchatbot.domain.profiles import present_profile
+from tgchatbot.domain.identities import actor_reference
+from tgchatbot.domain.attachments import attachment_description, generated_attachment_reference
 from tgchatbot.domain.timestamps import format_timestamp_fields, resolve_timezone
+
+AGENT_PRESENTATION_VERSION = 2
 
 
 def utc_time(value: Any) -> str | None:
@@ -101,6 +105,121 @@ def present_attribution(record: Mapping[str, Any], timezone: str | None = None) 
     return result
 
 
+def _related_actor(value: Mapping[str, Any], *, chat: bool = False) -> dict[str, Any]:
+    """Keep source identity, not Telegram account or download capabilities."""
+    if any(key in value for key in ('actor_id', 'actor_name', 'actor_username')):
+        return {key: actor_reference(item) if key == 'actor_id' else item
+                for key, item in value.items() if key in
+                {'actor_id', 'actor_kind', 'actor_name', 'actor_username'}
+                and item is not None and not (key == 'actor_kind' and item == 'user')}
+    result = {}
+    if value.get('id') is not None:
+        result['actor_id'] = ('chat_id:' if chat else 'person_id:') + str(value['id'])
+    name = value.get('title') if chat else ' '.join(str(value[key]) for key in ('first_name', 'last_name') if value.get(key))
+    if name:
+        result['actor_name'] = name
+    if value.get('username'):
+        result['actor_username'] = value['username']
+    if chat:
+        result['actor_kind'] = 'chat'
+    elif value.get('is_bot'):
+        result['actor_kind'] = 'bot'
+    return result
+
+
+def _forward_origin(origin: Mapping[str, Any]) -> dict[str, Any]:
+    result = {key: origin[key] for key in ('type', 'date', 'forwarded_date', 'message_id',
+              'forwarded_message_id', 'author_signature', 'saved_from') if origin.get(key) is not None}
+    if any(key in origin for key in ('actor_id', 'actor_name', 'actor_username')):
+        result['actor'] = _related_actor(origin)
+    for key in ('sender_user', 'sender_chat', 'chat'):
+        if isinstance(origin.get(key), Mapping):
+            result['actor'] = _related_actor(origin[key], chat=key != 'sender_user')
+            break
+    if origin.get('sender_user_name'):
+        # Hidden authors have a display name, not an inferred Telegram identity.
+        result['actor'] = {'actor_name': origin['sender_user_name']}
+    return result
+
+
+def _external_reply(external: Mapping[str, Any]) -> dict[str, Any]:
+    result = {key: external[key] for key in ('message_id', 'has_media_spoiler')
+              if external.get(key) is not None}
+    if isinstance(external.get('origin'), Mapping):
+        result['origin'] = _forward_origin(external['origin'])
+    if isinstance(external.get('chat'), Mapping):
+        result['chat'] = _related_actor(external['chat'], chat=True)
+    if isinstance(external.get('link_preview_options'), Mapping) and external['link_preview_options'].get('url'):
+        result['url'] = external['link_preview_options']['url']
+    # External attachments are references, not remotely synced originals. Keep
+    # their meaningful descriptions without presenting unusable download IDs.
+    attachments = []
+    for kind in ('animation', 'audio', 'document', 'photo', 'sticker', 'video', 'video_note', 'voice'):
+        value = external.get(kind)
+        if not value:
+            continue
+        item = {'kind': kind}
+        if isinstance(value, Mapping):
+            item.update({key: value[key] for key in ('file_name', 'mime_type', 'file_size',
+                'width', 'height', 'duration', 'title', 'performer', 'emoji', 'set_name',
+                'is_animated', 'is_video') if value.get(key) is not None})
+        attachments.append(item)
+    if attachments:
+        result['attachments'] = attachments
+    fields = {
+        'contact': ('phone_number', 'first_name', 'last_name'),
+        'dice': ('emoji', 'value'), 'game': ('title', 'description', 'text'),
+        'giveaway': ('winners_selection_date', 'winner_count', 'country_codes', 'prize_description',
+                     'premium_subscription_month_count', 'prize_star_count'),
+        'giveaway_winners': ('winner_count', 'unclaimed_prize_count', 'prize_description'),
+        'invoice': ('title', 'description', 'currency', 'total_amount'),
+        'location': ('latitude', 'longitude', 'horizontal_accuracy'),
+        'poll': ('question', 'type', 'is_closed', 'allows_multiple_answers', 'explanation'),
+        'venue': ('title', 'address'),
+    }
+    for key, names in fields.items():
+        value = external.get(key)
+        if isinstance(value, Mapping):
+            result[key] = {name: value[name] for name in names if value.get(name) is not None}
+            if key == 'poll' and value.get('options'):
+                result[key]['options'] = [option['text'] for option in value['options'] if 'text' in option]
+            if key == 'venue' and isinstance(value.get('location'), Mapping):
+                result[key]['location'] = {name: value['location'][name] for name in fields['location']
+                    if value['location'].get(name) is not None}
+    return result
+
+
+def _reply_quote(quote: Mapping[str, Any]) -> dict[str, Any]:
+    result = {key: quote[key] for key in ('text', 'position', 'is_manual') if quote.get(key) is not None}
+    if quote.get('entities'):
+        result['entities'] = []
+        for entity in quote['entities']:
+            item = {key: entity[key] for key in ('type', 'offset', 'length', 'url', 'language')
+                    if entity.get(key) is not None}
+            if isinstance(entity.get('user'), Mapping):
+                item['actor'] = _related_actor(entity['user'])
+            result['entities'].append(item)
+    return result
+
+
+def agent_attribution(record: Mapping[str, Any], timezone: str | None = None) -> dict[str, Any]:
+    """Project new application-owned evidence only; recorded exchanges stay exact."""
+    result = dict(record)
+    if isinstance(result.get('actor_id'), str):
+        result['actor_id'] = actor_reference(result['actor_id'])
+    if isinstance(result.get('speaker'), Mapping):
+        result['speaker'] = {**result['speaker'], 'id': actor_reference(result['speaker']['id'])}
+    if isinstance(result.get('reply_to_actor'), Mapping):
+        result['reply_to_actor'] = _related_actor(result['reply_to_actor'])
+    if isinstance(result.get('forward_origin'), Mapping):
+        result['forward_origin'] = _forward_origin(result['forward_origin'])
+    if isinstance(result.get('external_reply'), Mapping):
+        result['external_reply'] = _external_reply(result['external_reply'])
+    if isinstance(result.get('quote'), Mapping):
+        result['quote'] = _reply_quote(result['quote'])
+    return present_attribution(result, timezone)
+
+
 def present_tool_output(name: str, output: Mapping[str, Any], timezone: str | None = None) -> dict[str, Any]:
     """Project the defined timestamp fields of app-owned memory tool results."""
     result = dict(output)
@@ -115,7 +234,8 @@ def present_tool_output(name: str, output: Mapping[str, Any], timezone: str | No
     return result
 
 
-def present_image_evidence(part: MessagePart, timezone: str | None = None) -> MessagePart:
+def present_image_evidence(part: MessagePart, timezone: str | None = None, *,
+                           presentation_version: int = 1) -> MessagePart:
     """Project the app-owned image label; literal document/user text stays untouched."""
     prefix = '[Original image evidence: '
     if (part.kind != PartKind.TEXT or not (part.origin or '').startswith('memory_image:')
@@ -127,6 +247,11 @@ def present_image_evidence(part: MessagePart, timezone: str | None = None) -> Me
         return part
     if not isinstance(record, dict):
         return part
+    if presentation_version >= 2:
+        identity = message_evidence(record, message_id=record.get('message_id'), role=None,
+            fragments=[], total_characters=0, timezone=timezone, presentation_version=presentation_version)
+        identity.pop('fragments')
+        record = {'image_id': record['image_id'], **identity}
     return replace(part, text=prefix + json.dumps(present_attribution(record, timezone),
         ensure_ascii=False, default=str) + ']')
 
@@ -182,11 +307,53 @@ def _quoted_fragments(source: Mapping[str, Any], fragments: list[dict],
     return quoted
 
 
+def _present_whole_line_quotes(record: dict, source: Mapping[str, Any],
+                               original: ConversationMessage | None) -> None:
+    """Reference complete quoted lines without editing or repeating their text.
+
+    Partial slices and multipart originals retain explicit quoted wording: their
+    displayed line positions can differ from the canonical body.
+    """
+    fragments = record['fragments']
+    if len(fragments) != 1 or fragments[0]['offset'] != 0 or record.get('partial'):
+        return
+    parts = original.parts if original is not None else source.get('parts')
+    if parts is None:
+        return
+    if original is not None:
+        text_parts = [part for part in parts if part.text is not None]
+        if len(text_parts) != 1 or text_parts[0].kind != PartKind.TEXT or text_parts[0].origin:
+            return
+    else:
+        text_parts = [part for part in parts if part.get('text_span') is not None]
+        if len(text_parts) != 1 or text_parts[0].get('kind') != 'text' or text_parts[0].get('origin'):
+            return
+    text = fragments[0]['text']
+    lines, remaining = [], []
+    for quote in record['quoted_fragments']:
+        start = quote['offset']
+        end = start + len(quote['text'])
+        # Entity ranges can include a final newline, but never trim source text.
+        content_end = end - 1 if end > start and text[end - 1:end] == '\n' else end
+        if ((start == 0 or text[start - 1:start] == '\n')
+                and (content_end == len(text) or text[content_end:content_end + 1] == '\n')):
+            lines.append([text.count('\n', 0, start) + 1, text.count('\n', 0, content_end) + 1])
+        else:
+            remaining.append(quote)
+    if lines:
+        record['quoted_lines'] = lines
+        if remaining:
+            record['quoted_fragments'] = remaining
+        else:
+            del record['quoted_fragments']
+
+
 def message_evidence(source: Mapping[str, Any], *, message_id: int | None,
                      role: str | MessageRole | None, fragments: list[dict],
                      total_characters: int, images: list[dict] | None = None,
                      timezone: str | None = None,
-                     original: ConversationMessage | None = None) -> dict[str, Any]:
+                     original: ConversationMessage | None = None,
+                     presentation_version: int = 1) -> dict[str, Any]:
     """Project an original's supplied slices; selection, bounds and persistence belong to callers."""
     metadata = source.get('metadata') or {}
 
@@ -234,7 +401,8 @@ def message_evidence(source: Mapping[str, Any], *, message_id: int | None,
         # Typed source spans distinguish application/attachment context from
         # participant words. Literal lookalike text keeps its original owner.
         groups = []
-        for part in source['parts']:
+        image_ids = {image['image_id'] for image in images or []}
+        for index, part in enumerate(source['parts']):
             span = part.get('text_span')
             if span is None:
                 continue
@@ -243,14 +411,15 @@ def message_evidence(source: Mapping[str, Any], *, message_id: int | None,
                     'application' if origin == 'auto_note' else
                     'attachment' if origin in {'attachment_reference', 'attachment_excerpt', 'image_compacted'}
                     or part.get('kind') != 'text' else 'original')
-            if groups and groups[-1][2] == kind and span[0] <= groups[-1][1] + 1:
+            if (groups and groups[-1][2] == kind and span[0] <= groups[-1][1] + 1
+                    and not (presentation_version >= 2 and kind == 'attachment')):
                 groups[-1][1] = span[1]
             else:
-                groups.append([*span, kind])
+                groups.append([*span, kind, part, part.get('part_index', index)])
         originals, annotations = [], []
         for fragment in record['fragments']:
             offset, text = fragment['offset'], fragment['text']
-            for start, end, kind in groups:
+            for start, end, kind, part, index in groups:
                 start, end = max(start, offset), min(end, offset + len(text))
                 if start >= end or kind == 'provenance':
                     continue
@@ -258,6 +427,19 @@ def message_evidence(source: Mapping[str, Any], *, message_id: int | None,
                 if kind == 'original':
                     originals.append({'offset': start, 'text': shown})
                 else:
+                    if (presentation_version >= 2 and kind == 'attachment'
+                            and shown == generated_attachment_reference(part)):
+                        if part.get('kind') in {'image', 'sticker'} and any(
+                                image_id.startswith(f'img:{message_id}:') and image_id.endswith(f':{index}')
+                                for image_id in image_ids):
+                            # Image occurrences already report selection IDs and
+                            # availability; retain custom captions/descriptions.
+                            if part.get('detail') in (None, 'auto', 'low', 'high'):
+                                continue
+                        if part.get('kind') == 'file':
+                            shown = attachment_description(MessagePart(PartKind.FILE, **{
+                                key: part[key] for key in ('filename', 'mime_type', 'size_bytes',
+                                'artifact_path', 'workspace_path', 'detail') if key in part}))
                     annotations.append({'kind': kind, 'text': shown})
         record['fragments'] = originals
         if annotations:
@@ -265,6 +447,8 @@ def message_evidence(source: Mapping[str, Any], *, message_id: int | None,
     quoted = _quoted_fragments(source, record['fragments'], original)
     if quoted:
         record['quoted_fragments'] = quoted
+        if presentation_version >= 2:
+            _present_whole_line_quotes(record, source, original)
     for key in ('topic_id', 'direct_messages_topic_id', 'reply_to_source_id',
                 'reply_to_source_chat_id', 'reply_to_actor', 'forward_origin',
                 'external_reply', 'quote'):
@@ -279,19 +463,23 @@ def message_evidence(source: Mapping[str, Any], *, message_id: int | None,
                 record[key] = value(key)
     if images:
         record['images'] = images
-    return present_attribution(record, timezone)
+    return (agent_attribution if presentation_version >= 2 else present_attribution)(record, timezone)
 
 
 def attributed_message(message: ConversationMessage, *, message_id: int | None = None,
-                       timezone: str | None = None) -> ConversationMessage:
+                       timezone: str | None = None, presentation_version: int | None = None) -> ConversationMessage:
     # Assistant and tool roles already identify their own output. Participant
     # labels belong to incoming peers (including other bots), not the outer
     # tool observation. Source labels inside tool evidence remain untouched.
-    if message.role in {MessageRole.ASSISTANT, MessageRole.TOOL} or not message.metadata.get('source'):
+    if presentation_version is None:
+        presentation_version = message.metadata.get('presentation_version', 1)
+    if (message.role in {MessageRole.ASSISTANT, MessageRole.TOOL} or not message.metadata.get('source')
+            or presentation_version >= 2 and message.metadata.get('synthetic_role')):
         return message
     body = '\n'.join(part.text for part in message.parts if part.text is not None)
     identity = message_evidence(message.metadata, message_id=message_id, role=message.role,
-        fragments=[{'offset': 0, 'text': body}], total_characters=len(body), timezone=timezone, original=message)
+        fragments=[{'offset': 0, 'text': body}], total_characters=len(body), timezone=timezone, original=message,
+        presentation_version=presentation_version)
     identity.pop('fragments')
     label = json.dumps(identity, ensure_ascii=False, default=str)
     return replace(message, parts=[MessagePart(kind=PartKind.TEXT,
@@ -308,12 +496,15 @@ def evidence_part_spans(message: ConversationMessage) -> list[dict]:
     """Locate typed parts in the canonical body without interpreting their text."""
     spans: list[dict] = []
     offset = 0
-    for part in message.parts:
+    for index, part in enumerate(message.parts):
         if part.text is None:
             continue
         if spans:
             offset += 1
         end = offset + len(part.text)
-        spans.append({'text_span': [offset, end], 'kind': part.kind.value, 'origin': part.origin})
+        spans.append({'text_span': [offset, end], 'kind': part.kind.value, 'origin': part.origin,
+            'part_index': index, **{field: getattr(part, field) for field in
+                ('filename', 'mime_type', 'size_bytes', 'artifact_path', 'workspace_path', 'detail')
+                if getattr(part, field) is not None}})
         offset = end
     return spans

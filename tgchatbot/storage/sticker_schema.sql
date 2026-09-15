@@ -39,3 +39,13 @@ CREATE TABLE IF NOT EXISTS sticker_catalog_items (
     error text,
     PRIMARY KEY (revision_id,asset_id)
 );
+-- Public tool references outlive revisions and are never reassigned to another
+-- original. Content hashes remain the canonical catalog/delivery identity.
+CREATE TABLE IF NOT EXISTS sticker_catalog_references (
+    asset_id text PRIMARY KEY,
+    sticker_number bigint GENERATED ALWAYS AS IDENTITY UNIQUE NOT NULL
+);
+INSERT INTO sticker_catalog_references(asset_id)
+    SELECT DISTINCT item.asset_id FROM sticker_catalog_items item
+    WHERE NOT EXISTS (SELECT 1 FROM sticker_catalog_references ref WHERE ref.asset_id=item.asset_id)
+    ORDER BY item.asset_id ON CONFLICT DO NOTHING;

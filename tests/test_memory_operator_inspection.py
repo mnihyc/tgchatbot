@@ -220,6 +220,33 @@ class MemoryOperatorInspectionTests(BusinessTestCase):
         self.assertEqual(context[1]['block_id'], block.block_id)
         self.assertEqual(context[1]['summary_text'], 'A lantern was shown.')
 
+    async def test_discovered_participant_reference_opens_the_full_canonical_operator_profile(self):
+        source = await self.original('I prefer jasmine tea.', 1)
+        await self.original('I prefer coffee.', 2, actor='telegram:user:8')
+        fact = await self.store.save_profile_fact(self.session, subject_actor_id='telegram:user:7',
+            asserted_by='telegram:user:7', claim='Prefers jasmine tea.', source_ids=[source.db_id])
+        tables = ('profile_current', 'profile_facts', 'profile_inputs', 'jobs')
+        before = {table: await self.rows(table) for table in tables}
+
+        found = await self.command('search', '--chat-id', '100', '--query', 'jasmine', '--lexical-only')
+        reference = next(item['speaker']['id'] for item in found[0]['messages'] if item['message_id'] == source.db_id)
+        self.assertEqual(reference, 'person_id:7')
+        read = await self.command('read', '--chat-id', '100', '--message-id', str(source.db_id))
+        self.assertEqual(read[0]['messages'][0]['speaker']['id'], reference)
+        filtered = await self.command('search', '--chat-id', '100', '--query', 'jasmine',
+            '--actor-id', reference, '--lexical-only')
+        self.assertEqual(filtered, found)
+        selected = (await self.command('profiles', '--chat-id', '100', '--actor-id', reference))[0]
+        canonical = (await self.command('profiles', '--chat-id', '100', '--actor-id', 'telegram:user:7'))[0]
+        for key in ('profile', 'evidence', 'pending_material'):
+            self.assertEqual(selected[key], canonical[key])
+        self.assertEqual(selected['profile']['actor_id'], 'telegram:user:7')
+        self.assertEqual(selected['profile']['facts'][0]['id'], fact['id'])
+        self.assertEqual(selected['profile']['facts'][0]['source_ids'], [source.db_id])
+        self.assertEqual(selected['evidence'][0]['asserted_by'], 'telegram:user:7')
+        self.assertEqual({table: await self.rows(table) for table in tables}, before)
+        self.assertEqual(self.provider.requests, [])
+
     async def test_inspection_unknown_chat_does_not_create_it(self):
         count = await self.store.count_sessions()
         for function, kwargs in ((job_records, {}), (profile_records, {'max_bytes': self.config.memory.profile_bytes})):

@@ -154,7 +154,7 @@ class MemoryImageRuntimeTests(BusinessTestCase):
         statuses = {item['image_id']: item['status'] for item in first_response['response']['result']['image_results']}
         self.assertEqual(statuses, {first_id: 'opened', second_id: 'omitted'})
         self.assertEqual([part['inlineData']['data'] for part in first_response['parts']], [first_pixels])
-        self.assertIn('telegram:user:101', json.dumps(first_response['response']['evidence']))
+        self.assertIn('person_id:101', json.dumps(first_response['response']['evidence']))
 
         await runtime.run_turn(session_id=self.session, user_display_name='Participant',
             incoming_message=ConversationMessage.user_text('Now inspect the other photo.'))

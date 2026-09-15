@@ -200,10 +200,11 @@ class MessageImageWorkflows(BusinessTestCase):
         lookup = self.store.read_message_by_source
         self.assertEqual((await lookup(self.session, **identity, expected_scope=scope)).db_id, original.db_id)
         edited = await self.original(1, text='Corrected source caption.')
+        canonical_edit = (await self.store.read_messages(self.session, [edited.db_id]))[0]
         with self.assertRaises(StaleScopeError):
             await lookup(self.session, **identity, expected_scope=scope)
         current = await lookup(self.session, **identity, expected_scope=scope, generation_only=True)
-        self.assertEqual(current.message, edited.message)
+        self.assertEqual(current.message, canonical_edit.message)
         await self.store.reset_context(self.session)
         current = await lookup(self.session, **identity, expected_scope=scope, generation_only=True)
         self.assertEqual(current.db_id, original.db_id, 'Import ignores working-context resets, like original append')

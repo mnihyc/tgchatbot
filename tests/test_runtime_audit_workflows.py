@@ -102,10 +102,12 @@ class RuntimeAuditWorkflows(BusinessTestCase):
         settings = await self.settings(provider='gemini', model='fixture-flash',
             compact_target_tokens=10000, compact_trigger_tokens=100000)
         sources = []
+        canonical_sources = []
         for number in range(block_count):
             source = await self.store.append_message(self.session,
                 ConversationMessage.user_text(f'Original discussion {number}.'))
             sources.append(source)
+            canonical_sources.extend(await self.store.read_messages(self.session, [source.db_id]))
             await self.store.create_memory_block(self.session, source_message_ids=[source.db_id],
                 summary_text=f'Earlier discussion {number}. ' + 'A confirmed fact and its owner. ' * 85,
                 estimated_tokens=block_tokens)
@@ -140,7 +142,7 @@ class RuntimeAuditWorkflows(BusinessTestCase):
             self.assertEqual(later['contents'][:len(earlier['contents'])], earlier['contents'],
                 'An ordinary append must preserve the selected sealed summaries and earlier request prefix.')
         original_rows = await self.store.read_messages(self.session, [source.db_id for source in sources])
-        self.assertEqual([row.message for row in original_rows], [source.message for source in sources])
+        self.assertEqual(original_rows, canonical_sources)
         await self.store.close()
         restored_store = await self.new_store()
         restored_cache = PreviewCache(restored_store, max_bytes=0)

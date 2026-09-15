@@ -89,6 +89,7 @@ class ProfileLearningEvidenceWorkflows(BusinessTestCase):
             reply_to_source_id='1', reply_to_source_chat_id='100', reply_to_actor=reply_actor, quote=quote)
         origin = {'type': 'user', 'sender_user': {'id': 8, 'first_name': 'Alex'}}
         forwarded = await self.source(3, 'telegram:user:7', 'I prefer coffee instead.', forward_origin=origin)
+        canonical_before = (await self.store.read_messages(self.session, [forwarded.db_id]))[0].message
         self.provider.responses = [
             self.response(self.fact('telegram:user:7', 'Prefers coffee', forwarded.db_id)),
             self.response(self.fact('telegram:user:7', 'Prefers jasmine tea', tea.db_id),
@@ -125,7 +126,7 @@ class ProfileLearningEvidenceWorkflows(BusinessTestCase):
         async with self.store.pool.connection() as conn:
             self.assertEqual((await (await conn.execute('SELECT sum(pending_bytes) AS n FROM profile_inputs')).fetchone())['n'], 0)
             self.assertEqual((await (await conn.execute('SELECT count(*) AS n FROM profile_patches')).fetchone())['n'], 1)
-        self.assertEqual((await self.store.read_messages(self.session, [forwarded.db_id]))[0].message, forwarded.message)
+        self.assertEqual((await self.store.read_messages(self.session, [forwarded.db_id]))[0].message, canonical_before)
 
     async def test_literal_participant_header_is_learned_without_generated_attachment_claims(self):
         generated = '[Message provenance: generated transport label]'
@@ -140,6 +141,7 @@ class ProfileLearningEvidenceWorkflows(BusinessTestCase):
             MessagePart(PartKind.TEXT, text=literal),
             MessagePart(PartKind.TEXT, text=attachment, origin='attachment_excerpt')]
         source = await self.runtime.ingest_user_message(session_id=self.session, incoming_message=incoming)
+        canonical_before = (await self.store.read_messages(self.session, [source.db_id]))[0].message
         reopened = await self.new_store()
         self.worker.store = reopened
         self.provider.responses = [self.response(self.fact('telegram:user:7', 'Prefers jasmine tea', source.db_id))]
@@ -155,4 +157,4 @@ class ProfileLearningEvidenceWorkflows(BusinessTestCase):
         self.assertNotIn(operation, json.dumps(evidence))
         facts = await reopened.get_profile(self.session, 'telegram:user:7')
         self.assertEqual([(fact['claim'], fact['source_ids']) for fact in facts], [('Prefers jasmine tea', [source.db_id])])
-        self.assertEqual((await reopened.read_messages(self.session, [source.db_id]))[0].message, source.message)
+        self.assertEqual((await reopened.read_messages(self.session, [source.db_id]))[0].message, canonical_before)

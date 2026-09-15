@@ -73,7 +73,7 @@ class TimezoneEvidenceWorkflows(BusinessTestCase):
         self.assertEqual(image_label['sent_at'], evidence['sent_at'])
         profile = (await self.tool('user_profile_fetch', {'actor_ids': ['telegram:user:11']}, zone)).output
         self.assertTrue(profile['as_of'].endswith('+08:00'))
-        self.assertTrue(profile['fetched_at'].endswith('+08:00'))
+        self.assertNotIn('fetched_at', profile)
         document = profile['profiles'][0]
         self.assertEqual(document['identity']['last_message']['sent_at'], evidence['sent_at'])
         self.assertEqual(document['facts'][0]['valid_from'], '2026-09-12T23:59:00+08:00')

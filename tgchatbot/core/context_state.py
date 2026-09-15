@@ -55,20 +55,37 @@ class MemoryBlock:
     validator_status: str | None = None
     validator_score: float | None = None
     structured_data: dict[str, Any] = field(default_factory=dict)
+    presentation_version: int = 1
     compaction_version: int = field(default=0, compare=False, repr=False)
     def render_as_message(self, *, timezone: str | None = None) -> ConversationMessage:
         start = format_timestamp(self.time_start, timezone)
         end = format_timestamp(self.time_end, timezone)
         scope_bits: list[str] = []
-        if start or end:
+        scope = self.structured_data.get('scope') or {
+            'toolspan': 'Tool-heavy interaction span', 'episode': 'Episode summary',
+        }.get(self.kind, 'Digest summary')
+        scope_prefix = f'## Scope\n- {scope}\n'
+        # Deduplicate only the renderer-owned leading scope, never matching
+        # lines in model prose, retained quotations or a later section.
+        scope_lines = (self.summary_text[len(scope_prefix):].split('\n\n', 1)[0].splitlines()
+            if self.presentation_version >= 2 and self.summary_text.startswith(scope_prefix) else [])
+        rendered_span = f'{start} .. {end}' if start and end and start != end else start or end
+        duplicate_time = any(
+            line == f'- Time span: {rendered_span}' or line == '- Time span: ' + str(
+                f'{self.time_start} .. {self.time_end}' if self.time_start and self.time_end and self.time_start != self.time_end
+                else self.time_start or self.time_end)
+            for line in scope_lines)
+        if (start or end) and not duplicate_time:
             if start and end and start != end:
                 scope_bits.append(f"time={start}..{end}")
             else:
                 scope_bits.append(f"time={start or end}")
-        if self.actor_labels:
-            scope_bits.append("actors=" + ", ".join(self.actor_labels[:4]))
-        if self.topic_labels:
-            scope_bits.append("topics=" + ", ".join(self.topic_labels[:4]))
+        if self.actor_labels and '- Participants: ' + ', '.join(self.actor_labels) not in scope_lines:
+            labels = self.actor_labels if self.presentation_version >= 2 else self.actor_labels[:4]
+            scope_bits.append("actors=" + ", ".join(labels))
+        if self.topic_labels and '- Topics: ' + ', '.join(self.topic_labels) not in scope_lines:
+            labels = self.topic_labels if self.presentation_version >= 2 else self.topic_labels[:4]
+            scope_bits.append("topics=" + ", ".join(labels))
         header = f"[Memory {self.kind} block L{self.level} #{self.sequence_no}; covers {self.source_message_count} earlier messages"
         if scope_bits:
             header += "; " + "; ".join(scope_bits)
@@ -81,9 +98,6 @@ class MemoryBlock:
                 if self.time_start and self.time_end and self.time_start != self.time_end
                 else self.time_start or self.time_end)
             shown_span = f'{start} .. {end}' if start and end and start != end else start or end
-            scope = self.structured_data.get('scope') or {
-                'toolspan': 'Tool-heavy interaction span', 'episode': 'Episode summary',
-            }.get(self.kind, 'Digest summary')
             prefix = f'## Scope\n- {scope}\n- Time span: '
             stored_header = prefix + str(stored_span)
             if summary == stored_header or summary.startswith(stored_header + '\n'):

@@ -15,9 +15,12 @@ class CompactionSourceInheritanceTests(BusinessTestCase):
         await self.settings()
 
     async def original(self, number, text):
-        return await self.store.append_message(self.session, ConversationMessage.user_text(text, metadata={
+        stored = await self.store.append_message(self.session, ConversationMessage.user_text(text, metadata={
             'source': 'telegram', 'source_chat_id': '100', 'source_message_id': str(number),
             'actor_id': 'telegram:user:101', 'actor_kind': 'user', 'actor_name': 'Participant'}))
+        # These workflows compare original evidence before/after compaction,
+        # not append_message's separately versioned working presentation.
+        return (await self.store.read_messages(self.session, [stored.db_id]))[0]
 
     async def earlier_toolspan(self):
         source = await self.original(1, 'The earlier lookup established that the cobalt key is in the drawer.')

@@ -18,6 +18,8 @@ from tgchatbot.domain.models import OutboundArtifact
 from tgchatbot.tools.base import ToolContext
 from tgchatbot.tools.file_send import FileSendTool
 from tgchatbot.tools.read_doc import ReadDocTool
+from tgchatbot.tools.python_exec import PythonExecTool
+from tgchatbot.tools.shell_exec import ShellExecTool
 from tgchatbot.tools.remote_workspace import RemoteSessionPaths, RemoteWorkspaceClient
 from tgchatbot.transports.artifact_delivery import deliver_artifact
 
@@ -139,6 +141,38 @@ class RemoteTransferWorkflows(unittest.IsolatedAsyncioTestCase):
         displayed = await self.remote.run_shell(session_id='telegram:1',
             command='python3 -c "print(chr(22909) * 20000)"', timeout_s=10)
         self.assertEqual(displayed['stdout'], '好' * self.remote.ssh.max_stdout_chars)
+        self.assertTrue(displayed['stdout_truncated'])
+
+    async def test_tools_report_only_actual_output_loss_without_changing_literal_prefix(self):
+        self.process_workspace()
+        self.remote.ssh = replace(self.remote.ssh, max_stdout_chars=7, max_stderr_chars=7)
+        cases = (
+            (ShellExecTool(self.config, self.remote), {'command': "printf '1234567'; printf 'warning: tail' >&2"}),
+            (PythonExecTool(self.config, self.remote), {'code': "import sys\nprint('1234567', end='')\nsys.stderr.write('warning: tail')"}),
+        )
+        for tool, args in cases:
+            with self.subTest(tool=tool.spec.name):
+                result = await tool.run(args, ToolContext('telegram:1', 'Participant'))
+                self.assertTrue(result.output['ok'], result.output)
+                self.assertEqual(result.output['stdout'], '1234567')
+                self.assertNotIn('stdout_truncated', result.output)
+                self.assertEqual(result.output['stderr'], 'warning')
+                self.assertTrue(result.output['stderr_truncated'])
+        # A zero allowance still drains the process; an incomplete UTF-8 tail
+        # is displayed with the existing replacement behavior when it fits.
+        for raw, limit, expected, truncated in (
+            (b'', 0, '', False), (b'x', 0, '', True),
+            (b'abcdef\xe5\xa5', 7, 'abcdef\ufffd', False),
+            ('好' * 30000, 7, '好' * 7, True),
+        ):
+            stream = asyncio.StreamReader()
+            stream.feed_data(raw.encode() if isinstance(raw, str) else raw)
+            stream.feed_eof()
+            capture = {}
+            shown = await self.remote._read_output(stream, limit, capture=capture)
+            self.assertEqual(shown, expected)
+            self.assertEqual(capture['truncated'], truncated)
+            self.assertTrue(stream.at_eof())
 
     async def test_input_dates_follow_original_messages_in_configured_timezone_and_paths_remain_readable(self):
         paths = self.process_workspace()
@@ -343,7 +377,8 @@ class RemoteTransferWorkflows(unittest.IsolatedAsyncioTestCase):
                 "import sys; sys.stdout.write('好' * 1000000); sys.stderr.write('界' * 1000000)", **kwargs)
         with patch('asyncio.create_subprocess_exec', side_effect=local_process):
             result = await self.remote._run_ssh_command('fixture', timeout_s=10)
-        self.assertEqual(result, {'ok': True, 'returncode': 0, 'stdout': '好' * 7, 'stderr': '界' * 5})
+        self.assertEqual(result, {'ok': True, 'returncode': 0, 'stdout': '好' * 7, 'stderr': '界' * 5,
+            'stdout_truncated': True, 'stderr_truncated': True})
 
     async def test_cancelled_execution_reaps_local_process(self):
         self.remote.ensure_master = AsyncMock()

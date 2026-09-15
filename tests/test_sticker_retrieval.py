@@ -61,7 +61,7 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         asset = CatalogAsset('sha256:' + digest, digest, (CatalogAlias(path.relative_to(self.root).as_posix(), pack),),
             {'animated': animated}, card, {'family_ids': family or []}, card, {},
             np.array(image_vector, dtype=np.float32) if image_vector is not None else None,
-            np.array(vectors, dtype=np.float32))
+            np.array(vectors, dtype=np.float32), sticker_number=position + 1)
         self.assets.append(asset)
         return asset
 
@@ -74,8 +74,8 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         other = self.asset(action='A small reassuring nod', reading_vectors=[[.9, .43589, 0]])
         result = await self.query(candidate_budget=2)
         ids = [c['sticker_id'] for c in result.output['candidates']]
-        self.assertEqual(ids, [multi.asset_id, other.asset_id])
-        self.assertEqual(result.output['candidates'][0]['matched_reading']['meaning'], 'Offer care')
+        self.assertEqual(ids, [multi.agent_id, other.agent_id])
+        self.assertEqual(next(reading['meaning'] for reading in result.output['candidates'][0]['readings'] if reading.get('retrieval_match')), 'Offer care')
         self.assertEqual(len(set(ids)), 2)
 
     async def test_query_returns_actual_attributed_images_and_never_sends(self):
@@ -84,7 +84,7 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.stickers, [])
         images = [part for part in result.evidence_parts if part.kind == PartKind.IMAGE]
         self.assertTrue(images)
-        self.assertEqual(images[0].origin, 'sticker_candidate:' + asset.asset_id)
+        self.assertEqual(images[0].origin, 'sticker_candidate:' + asset.agent_id)
         self.assertTrue(images[0].data_b64)
         self.assertNotIn('path', result.output['candidates'][0])
         self.assertNotIn('fit_signals', result.output['candidates'][0])
@@ -95,7 +95,7 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         result = await self.query()
         labels = [part.text for part in result.evidence_parts if part.kind == PartKind.TEXT]
         self.assertEqual(len(labels), 1)
-        self.assertIn(asset.asset_id, labels[0])
+        self.assertIn(asset.agent_id, labels[0])
         self.assertIn('animated=False', labels[0])
         self.assertNotIn('sampled frame times', labels[0])
         self.assertNotIn('intermediate animation events', labels[0])
@@ -112,9 +112,9 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
             result = await self.query(candidate_budget=3)
             candidates = {item['sticker_id']: item for item in result.output['candidates']}
             for asset in (first, second):
-                self.assertEqual(candidates[asset.asset_id]['packs'], ['series'])
-                self.assertEqual(candidates[asset.asset_id]['pack_descriptions'], {'series': description})
-            self.assertNotIn('pack_descriptions', candidates[plain.asset_id])
+                self.assertEqual(candidates[asset.agent_id]['packs'], ['series'])
+                self.assertEqual(candidates[asset.agent_id]['pack_descriptions'], {'series': description})
+            self.assertNotIn('pack_descriptions', candidates[plain.agent_id])
             self.assertEqual(result.stickers, [])
         self.personas.save_sticker_persona.assert_not_awaited()
 
@@ -130,7 +130,7 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         revised = await self.query()
         self.assertEqual(revised.output['candidates'][0]['packs'], ['series', 'other'])
         self.assertEqual(revised.output['candidates'][0]['pack_descriptions'], {'other': 'Collected reaction images'})
-        self.assertEqual(revised.output['candidates'][0]['caption'], asset.card['caption'])
+        self.assertEqual(revised.output['candidates'][0].get('caption', ''), asset.card['caption'])
 
     async def test_animation_warning_survives_sampling_only_one_distinct_frame(self):
         asset = self.asset(animated=True)
@@ -153,7 +153,7 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
                 result = await self.query(allow_animation=True)
                 self.assertTrue(result.output['ok'])
                 label = next(part.text for part in result.evidence_parts if part.kind == PartKind.TEXT)
-                self.assertIn(asset.asset_id, label)
+                self.assertIn(asset.agent_id, label)
                 self.assertIn('animated=True', label)
                 self.assertIn('sampled frame times', label)
                 self.assertIn('intermediate animation events may be omitted', label)
@@ -176,15 +176,15 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         valid = self.asset(reading_vectors=[[.8, .6, 0]], harshness=0)
         result = await self.query(candidate_budget=1,
             advanced={'intensity_limits': {'max_harshness': 0, 'allow_animation': False}})
-        self.assertEqual([x['sticker_id'] for x in result.output['candidates']], [valid.asset_id])
+        self.assertEqual([x['sticker_id'] for x in result.output['candidates']], [valid.agent_id])
 
     async def test_pack_preference_keeps_global_choices_but_explicit_requirement_filters(self):
         global_asset = self.asset(pack='global', reading_vectors=[[1, 0, 0]])
         preferred = self.asset(pack='familiar', reading_vectors=[[.7, .71414, 0]])
         result = await self.query(preferred_pack='familiar', candidate_budget=2)
-        self.assertEqual({x['sticker_id'] for x in result.output['candidates']}, {global_asset.asset_id, preferred.asset_id})
+        self.assertEqual({x['sticker_id'] for x in result.output['candidates']}, {global_asset.agent_id, preferred.agent_id})
         required = await self.query(required_pack='familiar')
-        self.assertEqual([x['sticker_id'] for x in required.output['candidates']], [preferred.asset_id])
+        self.assertEqual([x['sticker_id'] for x in required.output['candidates']], [preferred.agent_id])
         absent = await self.query(required_pack='absent')
         self.assertEqual(absent.output['status'], 'no_candidates')
         self.assertNotIn('does not exist', str(absent.output))
@@ -194,7 +194,7 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         b = self.asset(pack='second', family=['round-cat'])
         self.asset(pack='first', family=['dog'])
         result = await self.query(required_character_family='round-cat')
-        self.assertEqual({x['sticker_id'] for x in result.output['candidates']}, {a.asset_id, b.asset_id})
+        self.assertEqual({x['sticker_id'] for x in result.output['candidates']}, {a.agent_id, b.agent_id})
 
     async def test_confirmed_repeat_stays_eligible_and_fresh_variant_is_offered(self):
         prior = self.asset(reading_vectors=[[1, 0, 0]])
@@ -203,9 +203,9 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         result = await self.query(diversity_preference='prefer_fresh_variant', candidate_budget=2)
         candidates = result.output['candidates']
         by_id = {candidate['sticker_id']: candidate for candidate in candidates}
-        self.assertEqual(set(by_id), {fresh.asset_id, prior.asset_id})
-        self.assertFalse(by_id[fresh.asset_id]['recently_delivered'])
-        self.assertTrue(by_id[prior.asset_id]['recently_delivered'])
+        self.assertEqual(set(by_id), {fresh.agent_id, prior.agent_id})
+        self.assertFalse(by_id[fresh.agent_id].get('recently_delivered', False))
+        self.assertTrue(by_id[prior.agent_id].get('recently_delivered', False))
         self.personas.save_sticker_persona.assert_not_awaited()
 
     async def test_common_caption_still_responds_to_changed_conversational_intent(self):
@@ -219,8 +219,8 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         for intent, expected in [('Warm agreement', warm), ('Reluctant agreement', reluctant)]:
             with self.subTest(intent=intent):
                 result = await self.query(intent_core=intent, caption_meaning='好', candidate_budget=1)
-                self.assertEqual([c['sticker_id'] for c in result.output['candidates']], [expected.asset_id])
-                self.assertEqual(result.output['candidates'][0]['matched_reading']['meaning'], intent)
+                self.assertEqual([c['sticker_id'] for c in result.output['candidates']], [expected.agent_id])
+                self.assertEqual(next(reading['meaning'] for reading in result.output['candidates'][0]['readings'] if reading.get('retrieval_match')), intent)
 
     async def test_caption_hint_keeps_contextual_alternatives_and_literal_companion(self):
         literal = self.asset(caption='好', reading_vectors=[[0, 1, 0]])
@@ -229,17 +229,17 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(budget=budget):
                 result = await self.query(caption_meaning='好', candidate_budget=budget)
                 self.assertEqual([c['sticker_id'] for c in result.output['candidates']],
-                    [fitting.asset_id, literal.asset_id][:budget])
+                    [fitting.agent_id, literal.agent_id][:budget])
 
     async def test_id_lookup_and_offline_caption_lookup_retain_hard_requirements(self):
         literal = self.asset(caption='好', pack='literal')
         selected = self.asset(caption='抱抱', pack='selected')
         self.embeddings.enabled = False
-        direct = await self.query(intent_core=selected.asset_id, caption_meaning='好')
-        self.assertEqual([c['sticker_id'] for c in direct.output['candidates']], [selected.asset_id])
+        direct = await self.query(intent_core=selected.agent_id, caption_meaning='好')
+        self.assertEqual([c['sticker_id'] for c in direct.output['candidates']], [selected.agent_id])
         self.assertEqual(direct.output['search_scope']['retrieval'], 'asset_id')
         caption = await self.query(caption_meaning='好')
-        self.assertEqual([c['sticker_id'] for c in caption.output['candidates']], [literal.asset_id])
+        self.assertEqual([c['sticker_id'] for c in caption.output['candidates']], [literal.agent_id])
         self.assertEqual(caption.output['search_scope']['retrieval'], 'literal')
         required = await self.query(caption_meaning='好', required_pack='selected')
         self.assertFalse(required.output['ok'])
@@ -251,25 +251,25 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         better = self.asset(caption='好', reading_vectors=[[.9, .43589, 0]])
         unranked = self.asset(caption='好', readings=[], reading_vectors=[])
         result = await self.query(caption_meaning='好', candidate_budget=2)
-        self.assertEqual([c['sticker_id'] for c in result.output['candidates']], [strongest.asset_id, better.asset_id])
+        self.assertEqual([c['sticker_id'] for c in result.output['candidates']], [strongest.agent_id, better.agent_id])
         full = await self.query(caption_meaning='好', candidate_budget=4)
         self.assertEqual({c['sticker_id'] for c in full.output['candidates']},
-            {strongest.asset_id, weaker.asset_id, better.asset_id, unranked.asset_id})
+            {strongest.agent_id, weaker.agent_id, better.agent_id, unranked.agent_id})
 
     async def test_caption_only_catalog_can_be_inspected_without_vectors(self):
         asset = self.asset(caption='好', readings=[], reading_vectors=[])
         result = await self.query(caption_meaning='好')
-        self.assertEqual([c['sticker_id'] for c in result.output['candidates']], [asset.asset_id])
+        self.assertEqual([c['sticker_id'] for c in result.output['candidates']], [asset.agent_id])
         self.assertEqual(result.output['search_scope']['retrieval'], 'literal')
         self.embeddings.embed_query.assert_not_awaited()
 
     async def test_known_id_cannot_substitute_caption_match_when_restricted_or_missing(self):
         selected = self.asset(caption='抱抱', pack='selected')
         self.asset(caption='好', pack='other')
-        restricted = await self.query(intent_core=selected.asset_id, caption_meaning='好', required_pack='other')
+        restricted = await self.query(intent_core=selected.agent_id, caption_meaning='好', required_pack='other')
         self.assertEqual(restricted.output['candidates'], [])
         (self.root / selected.aliases[0].path).rename(self.root / 'missing.png')
-        missing = await self.query(intent_core=selected.asset_id, caption_meaning='好')
+        missing = await self.query(intent_core=selected.agent_id, caption_meaning='好')
         self.assertEqual(missing.output['candidates'], [])
         self.embeddings.embed_query.assert_not_awaited()
 
@@ -277,11 +277,11 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         asset = self.asset(caption='好')
         self.embeddings.config.space_id = 'different-model'
         mismatch = await self.query(caption_meaning='好')
-        self.assertEqual([c['sticker_id'] for c in mismatch.output['candidates']], [asset.asset_id])
+        self.assertEqual([c['sticker_id'] for c in mismatch.output['candidates']], [asset.agent_id])
         self.assertEqual(mismatch.output['search_scope']['retrieval'], 'literal')
         self.embeddings.embed_query.assert_not_awaited()
-        direct = await self.query(intent_core=asset.asset_id)
-        self.assertEqual([c['sticker_id'] for c in direct.output['candidates']], [asset.asset_id])
+        direct = await self.query(intent_core=asset.agent_id)
+        self.assertEqual([c['sticker_id'] for c in direct.output['candidates']], [asset.agent_id])
         self.embeddings.config.space_id = 'space'
         self.embeddings.embed_query.side_effect = RuntimeError('fixture provider failure')
         failed = await self.query(caption_meaning='好')
@@ -305,9 +305,9 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(saved=saved, extra=extra):
                     result = await self.query(candidate_budget=2, diversity_preference='prefer_fresh_variant', **extra)
                     self.assertEqual([c['sticker_id'] for c in result.output['candidates']],
-                        [strongest.asset_id, fresh.asset_id])
+                        [strongest.agent_id, fresh.agent_id])
         one = await self.query(candidate_budget=1, diversity_preference='prefer_fresh_variant')
-        self.assertEqual([c['sticker_id'] for c in one.output['candidates']], [strongest.asset_id])
+        self.assertEqual([c['sticker_id'] for c in one.output['candidates']], [strongest.agent_id])
 
     async def test_explicit_switch_precedes_saved_pack_but_does_not_exclude_it(self):
         strongest, familiar, fresh = self.continuity_assets()
@@ -317,7 +317,7 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
                 result = await self.query(candidate_budget=budget,
                     advanced={'style_focus': {'style_goal': 'prefer_switch'}})
                 self.assertEqual([c['sticker_id'] for c in result.output['candidates']],
-                    [strongest.asset_id, fresh.asset_id, familiar.asset_id][:budget])
+                    [strongest.agent_id, fresh.agent_id, familiar.agent_id][:budget])
 
     async def test_explicit_continuity_conflicts_keep_existing_compromise(self):
         strongest, familiar, fresh = self.continuity_assets()
@@ -327,9 +327,9 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(explicit=explicit):
                 result = await self.query(candidate_budget=2, diversity_preference='prefer_fresh_variant', **explicit)
                 self.assertEqual([c['sticker_id'] for c in result.output['candidates']],
-                    [strongest.asset_id, familiar.asset_id])
+                    [strongest.agent_id, familiar.agent_id])
         default = await self.query(candidate_budget=2)
-        self.assertEqual([c['sticker_id'] for c in default.output['candidates']], [strongest.asset_id, familiar.asset_id])
+        self.assertEqual([c['sticker_id'] for c in default.output['candidates']], [strongest.agent_id, familiar.agent_id])
 
     async def test_explicit_family_does_not_turn_saved_pack_into_requested_identity(self):
         strongest, familiar, fresh = self.continuity_assets()
@@ -337,13 +337,13 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         self.personas.get_sticker_persona.return_value = {'visual_identity': {'prefer_pack': 'familiar'}}
         result = await self.query(candidate_budget=2, preferred_character_family='requested-character',
             diversity_preference='prefer_fresh_variant')
-        self.assertEqual([c['sticker_id'] for c in result.output['candidates']], [strongest.asset_id, requested.asset_id])
+        self.assertEqual([c['sticker_id'] for c in result.output['candidates']], [strongest.agent_id, requested.agent_id])
         absent = await self.query(candidate_budget=2, preferred_character_family='absent',
             diversity_preference='prefer_fresh_variant')
-        self.assertEqual({c['sticker_id'] for c in absent.output['candidates']}, {strongest.asset_id, fresh.asset_id})
+        self.assertEqual({c['sticker_id'] for c in absent.output['candidates']}, {strongest.agent_id, fresh.agent_id})
         explicit_both = await self.query(candidate_budget=2, preferred_character_family='requested-character',
             preferred_pack='familiar', diversity_preference='prefer_fresh_variant')
-        self.assertEqual([c['sticker_id'] for c in explicit_both.output['candidates']], [strongest.asset_id, familiar.asset_id])
+        self.assertEqual([c['sticker_id'] for c in explicit_both.output['candidates']], [strongest.agent_id, familiar.agent_id])
         self.personas.save_sticker_persona.assert_not_awaited()
 
     async def test_moving_inherited_pack_keeps_current_appearance_and_switch_order(self):
@@ -362,7 +362,7 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
                     persona={'visual_identity': {'rendering_style': 'gentle line art'}},
                     advanced={'style_focus': {'style_goal': 'prefer_switch'}})
                 self.assertEqual([c['sticker_id'] for c in result.output['candidates']],
-                    [strongest.asset_id, appearance.asset_id, switched.asset_id, familiar.asset_id][:budget])
+                    [strongest.agent_id, appearance.agent_id, switched.agent_id, familiar.agent_id][:budget])
 
     async def test_negative_meanings_are_constraints_not_positive_embedding_text(self):
         self.asset()
@@ -401,11 +401,11 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         asset = self.asset()
         await self.catalog.aensure_loaded()
         tool = StickerSendSelectedTool(self.catalog)
-        result = await tool.run({'sticker_id': asset.asset_id, 'timing': 'before_final'}, self.ctx)
+        result = await tool.run({'sticker_id': asset.agent_id, 'timing': 'before_final'}, self.ctx)
         self.assertEqual(result.output['status'], 'queued')
         self.assertEqual(result.stickers[0].timing, StickerTiming.SEND_NOW)
         self.assertEqual(result.stickers[0].content_sha256, asset.content_hash)
-        after = await tool.run({'selected_sticker_id': asset.asset_id}, self.ctx)
+        after = await tool.run({'selected_sticker_id': asset.agent_id}, self.ctx)
         self.assertEqual(after.stickers[0].timing, StickerTiming.AFTER_FINAL)
         self.deliveries.recent.assert_not_awaited()
 
@@ -413,7 +413,7 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         asset = self.asset()
         await self.catalog.aensure_loaded()
         (self.root / asset.aliases[0].path).write_bytes(b'replaced media')
-        result = await StickerSendSelectedTool(self.catalog).run({'selected_sticker_id': asset.asset_id}, self.ctx)
+        result = await StickerSendSelectedTool(self.catalog).run({'selected_sticker_id': asset.agent_id}, self.ctx)
         self.assertFalse(result.output['ok'])
         self.assertEqual(result.stickers, [])
 
@@ -424,7 +424,7 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         copy.write_bytes(source.read_bytes())
         self.assets[0] = replace(asset, aliases=asset.aliases + (CatalogAlias('copy.png', 'second'),))
         source.rename(self.root / 'moved.png')
-        result = await StickerSendSelectedTool(self.catalog).run({'selected_sticker_id': asset.asset_id}, self.ctx)
+        result = await StickerSendSelectedTool(self.catalog).run({'selected_sticker_id': asset.agent_id}, self.ctx)
         self.assertTrue(result.output['ok'])
         self.assertEqual(result.stickers[0].path, copy)
 
@@ -449,7 +449,7 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         result = await self.query()
         self.assertFalse(result.output['ok'])
         self.assertIn('embedding space changed', result.output['error'])
-        sent = await StickerSendSelectedTool(self.catalog).run({'selected_sticker_id': asset.asset_id}, self.ctx)
+        sent = await StickerSendSelectedTool(self.catalog).run({'selected_sticker_id': asset.agent_id}, self.ctx)
         self.assertTrue(sent.output['ok'])
 
     async def test_publication_during_search_keeps_original_caption_vector_and_id_together(self):
@@ -472,11 +472,11 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         await self.catalog.aensure_loaded()
         release.set()
         prior = await pending
-        self.assertEqual(prior.output['catalog_revision'], 'r1')
+        self.assertNotIn('catalog_revision', prior.output)
         self.assertEqual(prior.output['candidates'][0]['caption'], 'A quiet hug')
         self.assertEqual(prior.output['candidates'][0]['pack_descriptions'], {'pack-a': 'Original pack description'})
         current = await self.query()
-        self.assertEqual(current.output['catalog_revision'], 'r2')
+        self.assertNotIn('catalog_revision', current.output)
         self.assertEqual(current.output['candidates'][0]['caption'], 'Corrected caption')
         self.assertEqual(current.output['candidates'][0]['pack_descriptions'], {'pack-a': 'Updated pack description'})
 
@@ -485,8 +485,8 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         self.asset(harshness=4, action='Threatening the recipient')
         self.deliveries.recent.return_value = [{'sticker_id': fitting.asset_id}]
         result = await self.query(diversity_preference='prefer_fresh_variant', max_harshness=0)
-        self.assertEqual([c['sticker_id'] for c in result.output['candidates']], [fitting.asset_id])
-        self.assertTrue(result.output['candidates'][0]['recently_delivered'])
+        self.assertEqual([c['sticker_id'] for c in result.output['candidates']], [fitting.agent_id])
+        self.assertTrue(result.output['candidates'][0].get('recently_delivered', False))
 
     async def test_known_empty_required_pack_needs_no_remote_embedding_request(self):
         self.asset(pack='available')
@@ -504,7 +504,7 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         alias.symlink_to(self.root / asset.aliases[0].path)
         self.catalog.sticker_root = confined
         result = await StickerSendSelectedTool(self.catalog).run(
-            {'selected_sticker_id': asset.asset_id}, self.ctx)
+            {'selected_sticker_id': asset.agent_id}, self.ctx)
         self.assertFalse(result.output['ok'])
         self.assertEqual(result.stickers, [])
 
@@ -522,9 +522,9 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         other = self.asset()
         result = await self.query()
         self.assertTrue(result.output['ok'])
-        self.assertEqual(result.output['candidate_count'], 2)
+        self.assertEqual(len(result.output['candidates']), 2)
         self.assertTrue(any('visual evidence unavailable' in (part.text or '') for part in result.evidence_parts))
-        self.assertTrue(any(part.kind == PartKind.IMAGE and part.origin.endswith(other.asset_id)
+        self.assertTrue(any(part.kind == PartKind.IMAGE and part.origin.endswith(other.agent_id)
                             for part in result.evidence_parts))
 
     async def test_inflight_query_retains_delivered_history_after_lru_eviction(self):
@@ -548,5 +548,93 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         self.deliveries.recent.return_value = [{'sticker_id': prior.asset_id}]
         result = await self.query()
         candidates = {item['sticker_id']: item for item in result.output['candidates']}
-        self.assertTrue(candidates[prior.asset_id]['recently_delivered'])
-        self.assertEqual(candidates[different.asset_id]['visually_similar_deliveries'], [])
+        self.assertTrue(candidates[prior.agent_id].get('recently_delivered', False))
+        self.assertEqual(candidates[different.agent_id].get('visually_similar_deliveries', []), [])
+
+    async def test_compact_readings_preserve_both_roles_and_card_without_mutating_it(self):
+        import copy
+        asset = self.asset(readings=[
+            {'meaning': 'Offer a headpat', 'context': 'Recipient needs reassurance'},
+            {'meaning': 'Enjoy a headpat', 'context': 'Sender has just received affection'},
+            {'meaning': 'Ask for a headpat', 'context': 'Sender wants some affection'}],
+            reading_vectors=[[1, 0, 0], [0, 1, 0], [0, 0, 1]])
+        before = copy.deepcopy(asset.card)
+        result = await self.query()
+        candidate = result.output['candidates'][0]
+        self.assertEqual(candidate['sticker_id'], asset.agent_id)
+        self.assertEqual([{key: value for key, value in reading.items() if key != 'retrieval_match'}
+                          for reading in candidate['readings']], before['readings'])
+        self.assertEqual(sum(bool(reading.get('retrieval_match')) for reading in candidate['readings']), 1)
+        self.assertEqual(asset.card, before)
+        self.assertNotIn('matched_reading', candidate)
+        self.assertNotIn('appearance_embedding_source', candidate)
+        self.assertNotIn('uncertainty', candidate)
+        self.assertNotIn('guidance', result.output)
+        self.assertNotIn('catalog_revision', result.output)
+        self.assertNotIn('candidate_count', result.output)
+        self.assertTrue(all(asset.asset_id not in (part.text or '') + (part.origin or '')
+                            for part in result.evidence_parts))
+
+    async def test_recent_history_guides_selection_without_listing_unrelated_hashes(self):
+        prior = self.asset(pack='familiar', caption='Hello', image_vector=[1, 0, 0])
+        other = self.asset(pack='other', caption='Goodbye', image_vector=[1, 0, 0])
+        removed_hash = 'sha256:' + 'f' * 64
+        self.deliveries.recent.return_value = [{'sticker_id': prior.asset_id}, {'sticker_id': removed_hash}]
+        result = await self.query(required_pack='other')
+        self.assertNotIn('recent_deliveries', result.output)
+        self.assertEqual(result.output['candidates'][0]['sticker_id'], other.agent_id)
+        self.assertEqual(result.output['candidates'][0]['visually_similar_deliveries'], [prior.agent_id])
+        self.assertEqual(self.catalog.style_memory.get('chat-a').recent_sticker_ids, [prior.asset_id, removed_hash])
+        repeat = await self.query(required_pack='familiar')
+        self.assertTrue(repeat.output['candidates'][0]['recently_delivered'])
+        empty = await self.query(required_pack='absent')
+        self.assertEqual(empty.output['status'], 'no_candidates')
+        self.assertNotIn('recent_deliveries', empty.output)
+        # Querying never becomes a delivery or a learned preference.
+        self.assertEqual([call[0] for call in self.deliveries.method_calls], ['recent'] * 3)
+        self.personas.save_sticker_persona.assert_not_awaited()
+
+    async def test_old_hash_call_and_short_reference_select_same_verified_original(self):
+        asset = self.asset(caption='Hello')
+        tool = StickerSendSelectedTool(self.catalog)
+        for reference in (asset.asset_id, asset.agent_id):
+            result = await tool.run({'selected_sticker_id': reference}, self.ctx)
+            self.assertEqual(result.output['sticker_id'], asset.agent_id)
+            self.assertEqual(result.stickers[0].source_id, asset.asset_id)
+            self.assertEqual(result.stickers[0].content_sha256, asset.content_hash)
+            self.assertNotIn('catalog_revision', result.output)
+            self.assertNotIn('guidance', result.output)
+        failed = await tool.run({'selected_sticker_id': 'sha256:' + 'f' * 64}, self.ctx)
+        self.assertFalse(failed.output['ok'])
+        self.assertEqual(failed.stickers, [])
+        self.assertNotIn('sticker_id', failed.output)
+
+    async def test_stale_or_unavailable_reference_never_becomes_a_semantic_substitute(self):
+        removed = self.asset(caption='A hug')
+        other = self.asset(caption='sid:999')
+        await self.catalog.aensure_loaded()
+        self.store.active_revision_id.return_value = 'r2'
+        self.store.load_snapshot.side_effect = lambda _: CatalogSnapshot(
+            'r2', {'embedding_space_id': 'space'}, '', (other,))
+        for reference in (removed.agent_id, 'sid:999'):
+            with self.subTest(reference=reference):
+                result = await self.query(intent_core=reference)
+                self.assertEqual(result.output['status'], 'no_candidates')
+                self.assertEqual(result.output['candidates'], [])
+                self.assertEqual(result.evidence_parts, [])
+                self.embeddings.embed_query.assert_not_awaited()
+                sent = await StickerSendSelectedTool(self.catalog).run(
+                    {'selected_sticker_id': reference}, self.ctx)
+                self.assertFalse(sent.output['ok'])
+                self.assertEqual(sent.stickers, [])
+        # A retained record whose original file is missing also stays exact.
+        (self.root / removed.aliases[0].path).rename(self.root / 'moved.png')
+        self.store.active_revision_id.return_value = 'r3'
+        self.store.load_snapshot.side_effect = lambda _: CatalogSnapshot(
+            'r3', {'embedding_space_id': 'space'}, '', (removed, other))
+        unavailable = await self.query(intent_core=removed.agent_id)
+        self.assertEqual(unavailable.output['candidates'], [])
+        self.embeddings.embed_query.assert_not_awaited()
+        natural = await self.query(intent_core='Offer a greeting, similar to sid:1')
+        self.assertEqual([candidate['sticker_id'] for candidate in natural.output['candidates']], [other.agent_id])
+        self.embeddings.embed_query.assert_awaited_once()

@@ -2,14 +2,16 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone as utc_timezone
+from datetime import datetime
 import json
 import logging
 from typing import Any
 
 from tgchatbot.domain.models import ToolResult
 from tgchatbot.domain.profiles import chat_profile
-from tgchatbot.domain.provenance import evidence_part_spans, message_evidence, present_tool_output
+from tgchatbot.domain.identities import actor_reference, canonical_actor_id
+from tgchatbot.domain.provenance import (AGENT_PRESENTATION_VERSION, evidence_part_spans, message_evidence,
+                                      present_image_evidence, present_tool_output)
 from tgchatbot.domain.timestamps import resolve_timezone
 from tgchatbot.tools.base import ToolContext, ToolSpec
 from tgchatbot.storage.postgres_store import message_body
@@ -49,7 +51,7 @@ class MemoryService:
         if not isinstance(actor_ids, list) or any(not isinstance(actor, str) or not actor.strip() for actor in actor_ids):
             raise ValueError('actor_ids must be an array of explicit stable actor IDs; use [] for agent preferences only')
         zone = resolve_timezone(timezone)
-        subjects = list(dict.fromkeys(actor.strip() for actor in actor_ids))
+        subjects = list(dict.fromkeys(canonical_actor_id(actor.strip()) for actor in actor_ids))
         if include_agent_preferences and 'agent' not in subjects:
             subjects.append('agent')
         if scope is not None:
@@ -64,9 +66,7 @@ class MemoryService:
                 refresh_error = 'Learning was unavailable; these are the last committed profiles.'
         snapshot = await self.store.fetch_profile_snapshot(session_id, subjects,
             expected_scope=scope)
-        result = {'ok': True, 'session_id': session_id,
-            'generation': snapshot['scope']['generation'] if snapshot['scope'] is not None else None,
-            'as_of': snapshot['as_of'], 'fetched_at': datetime.now(utc_timezone.utc), 'timezone': zone.key,
+        result = {'ok': True, 'as_of': snapshot['as_of'],
             'profiles': [chat_profile(profile) for profile in snapshot['profiles']]}
         if refresh_error:
             result['refresh_error'] = refresh_error
@@ -102,7 +102,7 @@ class MemoryService:
                 status = 'lexical only: embedding query failed; semantic coverage unavailable'
         rows = await self.store.search_excerpts(session_id, query, embedding=vector,
             model=self.embeddings.space_id if vector is not None else None,
-            actor_id=actor_id, before=before, after=after,
+            actor_id=canonical_actor_id(actor_id) if actor_id is not None else None, before=before, after=after,
             limit=self.config.search_results if limit is None else min(self.config.search_results, max(1, int(limit))))
         if scope is not None:
             await self.store.assert_scope(session_id, scope)
@@ -137,7 +137,7 @@ class MemoryService:
             source = entry['source']
             messages.append(message_evidence(source, message_id=message_id, role=source['role'],
                 fragments=entry['fragments'], total_characters=source['total_characters'], images=source_images,
-                timezone=zone.key))
+                timezone=zone.key, presentation_version=AGENT_PRESENTATION_VERSION))
         # These originals provide conversational context, not additional ranked
         # matches or extensions of an excerpt's exact source spans.
         related = await self._related_context(session_id, [source_id for source_id in source_ids if source_id in images], source_ids,
@@ -177,7 +177,8 @@ class MemoryService:
             while True:
                 item = message_evidence({**stored.message.metadata, 'parts': evidence_part_spans(stored.message)}, message_id=message_id,
                     role=stored.message.role, fragments=[{'offset': 0, 'text': shown}],
-                    total_characters=len(text), images=images[message_id], timezone=timezone, original=stored.message)
+                    total_characters=len(text), images=images[message_id], timezone=timezone, original=stored.message,
+                    presentation_version=AGENT_PRESENTATION_VERSION)
                 size = len(json.dumps(item, ensure_ascii=False, default=str)) + (2 if result else 0)
                 if size <= remaining or not shown:
                     break
@@ -222,6 +223,8 @@ class MemoryService:
         rows = await self.store.read_messages(session_id, message_ids, limit=self.config.read_messages)
         by_id = {item.db_id: item for item in rows}
         rows = [by_id[mid] for mid in message_ids if mid in by_id]
+        images = await self.store.describe_message_images(session_id,
+            [item.db_id for item in rows], expected_scope=scope)
         remaining = self.config.response_chars
         results = []
         for item in rows:
@@ -230,18 +233,15 @@ class MemoryService:
             excerpt = text[offset:end]
             record = message_evidence({**item.message.metadata, 'parts': evidence_part_spans(item.message)}, message_id=item.db_id,
                 role=item.message.role, fragments=[{'offset': offset, 'text': excerpt}],
-                total_characters=len(text), timezone=timezone, original=item.message)
+                total_characters=len(text), timezone=timezone, original=item.message,
+                images=images.get(item.db_id),
+                presentation_version=AGENT_PRESENTATION_VERSION)
             if end < len(text):
                 record['next_offset'] = end
             results.append(record)
             remaining -= len(excerpt)
             if remaining <= 0:
                 break
-        images = await self.store.describe_message_images(session_id,
-            [item['message_id'] for item in results], expected_scope=scope)
-        for item in results:
-            if images.get(item['message_id']):
-                item['images'] = images[item['message_id']]
         if scope is not None:
             await self.store.assert_scope(session_id, scope)
         result = {'ok': True, 'messages': results,
@@ -250,7 +250,7 @@ class MemoryService:
                 *(mid for mid in message_ids if mid in by_id and mid not in {item['message_id'] for item in results}),
                 *deferred_ids]))}
         if profile_fact_ids:
-            result['profile_facts'] = facts
+            result['profile_facts'] = [{**fact, 'actor_id': actor_reference(fact['actor_id'])} for fact in facts]
             result['unavailable_profile_fact_ids'] = sorted(set(profile_fact_ids) - {fact['fact_id'] for fact in facts})
         return result
 
@@ -262,12 +262,13 @@ class MemorySearchTool:
         self.spec = ToolSpec('memory_search',
             'Find earlier messages in this chat, including history before /reset. Use a natural-language query and optional participant or time filters. '
             'Ordered matches identify contributing message_ids; messages contains their exact fragments in chronological order, each with its speaker and time. '
+            'quoted_lines marks 1-based inclusive quoted line ranges, distinct from the sender\'s new assertions. '
             'Use memory_read for omitted text, nearby context or selected images; the returned fragments may already suffice. '
             'Image references belong to their originals; related_context lists nearby originals separately from ranked matches. '
             'Earlier /reset_full history is unavailable.',
             {'type': 'object', 'properties': {
                 'query': {'type': 'string', 'description': 'Describe the event, fact or exchange you need; include distinctive words when known.'},
-                'actor_id': {'type': 'string', 'description': 'Optional stable actor ID from message provenance. Finds passages involving this participant; surrounding sources retain their own speakers. Omit when unknown.'},
+                'actor_id': {'type': 'string', 'description': 'Optional participant reference from message provenance, e.g. person_id:123. Finds passages involving this participant; surrounding sources retain their own speakers. Omit when unknown.'},
                 'after': {'type': 'string', 'description': 'Inclusive ISO timestamp; unzoned values use the conversation timezone'},
                 'before': {'type': 'string', 'description': 'Exclusive ISO timestamp; unzoned values use the conversation timezone'}},
              'required': ['query'], 'additionalProperties': False}, self)
@@ -320,7 +321,8 @@ class MemoryReadTool:
                 selected = await self.memory.store.resolve_message_images(ctx.session_id,
                     args.get('message_ids') or [], image_ids, expected_scope=ctx.scope, timezone=ctx.timezone)
                 output['image_results'] = selected['image_results']
-                evidence_parts = selected['evidence_parts']
+                evidence_parts = [present_image_evidence(part, ctx.timezone,
+                    presentation_version=AGENT_PRESENTATION_VERSION) for part in selected['evidence_parts']]
         except (ValueError, TypeError) as exc:
             output = {'ok': False, 'error': str(exc)}
         return ToolResult('', self.spec.name, output, evidence_parts=evidence_parts)
@@ -338,7 +340,7 @@ class UserProfileFetchTool:
             'Names never select identities. Empty facts do not mean no preferences.',
             {'type': 'object', 'properties': {
                 'actor_ids': {'type': 'array', 'items': {'type': 'string'},
-                    'description': 'Stable IDs from message provenance, such as telegram:user:123; [] fetches only agent preferences'},
+                    'description': 'Participant references from message provenance, e.g. person_id:123; [] fetches only agent preferences'},
                 'include_agent_preferences': {'type': 'boolean', 'description': 'Include source-backed agent style preferences; defaults to true'}},
              'required': ['actor_ids'], 'additionalProperties': False}, self)
 

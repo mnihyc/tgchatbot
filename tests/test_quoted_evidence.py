@@ -122,10 +122,11 @@ class QuotedEvidenceWorkflows(BusinessTestCase):
         evidence = records[0]
         self.assertEqual(evidence['quoted_fragments'], [{'offset': text.index(quoted), 'text': quoted}])
         self.assertEqual(evidence['fragments'], [{'offset': 0, 'text': text}])
-        self.assertEqual(evidence['speaker']['id'], 'telegram:user:7')
-        self.assertEqual(evidence['reply_to_actor']['actor_id'], 'telegram:user:8')
+        self.assertEqual(evidence['speaker']['id'], 'person_id:7')
+        self.assertEqual(evidence['reply_to_actor']['actor_id'], 'person_id:8')
         self.assertEqual(evidence['quote'], reply_quote)
-        self.assertEqual(evidence['forward_origin'], forwarded)
+        self.assertEqual(evidence['forward_origin'], {'type': 'user',
+            'actor': {'actor_id': 'person_id:9', 'actor_name': 'Other participant'}})
         self.assertEqual(evidence['reply_to_source_id'], '4')
         self.assertEqual(evidence['source_chat_id'], '100')
         self.assertEqual((await self.store.read_messages(self.session, [source.db_id]))[0].message, before)
@@ -142,6 +143,7 @@ class QuotedEvidenceWorkflows(BusinessTestCase):
         incoming.parts = [MessagePart(PartKind.TEXT, text=generated, origin='auto_note'),
             MessagePart(PartKind.TEXT, text=caption), MessagePart(PartKind.TEXT, text=own_second_part)]
         source = await self.runtime.ingest_user_message(session_id=self.session, incoming_message=incoming)
+        canonical_before = (await self.store.read_messages(self.session, [source.db_id]))[0].message
         start = len(generated) + 1 + caption.index(quoted)
         expected_quote = [{'offset': start, 'text': quoted}]
         compacted_input = self.runtime._normalize_compaction_message(source.message, original=source.message)
@@ -173,5 +175,5 @@ class QuotedEvidenceWorkflows(BusinessTestCase):
         own_offset = message_body(source.message).index(own_second_part)
         own = await memory.read(self.session, [source.db_id], offset=own_offset, timezone='Asia/Singapore')
         self.assertNotIn('quoted_fragments', own['messages'][0])
-        self.assertEqual((await reopened.read_messages(self.session, [source.db_id]))[0].message, source.message)
+        self.assertEqual((await reopened.read_messages(self.session, [source.db_id]))[0].message, canonical_before)
         self.assertEqual((await reopened.get_profile(self.session, 'telegram:user:7'))[0]['source_ids'], [source.db_id])

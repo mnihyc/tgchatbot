@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from tgchatbot.core.token_estimator import TokenEstimator
+from tgchatbot.domain.attachments import compact_memory_image_evidence
 from tgchatbot.domain.models import ConversationMessage, MessagePart, MessageRole, PartKind, ProviderResponse, SessionSettings, ToolCall, UsageInfo
 from tgchatbot.tools.base import ToolSpec
 
@@ -27,11 +28,14 @@ class ProviderCapabilities:
     multimodal_tool_results: bool = False
 
 
-def tool_message_evidence(message: ConversationMessage) -> list[MessagePart]:
+def tool_message_evidence(message: ConversationMessage, *, images: bool = True) -> list[MessagePart]:
     """The runtime marks the JSON summary separately from ordered tool evidence."""
     if not message.metadata.get('tool_evidence'):
         return []
-    return [part for part in message.parts if part.origin != 'tool_output']
+    parts = [part for part in message.parts if part.origin != 'tool_output']
+    if images and message.metadata.get('presentation_version', 1) >= 2:
+        return compact_memory_image_evidence(parts)
+    return parts
 
 
 def evidence_text(part: MessagePart) -> str:

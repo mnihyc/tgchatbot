@@ -17,11 +17,10 @@ class FileSendTool:
         self.spec = ToolSpec(
             name='file_send',
             description=(
-                'Prepare selected workspace files for delivery to this chat. '
-                'Paths are relative to the session directory; absolute paths within it are also accepted. '
-                'Returned workspace_path values are relative to that directory. '
-                'This returns file and delivery status, not file contents for analysis. '
-                'Wait for a confirmed delivery result before saying the files were sent.'
+                'Prepare workspace files for delivery after this turn. '
+                'Use paths relative to the session directory, or absolute paths within it. '
+                'Returns preparation status and relative workspace_path, not file contents. '
+                'Pending preparation is not confirmed delivery.'
             ),
             parameters_schema={
                 'type': 'object',

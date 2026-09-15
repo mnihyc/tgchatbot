@@ -55,6 +55,37 @@ class MemoryImageToolTests(BusinessTestCase):
         self.assertTrue(result.output['ok'], result.output)
         return result
 
+    async def test_imported_frames_keep_selectable_occurrences_without_repeating_synthetic_descriptors(self):
+        message = ConversationMessage.user_text('This is the cobalt animation.', metadata={
+            'source': 'telegram', 'source_chat_id': '100', 'source_message_id': '1',
+            'actor_id': 'telegram:user:101', 'actor_kind': 'user', 'actor_name': 'Participant',
+            'sent_at': '2026-01-02T03:00:01+00:00'})
+        hint = 'Animation: cobalt.webm. Original export file unavailable; retained previews available.'
+        message.parts.append(MessagePart(PartKind.TEXT, text=hint, origin='attachment_reference'))
+        message.parts.extend(MessagePart(PartKind.IMAGE, mime_type='image/png', filename=f'cobalt-preview-{index}.png',
+            data_b64=PIXEL, detail='auto') for index in range(5))
+        message.parts.append(MessagePart(PartKind.IMAGE, mime_type='image/png', data_b64=PIXEL,
+            text='A custom caption describing the final pose.'))
+        source = await self.store.append_message(self.session, message)
+        canonical_before = (await self.store.read_messages(self.session, [source.db_id]))[0].message
+        read = await self.tool('memory_read', {'message_ids': [source.db_id]})
+        record = read.output['messages'][0]
+        self.assertEqual(record['annotations'], [
+            {'kind': 'attachment', 'text': hint},
+            {'kind': 'attachment', 'text': 'A custom caption describing the final pose.'}])
+        self.assertEqual(len(record['images']), 6)
+        self.assertEqual(len({image['image_id'] for image in record['images']}), 6)
+        self.assertTrue(all(image['available'] for image in record['images']))
+        selected = await self.tool('memory_read', {'message_ids': [source.db_id],
+            'image_ids': [record['images'][2]['image_id']]})
+        self.assertEqual(selected.output['image_results'][0]['status'], 'selected')
+        self.assertEqual(len(selected.evidence_parts), 2)
+        label = json.loads(selected.evidence_parts[0].text.removeprefix('[Original image evidence: ')[:-1])
+        self.assertEqual(label['speaker']['id'], 'person_id:101')
+        self.assertEqual(label['image_id'], record['images'][2]['image_id'])
+        self.assertNotIn('source_revision', label)
+        self.assertEqual((await self.store.read_messages(self.session, [source.db_id]))[0].message, canonical_before)
+
     async def test_captionless_nearby_image_has_its_own_identity_and_never_changes_match(self):
         photo = await self.original(1, image=True, actor=102)
         caption = await self.original(2, 'The cobalt suitcase is finally packed.', actor=101)
@@ -69,9 +100,9 @@ class MemoryImageToolTests(BusinessTestCase):
         self.assertNotIn('images', records[caption.db_id])
         self.assertEqual(output['related_context'], [photo.db_id])
         neighbor = records[photo.db_id]
-        self.assertEqual(neighbor['speaker']['id'], 'telegram:user:102')
+        self.assertEqual(neighbor['speaker']['id'], 'person_id:102')
         self.assertEqual(neighbor['fragments'], [], 'A captionless photo has no words spoken by its sender')
-        self.assertEqual(neighbor['annotations'], [{'kind': 'attachment', 'text': message_body(photo.message)}])
+        self.assertNotIn('annotations', neighbor, 'The image reference already describes the synthetic attachment.')
         self.assertNotIn('partial', neighbor, 'Attachment annotations retain the complete selected evidence')
         self.assertTrue(neighbor['images'][0]['available'])
         self.assertNotIn(unrelated.db_id, output['related_context'])
@@ -99,13 +130,12 @@ class MemoryImageToolTests(BusinessTestCase):
         self.assertEqual([row['message_id'] for row in output['messages']], [question.db_id, answer.db_id])
         self.assertEqual([row['fragments'] for row in output['messages']],
             [[{'offset': 0, 'text': text}] for text in ('Which suitcase?', 'This one.')])
-        self.assertEqual(output['messages'][1]['annotations'],
-            [{'kind': 'attachment', 'text': answer.message.parts[-1].text}])
+        self.assertNotIn('annotations', output['messages'][1])
         self.assertFalse(any(row.get('partial') for row in output['messages']))
         self.assertNotIn('images', output['messages'][0])
         self.assertTrue(output['messages'][1]['images'][0]['available'])
-        self.assertEqual(output['messages'][1]['speaker']['id'], 'telegram:user:102')
-        self.assertEqual(output['messages'][1]['forward_origin']['sender_user']['id'], 900)
+        self.assertEqual(output['messages'][1]['speaker']['id'], 'person_id:102')
+        self.assertEqual(output['messages'][1]['forward_origin']['actor']['actor_id'], 'person_id:900')
         self.assertEqual(output.get('related_context', []), [])
 
     async def test_read_defaults_are_text_only_and_explicit_selection_has_attributed_evidence(self):
@@ -114,7 +144,7 @@ class MemoryImageToolTests(BusinessTestCase):
             result = await self.tool('memory_read', {'message_ids': [photo.db_id], **optional})
             record = result.output['messages'][0]
             self.assertEqual(record['fragments'], [{'offset': 0, 'text': 'My packed suitcase.'}])
-            self.assertEqual(record['annotations'], [{'kind': 'attachment', 'text': photo.message.parts[-1].text}])
+            self.assertNotIn('annotations', record)
             self.assertNotIn('partial', record)
             self.assertFalse(result.evidence_parts)
             self.assertNotIn('image_results', result.output)
@@ -123,7 +153,7 @@ class MemoryImageToolTests(BusinessTestCase):
         self.assertEqual(selected.output['image_results'], [{'image_id': image_id, 'status': 'selected'}])
         self.assertEqual([part.kind for part in selected.evidence_parts], [PartKind.TEXT, PartKind.IMAGE])
         self.assertTrue(all(part.origin == 'memory_image:' + image_id for part in selected.evidence_parts))
-        self.assertIn('telegram:user:101', selected.evidence_parts[0].text)
+        self.assertIn('person_id:101', selected.evidence_parts[0].text)
         self.assertIn(f'"message_id": {photo.db_id}', selected.evidence_parts[0].text)
         self.assertEqual(selected.evidence_parts[1].data_b64, PIXEL)
         self.assertNotIn(PIXEL, json.dumps(selected.output))
@@ -167,7 +197,7 @@ class MemoryImageToolTests(BusinessTestCase):
         self.assertEqual(output['related_context'], [photo.db_id])
         self.assertEqual([row['message_id'] for row in output['messages']], [photo.db_id, first.db_id, second.db_id])
         self.assertEqual([row['speaker']['id'] for row in output['messages']],
-            ['telegram:user:102', 'telegram:user:101', 'telegram:user:103'])
+            ['person_id:102', 'person_id:101', 'person_id:103'])
 
     async def test_small_context_window_follows_ranked_evidence_instead_of_import_order(self):
         self.store.config = replace(self.store.config, relationship_neighbors=0)

@@ -90,7 +90,8 @@ class InternalGenerationToolsWorkflows(BusinessTestCase):
                 source = await self.runtime.ingest_user_message(session_id=self.session,
                     incoming_message=ConversationMessage.user_text('I prefer jasmine tea.', metadata={
                         'actor_id': 'telegram:user:7', 'actor_kind': 'user', 'actor_name': 'Alex'}))
-                original_message = deepcopy(source.message)
+                original_message = deepcopy((await self.store.read_messages(
+                    self.session, [source.db_id]))[0].message)
                 worker = MemoryWorker(store=self.store, embeddings=SimpleNamespace(enabled=False),
                     providers={name: provider}, config=self.config)
                 # A learning request has its own allowance; live chat keeps its

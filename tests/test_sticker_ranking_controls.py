@@ -49,7 +49,7 @@ class StickerRankingControlTests(unittest.IsolatedAsyncioTestCase):
 
         candidates = result.output['candidates']
         self.assertEqual([item['sticker_id'] for item in candidates],
-                         [first.asset_id, photo.asset_id, second.asset_id, alternative.asset_id])
+                         [first.agent_id, photo.agent_id, second.agent_id, alternative.agent_id])
         self.assertEqual(candidates[0]['caption'], '辛苦了')
         self.assertEqual(candidates[-1]['packs'], ['another', 'collected'])
         self.assertEqual(len({part.origin for part in result.evidence_parts}), 4)
@@ -62,22 +62,22 @@ class StickerRankingControlTests(unittest.IsolatedAsyncioTestCase):
         result = await self.query(candidate_budget=4)
 
         self.assertEqual([item['sticker_id'] for item in result.output['candidates']],
-                         [first.asset_id, photo.asset_id, second.asset_id, similar.asset_id])
-        self.assertNotIn(irrelevant.asset_id, str(result.output['candidates']))
+                         [first.agent_id, photo.agent_id, second.agent_id, similar.agent_id])
+        self.assertNotIn(irrelevant.agent_id, str(result.output['candidates']))
 
     async def test_visual_diversity_keeps_requested_continuity_and_small_pool(self):
         first, second, photo, similar, alternative, irrelevant = self.expression_choices()
 
         preferred = await self.query(preferred_pack='familiar', candidate_budget=2)
         self.assertEqual([item['sticker_id'] for item in preferred.output['candidates']],
-                         [first.asset_id, similar.asset_id])
+                         [first.agent_id, similar.agent_id])
         required = await self.query(required_pack='familiar', candidate_budget=4)
         self.assertEqual({item['sticker_id'] for item in required.output['candidates']},
-                         {photo.asset_id, similar.asset_id})
+                         {photo.agent_id, similar.agent_id})
         self.assertEqual(next(item['caption'] for item in required.output['candidates']
-                              if item['sticker_id'] == similar.asset_id), '抱抱')
-        exact = await StickerQueryTool(self.catalog).run({'intent_core': similar.asset_id}, self.ctx)
-        self.assertEqual([item['sticker_id'] for item in exact.output['candidates']], [similar.asset_id])
+                              if item['sticker_id'] == similar.agent_id), '抱抱')
+        exact = await StickerQueryTool(self.catalog).run({'intent_core': similar.agent_id}, self.ctx)
+        self.assertEqual([item['sticker_id'] for item in exact.output['candidates']], [similar.agent_id])
 
     async def test_identical_image_vectors_do_not_invent_diversity_or_discard_captions(self):
         for caption, score in [('抱抱', .9), ('辛苦了', .8), ('休息吧', .7)]:
@@ -98,11 +98,11 @@ class StickerRankingControlTests(unittest.IsolatedAsyncioTestCase):
 
         visual = await self.query(expression_cue=cue, candidate_budget=2)
         self.assertEqual([item['sticker_id'] for item in visual.output['candidates']],
-                         [first.asset_id, similar.asset_id])
+                         [first.agent_id, similar.agent_id])
         captioned = await self.query(candidate_budget=2,
             advanced={'text_constraints': {'text_priority': 'require'}})
         self.assertEqual([item['sticker_id'] for item in captioned.output['candidates']],
-                         [first.asset_id, similar.asset_id])
+                         [first.agent_id, similar.agent_id])
         self.assertTrue(all(item['caption'] for item in captioned.output['candidates']))
 
     async def test_description_fallback_does_not_claim_visual_diversity(self):
@@ -113,7 +113,7 @@ class StickerRankingControlTests(unittest.IsolatedAsyncioTestCase):
         result = await self.query(candidate_budget=4)
 
         self.assertEqual([item['sticker_id'] for item in result.output['candidates']],
-                         [first.asset_id, photo.asset_id, second.asset_id, similar.asset_id])
+                         [first.agent_id, photo.agent_id, second.agent_id, similar.agent_id])
 
     async def test_many_readings_and_image_match_do_not_crowd_out_second_asset(self):
         multi = self.asset(
@@ -128,8 +128,8 @@ class StickerRankingControlTests(unittest.IsolatedAsyncioTestCase):
 
         candidates = result.output['candidates']
         self.assertEqual([item['sticker_id'] for item in candidates],
-                         [multi.asset_id, other.asset_id])
-        self.assertEqual(candidates[0]['matched_reading']['meaning'], 'Offer comfort')
+                         [multi.agent_id, other.agent_id])
+        self.assertEqual(next(reading['meaning'] for reading in candidates[0]['readings'] if reading.get('retrieval_match')), 'Offer comfort')
         self.assertEqual(len({part.origin for part in result.evidence_parts}), 2)
 
     async def test_inspecting_again_neither_rotates_choices_nor_learns_a_delivery(self):
@@ -164,11 +164,11 @@ class StickerRankingControlTests(unittest.IsolatedAsyncioTestCase):
         result = await self.query(candidate_budget=2)
 
         by_id = {item['sticker_id']: item for item in result.output['candidates']}
-        self.assertEqual(set(by_id), {reassurance.asset_id, dismissal.asset_id})
-        self.assertEqual(by_id[dismissal.asset_id]['visually_similar_deliveries'],
-                         [reassurance.asset_id])
-        self.assertEqual(by_id[dismissal.asset_id]['readings'][0]['meaning'], 'Request distance')
-        self.assertFalse(by_id[dismissal.asset_id]['recently_delivered'])
+        self.assertEqual(set(by_id), {reassurance.agent_id, dismissal.agent_id})
+        self.assertEqual(by_id[dismissal.agent_id].get('visually_similar_deliveries', []),
+                         [reassurance.agent_id])
+        self.assertEqual(by_id[dismissal.agent_id]['readings'][0]['meaning'], 'Request distance')
+        self.assertFalse(by_id[dismissal.agent_id].get('recently_delivered', False))
         self.assertEqual(result.stickers, [])
 
     async def test_freshness_does_not_override_required_pack_or_forbid_only_repeat(self):
@@ -180,8 +180,8 @@ class StickerRankingControlTests(unittest.IsolatedAsyncioTestCase):
                                   diversity_preference='prefer_fresh_variant')
 
         self.assertEqual([item['sticker_id'] for item in result.output['candidates']],
-                         [fitting.asset_id])
-        self.assertTrue(result.output['candidates'][0]['recently_delivered'])
+                         [fitting.agent_id])
+        self.assertTrue(result.output['candidates'][0].get('recently_delivered', False))
 
 
 class StickerImageAdmissionControlTests(BusinessTestCase):
@@ -231,13 +231,13 @@ class StickerImageAdmissionControlTests(BusinessTestCase):
 
                 self.assertEqual([item['sticker_id']
                     for item in query_results[-1].output['candidates']],
-                    [global_asset.asset_id, fresh.asset_id])
+                    [global_asset.agent_id, fresh.agent_id])
                 continuation = next(item for item in self.wire[1]['input']
                                     if item.get('type') == 'function_call_output')
                 output = json.loads(continuation['output'][0]['text'])
-                expected = [global_asset.asset_id, fresh.asset_id][:image_limit]
+                expected = [global_asset.agent_id, fresh.agent_id][:image_limit]
                 self.assertEqual([item['sticker_id'] for item in output['candidates']], expected)
-                self.assertEqual(output['candidate_count'], image_limit)
+                self.assertEqual(len(output['candidates']), image_limit)
                 self.assertEqual(sum(part['type'] == 'input_image'
                     for part in continuation['output']), image_limit)
                 if image_limit == 1:

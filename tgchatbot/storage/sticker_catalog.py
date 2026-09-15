@@ -24,8 +24,9 @@ ITEM_UPSERT = '''INSERT INTO sticker_catalog_items
                     provenance=EXCLUDED.provenance,dimensions=EXCLUDED.dimensions,image_vector_id=EXCLUDED.image_vector_id,
                     reading_vectors_id=EXCLUDED.reading_vectors_id,state=EXCLUDED.state,error=EXCLUDED.error'''
 
-ITEM_SELECT = """SELECT item.*, image.payload AS image_vector, readings.payload AS reading_vectors
+ITEM_SELECT = """SELECT item.*, ref.sticker_number, image.payload AS image_vector, readings.payload AS reading_vectors
     FROM sticker_catalog_items item
+    LEFT JOIN sticker_catalog_references ref ON ref.asset_id=item.asset_id
     LEFT JOIN sticker_catalog_vectors image ON image.id=item.image_vector_id
     LEFT JOIN sticker_catalog_vectors readings ON readings.id=item.reading_vectors_id"""
 
@@ -49,6 +50,13 @@ class CatalogAsset:
     reading_vectors: np.ndarray | None
     state: str = 'ready'
     error: str | None = None
+    sticker_number: int | None = None
+
+    @property
+    def agent_id(self) -> str:
+        if self.sticker_number is None:
+            raise ValueError('Sticker reference unavailable; reload the initialized catalog')
+        return f'sid:{self.sticker_number}'
 
     @property
     def family_ids(self) -> tuple[str, ...]:
@@ -105,7 +113,7 @@ class StickerCatalogStore:
         return CatalogAsset(row['asset_id'], row['content_hash'],
             tuple(CatalogAlias(**alias) for alias in row['aliases']), row['media'], row['generated_card'],
             row['corrections'], row['card'], row['provenance'], vector(row['image_vector']),
-            vector(row['reading_vectors'], True), row['state'], row['error'])
+            vector(row['reading_vectors'], True), row['state'], row['error'], row['sticker_number'])
 
     async def load_snapshot(self, revision_id: str | None = None) -> CatalogSnapshot:
         # Revisions are immutable after activation. Capture head and its contents
@@ -225,6 +233,8 @@ class StickerCatalogStore:
     async def iter_assets(self, revision_id: str | None = None, *, pack: str | None = None,
                           state: str | None = None, asset_ids: list[str] | None = None, details: bool = False):
         """Stream catalog records from one snapshot, never their binary vectors."""
+        if asset_ids is not None:
+            asset_ids = await self.resolve_asset_ids(asset_ids)
         async with self.store.pool.connection() as conn:
             async with conn.transaction():
                 await conn.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
@@ -266,6 +276,8 @@ class StickerCatalogStore:
     async def export_corrections(self, revision_id: str | None = None, *,
                                  asset_ids: list[str] | None = None, pack: str | None = None) -> dict[str, dict]:
         """Export complete saved overrides in the builder's existing input format."""
+        if asset_ids is not None:
+            asset_ids = await self.resolve_asset_ids(asset_ids)
         result = {row['asset_id']: row['corrections'] async for row in
                   self.iter_assets(revision_id, asset_ids=asset_ids, pack=pack, details=True)}
         if asset_ids and (missing := set(asset_ids) - result.keys()):
@@ -274,10 +286,29 @@ class StickerCatalogStore:
 
     async def get_asset(self, asset_id: str, revision_id: str | None = None) -> CatalogAsset | None:
         async with self.store.pool.connection() as conn:
-            row = await (await conn.execute(ITEM_SELECT + ''' WHERE item.asset_id=%s AND
+            row = await (await conn.execute(ITEM_SELECT + ''' WHERE (item.asset_id=%s OR 'sid:'||ref.sticker_number::text=%s) AND
                 item.revision_id=COALESCE(%s,(SELECT revision_id FROM sticker_catalog_head WHERE singleton))''',
-                (asset_id, revision_id))).fetchone()
+                (asset_id, asset_id, revision_id))).fetchone()
         return self._asset(row) if row else None
+
+    async def resolve_asset_ids(self, asset_ids: list[str]) -> list[str]:
+        """Operator selectors accept tool references; correction files keep hashes."""
+        references = [value for value in asset_ids if value.startswith('sid:')]
+        if not references:
+            return asset_ids
+        async with self.store.pool.connection() as conn:
+            rows = await (await conn.execute('''SELECT asset_id,'sid:'||sticker_number::text AS reference
+                FROM sticker_catalog_references WHERE 'sid:'||sticker_number::text=ANY(%s)''',
+                (references,))).fetchall()
+        resolved = {row['reference']: row['asset_id'] for row in rows}
+        return [resolved.get(value, value) for value in asset_ids]
+
+    async def agent_sticker_id(self, asset_id: str) -> str | None:
+        """Resolve a historical receipt without loading or requiring active media."""
+        async with self.store.pool.connection() as conn:
+            row = await (await conn.execute('''SELECT 'sid:'||sticker_number::text AS reference
+                FROM sticker_catalog_references WHERE asset_id=%s''', (asset_id,))).fetchone()
+        return row['reference'] if row else None
 
     async def begin_revision(self, *, source_root: str, recipe: dict, assets: list[CatalogAsset] | None = None, dimensions: int = 0, expected_parent: str | None | object = _UNSET, pack_descriptions: dict[str, str] | None = None) -> str:
         revision_id = uuid.uuid4().hex
@@ -302,6 +333,7 @@ class StickerCatalogStore:
                         FROM sticker_catalog_items WHERE revision_id=%s''', (revision_id, parent))
                 if assets is not None:
                     for asset in assets:
+                        await self._register_reference(conn, asset.asset_id)
                         await conn.execute(ITEM_UPSERT, (revision_id, asset.asset_id, asset.content_hash,
                             Jsonb([{'path': a.path, 'pack': a.pack} for a in asset.aliases]), Jsonb(asset.media),
                             Jsonb(asset.generated_card), Jsonb(asset.corrections), Jsonb(asset.card),
@@ -343,10 +375,17 @@ class StickerCatalogStore:
                 revision = await (await conn.execute('SELECT state FROM sticker_catalog_revisions WHERE id=%s FOR UPDATE', (revision_id,))).fetchone()
                 if not revision or revision['state'] != 'staging':
                     raise CatalogConflict('Only a staging revision can be changed')
+                await self._register_reference(conn, asset_id)
                 await conn.execute(ITEM_UPSERT, (revision_id, asset_id, content_hash, Jsonb(aliases), Jsonb(media),
                     Jsonb(generated_card), Jsonb(corrections), Jsonb(card), Jsonb(provenance), dimensions,
                     await self._save_vector(conn, image_vector, dimensions),
                     await self._save_vector(conn, reading_vectors, dimensions), state, error))
+
+    @staticmethod
+    async def _register_reference(conn, asset_id):
+        await conn.execute('''INSERT INTO sticker_catalog_references(asset_id)
+            SELECT %s WHERE NOT EXISTS (SELECT 1 FROM sticker_catalog_references WHERE asset_id=%s)
+            ON CONFLICT DO NOTHING''', (asset_id, asset_id))
 
     @staticmethod
     async def _save_vector(conn, vector, dimensions):

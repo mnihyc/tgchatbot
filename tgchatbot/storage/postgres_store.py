@@ -35,6 +35,8 @@ from tgchatbot.domain.models import (
     StickerMode, ToolHistoryMode,
 )
 from tgchatbot.operational import from_env
+from tgchatbot.domain.provenance import AGENT_PRESENTATION_VERSION
+from tgchatbot.domain.attachments import generated_attachment_reference
 
 SCHEMA_VERSION = 3
 EMBEDDING_DIMENSIONS = 1536
@@ -365,9 +367,7 @@ class PostgresStore:
             item['kind'] = part.kind.value
             part_text = part.text
             if part_text is None and part.kind != PartKind.TEXT:
-                attributes = {'kind': part.kind.value, 'filename': part.filename, 'mime': part.mime_type,
-                    'size': part.size_bytes, 'location': part.artifact_path, 'description': part.detail}
-                part_text = '[Attachment reference: ' + ', '.join(f'{key}={value}' for key, value in attributes.items() if value is not None) + ']'
+                part_text = generated_attachment_reference(part)
             if part_text is not None:
                 if fragments:
                     fragments.append('\n')
@@ -388,13 +388,14 @@ class PostgresStore:
         # never to canonical evidence or a capacity-evicted sidecar file.
         metadata.pop('provider_native', None)
         metadata.pop('provider_native_artifact', None)
+        metadata.pop('presentation_version', None)
         body = ''.join(fragments)
         # Do not use artifact filenames in the source fingerprint: retrying an update
         # can create a new filename for the same bytes.
         fingerprint_parts = [{key: value for key, value in asdict(part).items()
-            if key not in {'preview_ref', 'artifact_path'}} for part in message.parts]
+            if key not in {'preview_ref', 'artifact_path', 'workspace_path'}} for part in message.parts]
         fingerprint_metadata = {key: value for key, value in (message.metadata or {}).items()
-            if key not in {'provider_native', 'provider_native_artifact', 'source_revision'}}
+            if key not in {'provider_native', 'provider_native_artifact', 'source_revision', 'presentation_version'}}
         fingerprint = _json_hash({'role': message.role.value, 'name': message.name,
             'parts': fingerprint_parts, 'metadata': fingerprint_metadata})
         return body, parts, metadata, fingerprint, previews
@@ -415,6 +416,18 @@ class PostgresStore:
             'reply_to_source_id': str(metadata['reply_to_source_id']) if metadata.get('reply_to_source_id') is not None else None,
             'sent_at': _timestamp(metadata.get('sent_at')),
         }
+
+    async def allocate_tool_call_id(self, name: str) -> str:
+        """Allocate a compact application call reference from the DB sequence.
+
+        Reserving a sequence value need not create a message row. Like rolled
+        back inserts, it leaves an ordinary gap while preventing collisions
+        across processes, restarts and context resets.
+        """
+        async with self.pool.connection() as conn:
+            row = await (await conn.execute(
+                "SELECT nextval(pg_get_serial_sequence('messages','id')) AS id")).fetchone()
+        return f'{name}:{row["id"]}'
 
     async def append_message(self, session_id: str, message: ConversationMessage, estimated_tokens: int | None = None,
                              *, expected_scope: Mapping[str, Any] | None = None,
@@ -464,17 +477,19 @@ class PostgresStore:
             message_id = existing['id']
             revision = existing['source_revision'] + 1
             await conn.execute('''UPDATE messages SET source_revision=%s,actor_id=%s,actor_kind=%s,
-                actor_name=%s,topic_id=%s,reply_to_source_id=%s,presentation=NULL WHERE id=%s''',
-                (revision, canonical['actor_id'], canonical['actor_kind'], canonical['actor_name'], canonical['topic_id'], canonical['reply_to_source_id'], message_id))
+                actor_name=%s,topic_id=%s,reply_to_source_id=%s,presentation=%s WHERE id=%s''',
+                (revision, canonical['actor_id'], canonical['actor_kind'], canonical['actor_name'], canonical['topic_id'], canonical['reply_to_source_id'],
+                 Jsonb({'presentation_version': AGENT_PRESENTATION_VERSION}), message_id))
             await self._invalidate_sources(conn, session_id, scope['generation'], [message_id])
             await conn.execute('UPDATE sessions SET revision=revision+1 WHERE session_id=%s', (session_id,))
         else:
             row = await (await conn.execute('''INSERT INTO messages
                 (session_id,generation,context_id,role,source,source_chat_id,source_message_id,actor_id,
-                 actor_kind,actor_name,topic_id,reply_to_source_id,sent_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s,now())) RETURNING id''',
+                 actor_kind,actor_name,topic_id,reply_to_source_id,sent_at,presentation)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,COALESCE(%s,now()),%s) RETURNING id''',
                 (session_id, scope['generation'], scope['context_id'], message.role.value,
-                 *(canonical[key] for key in _CANONICAL_COLUMNS), canonical['sent_at']))).fetchone()
+                 *(canonical[key] for key in _CANONICAL_COLUMNS), canonical['sent_at'],
+                 Jsonb({'presentation_version': AGENT_PRESENTATION_VERSION})))).fetchone()
             message_id, revision = row['id'], 1
         for reference, data in previews.items():
             await conn.execute('''INSERT INTO message_previews (session_id,reference,payload)
@@ -484,7 +499,7 @@ class PostgresStore:
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s)''',
             (message_id, revision, body, Jsonb(parts), Jsonb(metadata), max(0, int(estimate)), fingerprint, _timestamp(metadata.get('edited_at'))))
         if message.metadata.get('provider_native'):
-            await conn.execute('UPDATE messages SET presentation=%s WHERE id=%s',
+            await conn.execute("UPDATE messages SET presentation=COALESCE(presentation,'{}'::jsonb)||%s WHERE id=%s",
                 (Jsonb({'provider_native': message.metadata['provider_native']}), message_id))
         searchable = []
         # Context controls and memory lookups remain replayable history, but
@@ -522,6 +537,8 @@ class PostgresStore:
         body, part_data, metadata = row['body'], row['parts'], dict(row['metadata'])
         if presentation and row.get('presentation'):
             projection = row['presentation']
+            if 'presentation_version' in projection:
+                metadata['presentation_version'] = projection['presentation_version']
             body, part_data = projection.get('body', body), projection.get('parts', part_data)
             if projection.get('tool_evidence'):
                 metadata['tool_evidence'] = True
@@ -1221,7 +1238,8 @@ class PostgresStore:
                 lifecycle=lifecycle, source_kind=source_kind, parent_block_ids=parent_ids or replace_ids,
                 topic_labels=list(topic_labels or []), actor_labels=list(actor_labels or []), time_start=time_start,
                 time_end=time_end, retained_raw_excerpt_count=retained_raw_excerpt_count,
-                validator_status=validator_status, validator_score=validator_score, structured_data=structured_data or {})
+                validator_status=validator_status, validator_score=validator_score, structured_data=structured_data or {},
+                presentation_version=AGENT_PRESENTATION_VERSION)
             row = await (await conn.execute('''INSERT INTO memory_blocks
                 (session_id,generation,context_id,sequence_no,summary_text,estimated_tokens,source_ids,source_revisions,details)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *''',

@@ -8,6 +8,7 @@ import httpx
 
 from tgchatbot.config import ChatCompletionsConfig
 from tgchatbot.core.token_estimator import TokenEstimator
+from tgchatbot.domain.attachments import attachment_description
 from tgchatbot.domain.models import ConversationMessage, MessagePart, MessageRole, PartKind, ProviderResponse, SessionSettings, ToolCall, UsageInfo
 from tgchatbot.logging_config import dump_llm_exchange
 from tgchatbot.providers.base import (ControlDescriptor, ProviderCapabilities, ProviderOutcomeError, RequestTokenEstimate,
@@ -77,7 +78,7 @@ class ChatCompletionsProvider:
                 }]}]
             if call_id and metadata.get('tool_phase') == 'result':
                 return self.make_tool_result_items(ToolCall(message.name or '', str(call_id), {}),
-                    payload.get('output') or {}, tool_message_evidence(message))
+                    payload.get('output') or {}, tool_message_evidence(message, images=False))
         role = 'user' if message.role == MessageRole.TOOL else message.role.value
         parts: list[dict[str, Any]] = []
         for part in message.parts:
@@ -89,14 +90,9 @@ class ChatCompletionsProvider:
                 else:
                     parts.append({'type': 'text', 'text': '[Image attached; image input is unavailable for this provider profile or message role.]'})
             elif part.kind == PartKind.FILE:
-                descriptor = f'[Attached file: {part.filename or "file"}'
-                if part.mime_type:
-                    descriptor += f', {part.mime_type}'
-                if part.size_bytes is not None:
-                    descriptor += f', {part.size_bytes} bytes'
-                if part.artifact_path:
-                    descriptor += f', remote_path={part.artifact_path}'
-                parts.append({'type': 'text', 'text': descriptor + ']'})
+                descriptor = attachment_description(part,
+                    presentation_version=int(message.metadata.get('presentation_version', 1)))
+                parts.append({'type': 'text', 'text': descriptor})
             elif part.kind == PartKind.STICKER:
                 parts.append({'type': 'text', 'text': part.text or '[Sticker]'})
         if not parts:

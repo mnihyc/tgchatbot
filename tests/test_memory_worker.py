@@ -594,7 +594,8 @@ class WorkerWorkflowTests(BusinessTestCase):
         before = len(self.provider.requests)
         for _ in range(2):
             profile = (await memory.fetch_profiles(self.session, ['telegram:user:7']))['profiles'][0]
-            self.assertEqual([fact['id'] for fact in profile['facts']], [fact['id'] for fact in reversed(old)])
+            self.assertEqual([(fact['fact_id'], fact['claim']) for fact in profile['facts']],
+                [(fact['id'], fact['claim']) for fact in reversed(old)])
             self.assertGreater(len(json.dumps(profile, ensure_ascii=False).encode('utf-8')), 900)
         self.assertEqual(len(self.provider.requests), before)
         self.assertEqual(await self.profile_jobs(), [])
@@ -615,9 +616,17 @@ class WorkerWorkflowTests(BusinessTestCase):
         profile = result['profiles'][0]
         self.assertEqual(len(self.provider.requests), before)
         self.assertGreater(len(json.dumps(profile, ensure_ascii=False).encode('utf-8')), 900)
-        self.assertEqual([fact['id'] for fact in profile['facts']], [fact['id'] for fact in reversed(old)])
-        self.assertTrue(all(fact['asserted_by'] == 'telegram:user:7' and fact['source_ids'] == [source.db_id]
-                            for fact in profile['facts']))
+        self.assertEqual([(fact['fact_id'], fact['claim']) for fact in profile['facts']],
+            [(fact['id'], fact['claim']) for fact in reversed(old)])
+        self.assertTrue(all(fact['asserted_by'] == 'person_id:7' for fact in profile['facts']))
+        evidence = await memory.read(self.session, profile_fact_ids=[fact['fact_id'] for fact in profile['facts']])
+        self.assertEqual({fact['fact_id'] for fact in evidence['profile_facts']}, {fact['id'] for fact in old})
+        self.assertTrue(all(fact['source_ids'] == [source.db_id] for fact in evidence['profile_facts']))
+        self.assertEqual(evidence['unavailable_profile_fact_ids'], [])
+        self.assertEqual(evidence['messages'][0]['speaker']['id'], 'person_id:7')
+        self.assertEqual(evidence['messages'][0]['fragments'], [
+            {'offset': 0, 'text': 'Please keep your replies calm and concise.'}])
+        self.assertEqual(len(self.provider.requests), before)
 
     async def test_lazy_subject_selection_does_not_spend_its_batch_on_unrelated_old_backlog(self):
         older = await self.source('Unrelated older material. ' * 100, 1, actor='telegram:user:8')

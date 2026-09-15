@@ -11,6 +11,7 @@ from tgchatbot.core.memory import MemoryService
 from tgchatbot.core.memory_worker import MemoryWorker
 from tgchatbot.domain.models import ProviderResponse
 from tgchatbot.domain.profiles import profile_size
+from tgchatbot.domain.identities import canonical_actor_id
 from tgchatbot.tools.import_desktop import import_file
 
 
@@ -59,7 +60,7 @@ class ProfileSourceChronologyWorkflows(BusinessTestCase):
         initial = await self.memory.fetch_profiles(self.session, ['telegram:user:11', 'telegram:user:22'])
         self.assertNotIn('refresh_error', initial)
         self.assertEqual(len(self.provider.requests), 1)
-        initial_profiles = {profile['actor_id']: profile for profile in initial['profiles']}
+        initial_profiles = {canonical_actor_id(profile['actor_id']): profile for profile in initial['profiles']}
 
         # These older messages arrive after September has already been learned.
         # Both people share a display name and had different preferences then.
@@ -90,7 +91,7 @@ class ProfileSourceChronologyWorkflows(BusinessTestCase):
             result = await self.memory.fetch_profiles(self.session, ['telegram:user:11', 'telegram:user:22'])
         model.assert_awaited_once()
         self.assertNotIn('refresh_error', result)
-        profiles = {profile['actor_id']: profile for profile in result['profiles']}
+        profiles = {canonical_actor_id(profile['actor_id']): profile for profile in result['profiles']}
         self.assertEqual({fact['claim'] for fact in profiles['telegram:user:11']['facts']},
             {'Prefers unsweetened jasmine tea', 'Collects fountain pens'})
         self.assertEqual(profiles['telegram:user:22'], initial_profiles['telegram:user:22'])

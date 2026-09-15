@@ -12,6 +12,7 @@ from tgchatbot.core.memory import MemoryService
 from tgchatbot.core.memory_worker import MemoryWorker
 from tgchatbot.core.runtime import AgentRuntime
 from tgchatbot.domain.models import ConversationMessage, MessagePart, PartKind
+from tgchatbot.domain.identities import actor_reference
 from tgchatbot.tools.base import ToolContext
 
 
@@ -71,9 +72,9 @@ class CompactProfileToolWorkflows(BusinessTestCase):
         self.assertEqual(current[direct['id']]['claim'], direct['claim'])
         self.assertEqual(current[direct['id']]['kind'], 'explicit')
         self.assertNotIn('asserted_by', current[direct['id']], 'The containing person is the direct asserter.')
-        self.assertEqual(current[inferred['id']]['asserted_by'], self.other)
+        self.assertEqual(current[inferred['id']]['asserted_by'], actor_reference(self.other))
         self.assertEqual(current[inferred['id']]['kind'], 'inferred')
-        self.assertEqual(current[style['id']]['asserted_by'], self.actor,
+        self.assertEqual(current[style['id']]['asserted_by'], actor_reference(self.actor),
             'An agent style preference must retain the person who requested it.')
         self.assertEqual(profiles['agent']['subject_kind'], 'agent_preferences')
         for key in ('valid_from', 'valid_to'):
@@ -108,11 +109,11 @@ class CompactProfileToolWorkflows(BusinessTestCase):
         args['profile_fact_ids'] = [tea['id'], style['id'], tea['id'], missing]
         result = await self.tool('memory_read', args)
         self.assertEqual(result['profile_facts'], [
-            {'fact_id': tea['id'], 'actor_id': self.actor, 'source_ids': [source.db_id], 'current': True},
+            {'fact_id': tea['id'], 'actor_id': actor_reference(self.actor), 'source_ids': [source.db_id], 'current': True},
             {'fact_id': style['id'], 'actor_id': 'agent', 'source_ids': [source.db_id], 'current': True}])
         self.assertEqual(result['unavailable_profile_fact_ids'], [missing])
         self.assertEqual([row['message_id'] for row in result['messages']], [source.db_id])
-        self.assertEqual(result['messages'][0]['speaker']['id'], self.actor)
+        self.assertEqual(result['messages'][0]['speaker']['id'], actor_reference(self.actor))
         self.assertEqual(result['messages'][0]['fragments'], [{'offset': 0, 'text': source.message.parts[0].text}])
         self.assertEqual(await self.pending_profile_evidence(), pending)
         self.assertEqual(self.provider.requests, [], 'Reading citations must not start a learning batch.')
@@ -166,6 +167,36 @@ class CompactProfileToolWorkflows(BusinessTestCase):
         self.assertEqual(explicit.output['image_results'][0]['status'], 'selected')
         self.assertEqual([part.kind for part in explicit.evidence_parts], [PartKind.TEXT, PartKind.IMAGE])
 
+    async def test_typed_actor_references_reopen_profiles_and_search_without_crossing_reset(self):
+        tea = await self.source(1, 'My preferred drink is jasmine tea.')
+        coffee = await self.source(2, 'My preferred drink is black coffee.', actor=self.other)
+        await self.fact('Prefers jasmine tea.', tea)
+        await self.fact('Prefers black coffee.', coffee, actor=self.other, asserted_by=self.other)
+        await self.store.reset_context(self.session)
+        reopened = await self.new_store()
+        memory = MemoryService(reopened, self.embeddings)
+        result = await self.tool('user_profile_fetch', {'actor_ids': [actor_reference(self.actor), self.actor,
+            actor_reference(self.other)], 'include_agent_preferences': False}, memory=memory)
+        self.assertEqual([profile['actor_id'] for profile in result['profiles']],
+                         [actor_reference(self.actor), actor_reference(self.other)])
+        self.assertEqual([profile['facts'][0]['claim'] for profile in result['profiles']],
+                         ['Prefers jasmine tea.', 'Prefers black coffee.'])
+        self.assertEqual(set(result), {'ok', 'as_of', 'profiles'})
+        self.assertNotIn('source_revision', result['profiles'][0]['identity']['last_message'])
+        search = await self.tool('memory_search', {'query': 'preferred drink', 'actor_id': actor_reference(self.actor)}, memory=memory)
+        self.assertEqual(search, await memory.search(self.session, 'preferred drink', actor_id=self.actor,
+            timezone='Asia/Singapore'))
+        self.assertIn(tea.db_id, [mid for match in search['matches'] for mid in match['message_ids']])
+        self.assertEqual({message['speaker']['id'] for message in search['messages']},
+                         {actor_reference(self.actor), actor_reference(self.other)})
+        self.assertEqual((await reopened.read_messages(self.session, [tea.db_id]))[0].message.metadata['actor_id'], self.actor)
+        await reopened.reset_full(self.session, self.config.default_session_settings())
+        current = await self.tool('user_profile_fetch', {'actor_ids': [actor_reference(self.actor)],
+            'include_agent_preferences': False}, memory=memory)
+        self.assertEqual(current['profiles'][0]['status'], 'unknown_identity')
+        self.assertEqual(current['profiles'][0]['facts'], [])
+        self.assertEqual((await memory.search(self.session, 'preferred drink', actor_id=actor_reference(self.actor)))['messages'], [])
+
     async def test_restart_and_compaction_keep_recorded_full_payload_and_append_compact_refresh(self):
         source = await self.source(1, 'I prefer jasmine tea.')
         fact = await self.fact('Prefers jasmine tea.', source)
@@ -178,6 +209,7 @@ class CompactProfileToolWorkflows(BusinessTestCase):
         ):
             pair.append(await self.runtime.record_tool_observation(session_id=self.session,
                 name='user_profile_fetch', phase=phase, payload=payload))
+        canonical_pair = await self.store.read_messages(self.session, [row.db_id for row in pair])
         warm = copy.deepcopy((await self.runtime._get_live_state(self.session)).raw_messages)
         self.runtime.invalidate_session(self.session)
         self.assertEqual((await self.runtime._get_live_state(self.session)).raw_messages, warm)
@@ -191,7 +223,7 @@ class CompactProfileToolWorkflows(BusinessTestCase):
             providers={'openai': self.provider}, memory=memory)
         await runtime.prepare_context(session_id=self.session)
         originals = await reopened.read_messages(self.session, [row.db_id for row in pair])
-        self.assertEqual([row.message for row in originals], [row.message for row in pair])
+        self.assertEqual([row.message for row in originals], [row.message for row in canonical_pair])
         earlier_fact = originals[-1].message.metadata['tool_payload']['output']['profiles'][0]['facts'][0]
         self.assertEqual(earlier_fact['source_ids'], [source.db_id])
         self.assertEqual(earlier_fact['id'], fact['id'])

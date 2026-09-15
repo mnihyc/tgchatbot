@@ -153,7 +153,7 @@ class CompactionEvidenceRuntimeTests(BusinessTestCase):
                     records.append(value)
         self.assertEqual(len(records), 1)
         evidence = records[0]
-        self.assertEqual(evidence['speaker']['id'], 'telegram:user:7')
+        self.assertEqual(evidence['speaker']['id'], 'person_id:7')
         self.assertEqual(evidence['speaker']['name'], name)
         self.assertEqual(evidence['topic_id'], '44')
         self.assertEqual([fragment['text'] for fragment in evidence['fragments']],
@@ -168,7 +168,7 @@ class CompactionEvidenceRuntimeTests(BusinessTestCase):
         self.assertIn('Attached report: a two-page schedule.', annotations)
         self.assertIn('schedule.txt', annotations)
         self.assertNotIn(literal, annotations)
-        self.assertEqual(result['actor_labels'], ['telegram:user:7'])
+        self.assertEqual(result['actor_labels'], ['person_id:7'])
         self.assertEqual(wire[0]['contents'][-1]['role'], 'user')
         self.assertEqual((await self.store.read_messages(self.session, [source.db_id]))[0].message,
             before)

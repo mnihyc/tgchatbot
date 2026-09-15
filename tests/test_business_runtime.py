@@ -18,6 +18,7 @@ from tgchatbot.domain.models import (
     PromptInjectionMode, ProviderResponse, StickerMode, ToolCall, ToolHistoryMode,
 )
 from tgchatbot.domain.provenance import present_tool_output
+from tgchatbot.domain.identities import actor_reference, canonical_actor_id
 
 
 def text_of(messages):
@@ -94,7 +95,7 @@ class RuntimeWorkflowTests(BusinessTestCase):
             self.assertEqual(len(headers), 1)
             identity = json.loads(headers[0].removeprefix('[Message provenance: ').removesuffix(']'))
             self.assertEqual(identity['message_id'], peer.db_id)
-            self.assertEqual(identity['speaker'], {'id': 'telegram:user:888', 'name': 'Helper', 'kind': 'bot'})
+            self.assertEqual(identity['speaker'], {'id': 'person_id:888', 'name': 'Helper', 'kind': 'bot'})
 
         await self.store.close()
         restarted_store = await self.new_store()
@@ -111,11 +112,11 @@ class RuntimeWorkflowTests(BusinessTestCase):
         recalled = {item['message_id']: item for item in
             (await memory.read(self.session, [peer.db_id, own.db_id]))['messages']}
         self.assertEqual(recalled[own.db_id]['fragments'], [{'offset': 0, 'text': own_text}])
-        self.assertEqual(recalled[own.db_id]['speaker']['id'], 'telegram:user:999')
+        self.assertEqual(recalled[own.db_id]['speaker']['id'], 'person_id:999')
         self.assertEqual(recalled[own.db_id]['reply_to_source_id'], '81')
         self.assertEqual(recalled[own.db_id]['sent_at'], '2026-01-02T11:04:05+08:00')
         self.assertEqual(recalled[own.db_id]['topic_id'], '77')
-        self.assertEqual(recalled[peer.db_id]['speaker']['id'], 'telegram:user:888')
+        self.assertEqual(recalled[peer.db_id]['speaker']['id'], 'person_id:888')
 
         settings.tool_history_mode = ToolHistoryMode.NATIVE_SAME_PROVIDER
         await restarted_store.save_session(self.session, settings)
@@ -479,7 +480,7 @@ class ProfileContextWorkflowTests(BusinessTestCase):
             facts = [(profile["actor_id"], fact["fact_id"])
                      for profile in response_payload["profiles"] for fact in profile["facts"]]
             self.assertEqual(facts,
-                             [(self.actor, fact_id)])
+                             [(actor_reference(self.actor), fact_id)])
             self.assertNotIn('source_ids', rendered)
             await self.runtime.record_assistant_text(session_id=self.session, text=first.text)
             await self.turn("And for tomorrow?", 3)
@@ -503,7 +504,7 @@ class ProfileContextWorkflowTests(BusinessTestCase):
         self.assertIn(self.claim, text_of(compacted_input))
         self.assertIn('"fact_id": ' + str(fact_id), text_of(compacted_input))
         controls = [item for item in compacted_input if item.metadata.get("source_role") == "transport"]
-        self.assertTrue(any(self.actor in text_of([item]) for item in controls))
+        self.assertTrue(any(actor_reference(self.actor) in text_of([item]) for item in controls))
         self.assertTrue(all(item.role != MessageRole.USER for item in controls))
 
     async def test_image_retirement_refreshes_profiles_once_without_creating_new_human_evidence(self):
@@ -523,7 +524,7 @@ class ProfileContextWorkflowTests(BusinessTestCase):
         self.assertIn(self.claim, text_of(changed_history))
         call, result = await self.refresh_pair()
         output = result.message.metadata["tool_payload"]["output"]
-        self.assertIn(self.actor, call.message.metadata["tool_payload"]["arguments"]["actor_ids"])
+        self.assertIn(actor_reference(self.actor), call.message.metadata["tool_payload"]["arguments"]["actor_ids"])
         sent_pair = [item for item in changed_history if item.metadata.get("synthetic_role") == "profile_refresh"]
         self.assertEqual([item.role for item in sent_pair], [MessageRole.TOOL, MessageRole.TOOL])
         self.assertTrue(output['as_of'].endswith('+00:00'))
@@ -606,7 +607,7 @@ class ProfileContextWorkflowTests(BusinessTestCase):
         _, result = await self.refresh_pair()
         refresh = result.message
         profiles = refresh.metadata["tool_payload"]["output"]["profiles"]
-        by_id = {profile["actor_id"]: profile for profile in profiles}
+        by_id = {canonical_actor_id(profile["actor_id"]): profile for profile in profiles}
         self.assertEqual(set(by_id), {self.actor, "telegram:user:8", "telegram:user:9", "agent"})
         self.assertEqual(by_id[self.actor]["identity"]["actor_name"], "Alex")
         self.assertEqual(by_id["telegram:user:8"]["identity"]["actor_name"], "Alex")

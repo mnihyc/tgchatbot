@@ -18,6 +18,7 @@ import uuid
 from psycopg import Error as DatabaseError
 
 from tgchatbot.domain.models import MessageRole
+from tgchatbot.domain.identities import canonical_actor_id
 from tgchatbot.domain.timestamps import format_timestamp
 from tgchatbot.embeddings import EmbeddingClient, EmbeddingConfig
 from tgchatbot.operational import from_env
@@ -340,6 +341,7 @@ async def profile_records(store: PostgresStore, session_id: str, *, max_bytes: i
                           options: OperationsConfig | None = None) -> AsyncIterator[dict[str, Any]]:
     """Inspect current profiles and pending material without refreshing them."""
     from tgchatbot.domain.profiles import present_profile
+    actor_id = canonical_actor_id(actor_id) if actor_id is not None else None
     options = options if options is not None else from_env(OperationsConfig, 'MEMORY_OPERATIONS')
     scope = await existing_scope(store, session_id)
     after = ''

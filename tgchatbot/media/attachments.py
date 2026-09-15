@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 import posixpath
 
-from tgchatbot.domain.models import MessagePart, PartKind
+from tgchatbot.domain.models import MessagePart
 from tgchatbot.logging_config import clip_for_log
 
 logger = logging.getLogger(__name__)
@@ -47,7 +47,6 @@ async def sync_attachment_parts(session_id: str, parts: list[MessagePart], remot
             except Exception:
                 logger.warning('attachment.sync.cleanup_failed sid=%s file=%s', clip_for_log(session_id, limit=48), path.name)
     updated_parts: list[MessagePart] = []
-    synced_entries: list[str] = []
     for part in parts:
         if not (part.artifact_path and part.remote_sync):
             updated_parts.append(part)
@@ -56,21 +55,9 @@ async def sync_attachment_parts(session_id: str, parts: list[MessagePart], remot
         remote_path = paths_by_source.get(local_key)
         if remote_path:
             shown_path = posixpath.relpath(remote_path, remote_workspace.session_paths(session_id).root)
-            synced_entries.append(f"{part.filename or Path(remote_path).name} -> {shown_path}")
-            updated_parts.append(replace(part, artifact_path=remote_path, remote_sync=True))
+            updated_parts.append(replace(part, artifact_path=remote_path,
+                workspace_path=shown_path, remote_sync=True))
             continue
-        filename = part.filename or 'file'
         updated_parts.append(replace(part, artifact_path=None, remote_sync=False,
             detail=((part.detail + '; ') if part.detail else '') + 'remote copy unavailable: upload failed'))
-        updated_parts.append(
-            MessagePart(
-                kind=PartKind.TEXT,
-                text=f'[Attachment sync failed for remote use: {filename}]',
-                remote_sync=False,
-                origin='auto_note',
-            )
-        )
-    note_parts: list[MessagePart] = []
-    if synced_entries:
-        note_parts.append(MessagePart(kind=PartKind.TEXT, text='[Attachment synced to remote for tool use (paths relative to workspace): ' + '; '.join(synced_entries) + ']', remote_sync=False, origin='auto_note'))
-    return [*note_parts, *updated_parts]
+    return updated_parts

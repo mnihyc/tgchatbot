@@ -5,6 +5,7 @@ from datetime import datetime
 import json
 
 from tgchatbot.domain.timestamps import format_timestamp_fields
+from tgchatbot.domain.identities import actor_reference
 
 
 def present_profile(document: dict, timezone: str | None = None) -> dict:
@@ -37,6 +38,13 @@ def chat_profile(document: dict) -> dict:
     newly fetched tool results, never to previously recorded conversation history.
     """
     result = dict(document)
+    result['actor_id'] = actor_reference(document['actor_id'])
+    if document.get('identity'):
+        identity = dict(document['identity'])
+        if identity.get('last_message'):
+            identity['last_message'] = {key: value for key, value in identity['last_message'].items()
+                                      if key != 'source_revision'}
+        result['identity'] = identity
     result['facts'] = []
     for fact in document.get('facts', []):
         item = {'fact_id': fact['id'], 'claim': fact['claim'], 'kind': fact['kind']}
@@ -44,7 +52,7 @@ def chat_profile(document: dict) -> dict:
             if fact.get(field) is not None:
                 item[field] = fact[field]
         if fact.get('asserted_by') != document['actor_id']:
-            item['asserted_by'] = fact['asserted_by']
+            item['asserted_by'] = actor_reference(fact['asserted_by'])
         result['facts'].append(item)
     return result
 

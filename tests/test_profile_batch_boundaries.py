@@ -23,11 +23,14 @@ class ProfileBatchBoundaries(BusinessTestCase):
         self.actor = 'telegram:user:7'
 
     async def source(self, number, text):
-        return await self.runtime.ingest_user_message(session_id=self.session,
+        stored = await self.runtime.ingest_user_message(session_id=self.session,
             incoming_message=ConversationMessage.user_text(text, metadata={
                 'source': 'telegram', 'source_chat_id': '100', 'source_message_id': str(number),
                 'actor_id': self.actor, 'actor_kind': 'user', 'actor_name': 'Participant',
                 'sent_at': f'2026-01-01T00:00:{number:02d}+00:00'}))
+        # Learning must preserve canonical originals independently of the
+        # versioned working presentation returned by live intake.
+        return (await self.store.read_messages(self.session, [stored.db_id]))[0]
 
     def model(self, declarations):
         async def generate(**request):

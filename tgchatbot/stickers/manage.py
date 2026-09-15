@@ -29,7 +29,7 @@ def parse_args(argv=None):
         command = commands.add_parser(name, help=help_text)
         command.add_argument('--revision', help='Catalog revision ID; defaults to the active catalog')
         if name == 'asset':
-            command.add_argument('asset_id', help='Exact content ID shown by assets')
+            command.add_argument('asset_id', help='Content ID from assets or sid reference from sticker_query')
         if name in {'assets', 'corrections'}:
             command.add_argument('--pack', help='Filter by exact current pack membership')
         if name == 'assets':

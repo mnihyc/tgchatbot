@@ -171,6 +171,7 @@ class ContextPreparationTests(BusinessTestCase):
 
     async def test_many_pages_prepare_without_loading_or_installing_full_archive(self):
         originals = await self.archive()
+        canonical_before = await self.store.read_messages(self.session, [row.db_id for row in originals])
         windows = []
         loader = self.store.load_compaction_window
         async def capture(*args, **kwargs):
@@ -189,7 +190,7 @@ class ContextPreparationTests(BusinessTestCase):
         self.assertLessEqual(max(len(window.blocks) for window in windows), 4)
         self.assertEqual(self.runtime._live_sessions, {})
         stored = await self.store.read_messages(self.session, [row.db_id for row in originals])
-        self.assertEqual([row.message for row in stored], [row.message for row in originals])
+        self.assertEqual(stored, canonical_before)
         kinds = {request['response_schema_name'] for request in self.provider.requests}
         self.assertIn('episode_memory_block', kinds)
         self.assertIn('digest_memory_block', kinds)
