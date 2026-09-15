@@ -259,9 +259,18 @@ class PostgresStore:
         async with self.pool.connection() as conn:
             return self._scope(await self._session(conn, session_id))
 
+    async def get_existing_scope(self, session_id: str) -> dict[str, int] | None:
+        """Read a conversation boundary without creating a missing session."""
+        async with self.pool.connection() as conn:
+            row = await (await conn.execute('SELECT generation,context_id,revision FROM sessions '
+                'WHERE session_id=%s', (session_id,))).fetchone()
+        return self._scope(row) if row is not None else None
+
     async def assert_scope(self, session_id: str, expected_scope: Mapping[str, Any], *,
                            generation_only: bool = False) -> dict[str, int]:
-        scope = await self.get_scope(session_id)
+        scope = await self.get_existing_scope(session_id)
+        if scope is None:
+            raise StaleScopeError('conversation scope is unavailable')
         self._check_scope(scope, expected_scope, context=not generation_only)
         return scope
 
@@ -1575,6 +1584,51 @@ class PostgresStore:
         return {'scope': dict(scope) if scope is not None else None, 'as_of': as_of,
                 'profiles': profiles, 'facts': facts,
                 **({'pending_material': pending_material} if include_pending else {})}
+
+    async def resolve_profile_fact_sources(self, session_id: str, fact_ids: Sequence[int], *,
+                                            expected_scope: Mapping[str, Any] | None = None) -> list[dict[str, Any]]:
+        """Resolve profile references to intact originals without refreshing learning.
+
+        A fact can remain inspectable after leaving the current profile. Changed
+        or unavailable evidence, another chat, and earlier generations cannot.
+        """
+        ids = _ids(fact_ids)
+        if not ids:
+            return []
+        async with self.pool.connection() as conn:
+            await conn.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+            scope = await (await conn.execute('SELECT generation,context_id,revision FROM sessions '
+                'WHERE session_id=%s', (session_id,))).fetchone()
+            if scope is None:
+                if expected_scope is not None:
+                    raise StaleScopeError('conversation scope is unavailable')
+                return []
+            self._check_scope(scope, expected_scope)
+            rows = await (await conn.execute('''SELECT f.id AS fact_id,f.subject_actor_id AS actor_id,
+                evidence.source_ids,
+                (COALESCE(f.id=ANY(c.fact_ids),false) AND f.status IN ('active','superseded')
+                    AND (f.valid_from IS NULL OR f.valid_from<=now())
+                    AND (f.valid_to IS NULL OR f.valid_to>now())) AS current
+                FROM profile_facts f LEFT JOIN profile_current c
+                    ON c.session_id=f.session_id AND c.generation=f.generation AND c.actor_id=f.subject_actor_id
+                CROSS JOIN LATERAL (
+                    SELECT array_agg(m.id ORDER BY m.sent_at,m.id) AS source_ids
+                    FROM unnest(f.source_ids) source(id) JOIN messages m ON m.id=source.id
+                    AND m.session_id=f.session_id AND m.generation=f.generation
+                    AND NOT m.hidden AND NOT m.deleted
+                    AND m.source_revision::text=f.source_revisions->>m.id::text
+                ) evidence
+                WHERE f.session_id=%s AND f.generation=%s AND f.id=ANY(%s) AND f.valid
+                    AND cardinality(evidence.source_ids)=cardinality(f.source_ids)
+                ORDER BY f.id''', (session_id, scope['generation'], ids))).fetchall()
+        if expected_scope is not None:
+            # Use a new read snapshot to detect an edit/reset during resolution;
+            # scope discovery here must never create a session as a side effect.
+            current = await self.get_existing_scope(session_id)
+            if current is None:
+                raise StaleScopeError('conversation scope is unavailable')
+            self._check_scope(current, expected_scope)
+        return rows
 
     async def claim_profile_batch(self, **kwargs):
         from tgchatbot.storage.profiles import claim_batch

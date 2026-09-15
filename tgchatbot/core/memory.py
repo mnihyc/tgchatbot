@@ -8,6 +8,7 @@ import logging
 from typing import Any
 
 from tgchatbot.domain.models import ToolResult
+from tgchatbot.domain.profiles import chat_profile
 from tgchatbot.domain.provenance import evidence_part_spans, message_evidence, present_tool_output
 from tgchatbot.domain.timestamps import resolve_timezone
 from tgchatbot.tools.base import ToolContext, ToolSpec
@@ -62,11 +63,11 @@ class MemoryService:
                 logger.warning('memory.profile_refresh_unavailable error=%s', type(exc).__name__)
                 refresh_error = 'Learning was unavailable; these are the last committed profiles.'
         snapshot = await self.store.fetch_profile_snapshot(session_id, subjects,
-            expected_scope=scope, max_bytes=self.config.profile_bytes)
+            expected_scope=scope)
         result = {'ok': True, 'session_id': session_id,
             'generation': snapshot['scope']['generation'] if snapshot['scope'] is not None else None,
             'as_of': snapshot['as_of'], 'fetched_at': datetime.now(utc_timezone.utc), 'timezone': zone.key,
-            'profiles': snapshot['profiles']}
+            'profiles': [chat_profile(profile) for profile in snapshot['profiles']]}
         if refresh_error:
             result['refresh_error'] = refresh_error
 
@@ -186,18 +187,35 @@ class MemoryService:
                 remaining -= size
         return result
 
-    async def read(self, session_id: str, message_ids: list[int], *, scope=None, offset=0, length=None,
-                   include_neighbors=False, timezone=None):
-        if len(message_ids) > self.config.read_messages or not message_ids or any(int(value) <= 0 for value in message_ids):
+    async def read(self, session_id: str, message_ids: list[int] | None = None, *, scope=None, offset=0, length=None,
+                   include_neighbors=False, timezone=None, profile_fact_ids: list[int] | None = None):
+        message_ids = message_ids or []
+        profile_fact_ids = profile_fact_ids or []
+        if len(message_ids) > self.config.read_messages or any(int(value) <= 0 for value in message_ids):
             raise ValueError(f'Read 1–{self.config.read_messages} positive message IDs returned by memory_search')
+        if not message_ids and not profile_fact_ids:
+            raise ValueError('Provide message_ids or profile_fact_ids to read their original evidence')
+        if any(int(value) <= 0 for value in profile_fact_ids):
+            raise ValueError('profile_fact_ids must contain positive fact_id values from user_profile_fetch')
         offset, length = int(offset), self.config.read_chars if length is None else int(length)
         if offset < 0 or not 1 <= length <= self.config.read_chars:
             raise ValueError(f'Offset must be nonnegative; length must be 1–{self.config.read_chars} characters')
+        if profile_fact_ids and scope is None:
+            # Keep resolving a fact and reading its originals under one source
+            # revision even for callers outside an active agent turn.
+            scope = await self.store.get_existing_scope(session_id)
         if scope is not None:
             await self.store.assert_scope(session_id, scope)
         requested = list(dict.fromkeys(message_ids))
-        message_ids = requested
-        if include_neighbors:
+        facts = []
+        if profile_fact_ids:
+            facts = await self.store.resolve_profile_fact_sources(session_id, profile_fact_ids, expected_scope=scope)
+            requested = list(dict.fromkeys([*requested, *(mid for fact in facts for mid in fact['source_ids'])]))
+        # Existing original-read limits own text admission. A fact can cite many
+        # originals; return their remaining IDs for explicit follow-up reads.
+        message_ids = requested[:self.config.read_messages]
+        deferred_ids = requested[self.config.read_messages:]
+        if include_neighbors and message_ids:
             from tgchatbot.storage.relationships import expand_message_ids
             message_ids = await expand_message_ids(self.store, session_id, message_ids,
                 limit=self.config.read_messages, expected_scope=scope)
@@ -226,9 +244,15 @@ class MemoryService:
                 item['images'] = images[item['message_id']]
         if scope is not None:
             await self.store.assert_scope(session_id, scope)
-        return {'ok': True, 'messages': results,
-            'unavailable_ids': sorted(set(requested) - set(by_id)),
-            'omitted_ids': [mid for mid in message_ids if mid in by_id and mid not in {item['message_id'] for item in results}]}
+        result = {'ok': True, 'messages': results,
+            'unavailable_ids': sorted(set(requested[:self.config.read_messages]) - set(by_id)),
+            'omitted_ids': list(dict.fromkeys([
+                *(mid for mid in message_ids if mid in by_id and mid not in {item['message_id'] for item in results}),
+                *deferred_ids]))}
+        if profile_fact_ids:
+            result['profile_facts'] = facts
+            result['unavailable_profile_fact_ids'] = sorted(set(profile_fact_ids) - {fact['fact_id'] for fact in facts})
+        return result
 
 
 
@@ -262,7 +286,8 @@ class MemoryReadTool:
     def __init__(self, memory: MemoryService) -> None:
         self.memory = memory
         self.spec = ToolSpec('memory_read',
-            'Read selected original message_ids, returning the same message records as memory_search. '
+            'Read original message_ids or the supporting originals for profile_fact_ids from user_profile_fetch. '
+            'Returns the same message records as memory_search; profile evidence reads do not run learning. '
             'Paginate long text with offset and length; include_neighbors adds reply and nearby context. '
             'Images remain descriptions unless image_ids selects them for visual examination. '
             'Each selected image must belong to an explicitly requested original, not an incidental neighbor. '
@@ -270,11 +295,13 @@ class MemoryReadTool:
             {'type': 'object', 'properties': {
                 'message_ids': {'type': 'array', 'items': {'type': 'integer'},
                     'description': 'Original message_id values from evidence records or provenance.'},
+                'profile_fact_ids': {'type': 'array', 'items': {'type': 'integer'},
+                    'description': 'Optional fact_id values from user_profile_fetch. Opens their supporting originals; current=false marks historical facts. Use returned omitted_ids for further reads.'},
                 'image_ids': {'type': 'array', 'items': {'type': 'string'},
                     'description': 'Optional image references beside those originals; include each owning original in message_ids. Absent or empty keeps the read text-only.'},
                 'offset': {'type': 'integer'}, 'length': {'type': 'integer'},
                 'include_neighbors': {'type': 'boolean', 'description': 'Also read explicit reply target and nearby messages in the same topic, within the configured read window'}},
-             'required': ['message_ids'], 'additionalProperties': False}, self)
+             'additionalProperties': False}, self)
 
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         evidence_parts = []
@@ -282,7 +309,8 @@ class MemoryReadTool:
             offset = args.get('offset')
             output = await self.memory.read(ctx.session_id, args.get('message_ids', []), scope=ctx.scope,
                 offset=0 if offset is None else offset, length=args.get('length'),
-                include_neighbors=args.get('include_neighbors') is True, timezone=ctx.timezone)
+                include_neighbors=args.get('include_neighbors') is True, timezone=ctx.timezone,
+                profile_fact_ids=args.get('profile_fact_ids'))
             image_ids = args.get('image_ids')
             if image_ids is None:
                 image_ids = []  # Strict provider schemas express omitted optional fields as null.
@@ -290,7 +318,7 @@ class MemoryReadTool:
                 raise ValueError('image_ids must be an array of image references returned by memory_search or memory_read')
             if image_ids:
                 selected = await self.memory.store.resolve_message_images(ctx.session_id,
-                    args.get('message_ids', []), image_ids, expected_scope=ctx.scope, timezone=ctx.timezone)
+                    args.get('message_ids') or [], image_ids, expected_scope=ctx.scope, timezone=ctx.timezone)
                 output['image_results'] = selected['image_results']
                 evidence_parts = selected['evidence_parts']
         except (ValueError, TypeError) as exc:
@@ -305,7 +333,9 @@ class UserProfileFetchTool:
             'Fetch current source-backed profiles for explicit actor IDs and, by default, the agent\'s continuing style preferences. '
             'Use when personal context matters and earlier profile evidence is missing or stale. '
             'A fetch can learn at most one pending batch before returning committed profiles. '
-            'Names never select identities. Empty facts do not mean no preferences; check the facts\' sources and dates.',
+            'Claims keep their kind and known validity dates; asserted_by defaults to the containing actor_id. '
+            'Use memory_read(profile_fact_ids=[fact_id]) to inspect supporting originals. '
+            'Names never select identities. Empty facts do not mean no preferences.',
             {'type': 'object', 'properties': {
                 'actor_ids': {'type': 'array', 'items': {'type': 'string'},
                     'description': 'Stable IDs from message provenance, such as telegram:user:123; [] fetches only agent preferences'},

@@ -43,10 +43,12 @@ class ProfileRefreshParticipantTests(BusinessTestCase):
     async def test_prepare_after_all_humans_compacted_keeps_named_profiles_warm_and_cold(self):
         first = await self.original(1, 'telegram:user:101', name='Person A')
         second = await self.original(2, 'telegram:user:102', name='Person B')
+        fact_ids = {}
         for source, actor, claim in ((first, 'telegram:user:101', 'Prefers tea'),
                                      (second, 'telegram:user:102', 'Prefers coffee')):
-            await self.store.save_profile_fact(self.session, subject_actor_id=actor,
+            fact = await self.store.save_profile_fact(self.session, subject_actor_id=actor,
                 asserted_by=actor, claim=claim, source_ids=[source.db_id])
+            fact_ids[actor] = fact['id']
         await self.compact([first, second])
         tool = await self.runtime.record_tool_observation(session_id=self.session,
             name='shell_exec', phase='result', payload={'output': {'stdout': 'Task completed.'}})
@@ -56,8 +58,9 @@ class ProfileRefreshParticipantTests(BusinessTestCase):
         self.assertEqual(args['actor_ids'], ['telegram:user:102', 'telegram:user:101'])
         self.assertEqual({p['actor_id']: p['identity']['actor_name'] for p in warm['profiles']},
             {'telegram:user:101': 'Person A', 'telegram:user:102': 'Person B', 'agent': None})
-        self.assertEqual({p['actor_id']: [fact['source_ids'] for fact in p['facts']] for p in warm['profiles']},
-            {'telegram:user:101': [[first.db_id]], 'telegram:user:102': [[second.db_id]], 'agent': []})
+        self.assertEqual({p['actor_id']: [fact['fact_id'] for fact in p['facts']] for p in warm['profiles']},
+            {'telegram:user:101': [fact_ids['telegram:user:101']],
+             'telegram:user:102': [fact_ids['telegram:user:102']], 'agent': []})
         # A later tool-only compaction must discover the same original people
         # after reopening the database, without a surviving runtime roster.
         await self.compact([tool])

@@ -459,8 +459,9 @@ class ProfileContextWorkflowTests(BusinessTestCase):
                                             trigger_message_id=target_id)
         self.assertEqual(next_provider.requests[0]["messages"], after)
 
-    async def test_profile_tool_evidence_survives_later_turns_provider_switch_and_compaction_input(self):
+    async def test_profile_fact_references_survive_later_turns_provider_switch_and_compaction_input(self):
         source = await self.seed_profile()
+        fact_id = (await self.store.get_profile(self.session, self.actor))[0]['id']
         await self.settings(tool_history_mode=ToolHistoryMode.NATIVE_SAME_PROVIDER)
         self.provider.responses = [
             ProviderResponse(tool_calls=[ToolCall("user_profile_fetch", "profile-1", {"actor_ids": [self.actor]})],
@@ -475,10 +476,11 @@ class ProfileContextWorkflowTests(BusinessTestCase):
             rendered = json.dumps(response_payload, ensure_ascii=False, default=str)
             self.assertIn(self.claim, rendered)
             self.assertIn("2026-01-02T11:04:05+08:00", rendered)
-            facts = [(profile["actor_id"], fact["source_ids"])
+            facts = [(profile["actor_id"], fact["fact_id"])
                      for profile in response_payload["profiles"] for fact in profile["facts"]]
             self.assertEqual(facts,
-                             [(self.actor, [source.db_id])])
+                             [(self.actor, fact_id)])
+            self.assertNotIn('source_ids', rendered)
             await self.runtime.record_assistant_text(session_id=self.session, text=first.text)
             await self.turn("And for tomorrow?", 3)
             fetch.assert_awaited_once()
@@ -494,12 +496,12 @@ class ProfileContextWorkflowTests(BusinessTestCase):
         await self.turn("Continue with this provider.", 4)
         translated = other.requests[0]["messages"]
         self.assertIn(self.claim, text_of(translated))
-        self.assertIn('"source_ids": [' + str(source.db_id) + ']', text_of(translated))
+        self.assertIn('"fact_id": ' + str(fact_id), text_of(translated))
         self.assertFalse(any(item.role == MessageRole.TOOL for item in translated))
         raw = await self.store.list_uncompacted_messages(self.session)
         compacted_input = self.runtime._normalize_compaction_messages([item.message for item in raw])
         self.assertIn(self.claim, text_of(compacted_input))
-        self.assertIn('"source_ids": [' + str(source.db_id) + ']', text_of(compacted_input))
+        self.assertIn('"fact_id": ' + str(fact_id), text_of(compacted_input))
         controls = [item for item in compacted_input if item.metadata.get("source_role") == "transport"]
         self.assertTrue(any(self.actor in text_of([item]) for item in controls))
         self.assertTrue(all(item.role != MessageRole.USER for item in controls))

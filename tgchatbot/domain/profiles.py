@@ -30,6 +30,25 @@ def profile_size(value: dict) -> int:
                           if isinstance(item, datetime) else str(item)).encode('utf-8'))
 
 
+def chat_profile(document: dict) -> dict:
+    """Present all claims; their database fact references open evidence on demand.
+
+    Learning and operator snapshots keep the full document. Apply this only to
+    newly fetched tool results, never to previously recorded conversation history.
+    """
+    result = dict(document)
+    result['facts'] = []
+    for fact in document.get('facts', []):
+        item = {'fact_id': fact['id'], 'claim': fact['claim'], 'kind': fact['kind']}
+        for field in ('valid_from', 'valid_to'):
+            if fact.get(field) is not None:
+                item[field] = fact[field]
+        if fact.get('asserted_by') != document['actor_id']:
+            item['asserted_by'] = fact['asserted_by']
+        result['facts'].append(item)
+    return result
+
+
 def profile_document(actor_id: str, identity: dict | None, facts: list[dict], *,
                      max_bytes: int | None = None, known_agent: bool = False, strict: bool = False) -> dict:
     """Present every selected fact with its identity and attribution intact.

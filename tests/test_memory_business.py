@@ -85,7 +85,9 @@ class MemoryBusinessTests(BusinessTestCase):
         self.assertEqual(profiles['telegram:user:7']['facts'][0]['claim'], 'Prefers tea')
         self.assertEqual(profiles['telegram:user:8']['facts'][0]['kind'], 'inferred')
         self.assertEqual(profiles['agent']['subject_kind'], 'agent_preferences')
-        self.assertEqual(profiles['agent']['facts'][0]['source_ids'], [alice.db_id])
+        evidence = await self.memory.read(self.session,
+            profile_fact_ids=[profiles['agent']['facts'][0]['fact_id']])
+        self.assertEqual(evidence['profile_facts'][0]['source_ids'], [alice.db_id])
         self.assertEqual(profiles['agent']['facts'][0]['asserted_by'], 'telegram:user:7')
         self.assertNotIn('opaque_selection_state', json.dumps(result))
         for unresolved in ('unknown', 'Alex'):
@@ -115,7 +117,7 @@ class MemoryBusinessTests(BusinessTestCase):
             include_agent_preferences=False))['profiles'][0]
         self.assertGreater(len(json.dumps(profile, ensure_ascii=False).encode('utf-8')), 4096)
         self.assertEqual(profile['identity']['actor_name'], name)
-        self.assertEqual([fact['id'] for fact in profile['facts']], [fact['id'] for fact in reversed(facts)])
+        self.assertEqual([fact['fact_id'] for fact in profile['facts']], [fact['id'] for fact in reversed(facts)])
         self.assertEqual([fact['claim'] for fact in profile['facts']], [fact['claim'] for fact in reversed(facts)])
         self.assertEqual(self.provider.requests, [])
         self.assertNotIn('next_before_fact_id', profile)
@@ -136,7 +138,8 @@ class MemoryBusinessTests(BusinessTestCase):
             await self.memory.fetch_profiles(self.session, ['telegram:user:7'], scope=previous)
         current = await self.store.get_scope(self.session)
         profile = (await self.memory.fetch_profiles(self.session, ['telegram:user:7'], scope=current))['profiles'][0]
-        self.assertEqual(profile['facts'][0]['source_ids'], [source.db_id])
+        evidence = await self.memory.read(self.session, profile_fact_ids=[profile['facts'][0]['fact_id']])
+        self.assertEqual(evidence['profile_facts'][0]['source_ids'], [source.db_id])
         foreign = await self.memory.fetch_profiles('telegram:200', ['telegram:user:7'], include_agent_preferences=False)
         self.assertEqual(foreign['profiles'][0]['status'], 'unknown_identity')
         self.assertEqual(foreign['profiles'][0]['facts'], [])
@@ -160,8 +163,9 @@ class MemoryBusinessTests(BusinessTestCase):
         await self.store.save_profile_fact(self.session, subject_actor_id='telegram:user:7', asserted_by='telegram:user:7',
             claim='A future preference', source_ids=[correction.db_id], valid_from='2099-01-01T00:00:00Z')
         profile = (await self.memory.fetch_profiles(self.session, ['telegram:user:7']))['profiles'][0]
-        self.assertEqual([fact['id'] for fact in profile['facts']], [new['id']])
-        self.assertEqual(profile['facts'][0]['source_ids'], [correction.db_id])
+        self.assertEqual([fact['fact_id'] for fact in profile['facts']], [new['id']])
+        evidence = await self.memory.read(self.session, profile_fact_ids=[profile['facts'][0]['fact_id']])
+        self.assertEqual(evidence['profile_facts'][0]['source_ids'], [correction.db_id])
         self.assertEqual(new['supersedes'], old['id'])
         self.assertEqual(new['source_revisions'], {str(correction.db_id): 1})
         await self.store.hide_message_ids(self.session, [correction.db_id])
@@ -212,7 +216,8 @@ class MemoryBusinessTests(BusinessTestCase):
                          {item.db_id: [{'offset': 0, 'text': original_text(item.message)}] for item in controls})
         profile = (await memory.fetch_profiles(self.session, ['telegram:user:7']))['profiles'][0]
         self.assertEqual(profile['identity']['last_message']['message_id'], source.db_id)
-        self.assertEqual(profile['facts'][0]['source_ids'], [source.db_id])
+        evidence = await self.memory.read(self.session, profile_fact_ids=[profile['facts'][0]['fact_id']])
+        self.assertEqual(evidence['profile_facts'][0]['source_ids'], [source.db_id])
         self.runtime.invalidate_session(self.session)
         current = await self.ingest('Continue from our earlier context.', source_id=2)
         self.provider.responses = [ProviderResponse(final_text='Your earlier preference remains available.'),
