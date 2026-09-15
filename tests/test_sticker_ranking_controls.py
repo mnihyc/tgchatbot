@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import unittest
 import json
+from dataclasses import replace
+from math import sqrt
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -13,6 +15,7 @@ from tgchatbot.core.runtime import AgentRuntime
 from tgchatbot.domain.models import ChatMode, ConversationMessage, ToolResult
 from tgchatbot.tools.base import ToolSpec
 from tgchatbot.tools.sticker_send import StickerQueryTool
+from tgchatbot.storage.sticker_catalog import CatalogAlias, CatalogSnapshot
 
 
 class StickerRankingControlTests(unittest.IsolatedAsyncioTestCase):
@@ -20,6 +23,97 @@ class StickerRankingControlTests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = fixtures.StickerConversationTests.asyncSetUp
     asset = fixtures.StickerConversationTests.asset
     query = fixtures.StickerConversationTests.query
+
+    def expression_choices(self, *, include_alternative=True):
+        first = self.asset(pack='drawn', caption='辛苦了', reading_vectors=[[1, 0, 0]],
+                           image_vector=[0, 0, 1])
+        second = self.asset(pack='drawn', reading_vectors=[[.99, sqrt(1-.99**2), 0]],
+                            image_vector=[.1, 0, sqrt(.99)])
+        photo = self.asset(pack='familiar', reading_vectors=[[.6, .8, 0]],
+                           image_vector=[.8, .6, 0])
+        similar = self.asset(pack='familiar', caption='抱抱', reading_vectors=[[.65, sqrt(1-.65**2), 0]],
+                             image_vector=[.79, .35, sqrt(1-.79**2-.35**2)])
+        alternative = (self.asset(pack='another', reading_vectors=[[.8, .6, 0]],
+                       image_vector=[.7, -.6, sqrt(.15)]) if include_alternative else None)
+        irrelevant = self.asset(pack='unrelated', caption='走开',
+            readings=[{'meaning': 'Reject affection', 'context': 'Request distance'}],
+            reading_vectors=[[.1, sqrt(.99), 0]], image_vector=[.69, -sqrt(1-.69**2), 0])
+        return first, second, photo, similar, alternative, irrelevant
+
+    async def test_visual_alternative_broadens_shortlist_without_weaker_meaning_or_duplicate_aliases(self):
+        first, second, photo, similar, alternative, irrelevant = self.expression_choices()
+        self.assets[4] = replace(alternative, aliases=alternative.aliases +
+            (CatalogAlias(alternative.aliases[0].path, 'collected'),))
+
+        result = await self.query(candidate_budget=4)
+
+        candidates = result.output['candidates']
+        self.assertEqual([item['sticker_id'] for item in candidates],
+                         [first.asset_id, photo.asset_id, second.asset_id, alternative.asset_id])
+        self.assertEqual(candidates[0]['caption'], '辛苦了')
+        self.assertEqual(candidates[-1]['packs'], ['another', 'collected'])
+        self.assertEqual(len({part.origin for part in result.evidence_parts}), 4)
+        again = await self.query(candidate_budget=4)
+        self.assertEqual(again.output['candidates'], candidates)
+
+    async def test_visual_novelty_cannot_fill_shortlist_with_less_relevant_expression(self):
+        first, second, photo, similar, _, irrelevant = self.expression_choices(include_alternative=False)
+
+        result = await self.query(candidate_budget=4)
+
+        self.assertEqual([item['sticker_id'] for item in result.output['candidates']],
+                         [first.asset_id, photo.asset_id, second.asset_id, similar.asset_id])
+        self.assertNotIn(irrelevant.asset_id, str(result.output['candidates']))
+
+    async def test_visual_diversity_keeps_requested_continuity_and_small_pool(self):
+        first, second, photo, similar, alternative, irrelevant = self.expression_choices()
+
+        preferred = await self.query(preferred_pack='familiar', candidate_budget=2)
+        self.assertEqual([item['sticker_id'] for item in preferred.output['candidates']],
+                         [first.asset_id, similar.asset_id])
+        required = await self.query(required_pack='familiar', candidate_budget=4)
+        self.assertEqual({item['sticker_id'] for item in required.output['candidates']},
+                         {photo.asset_id, similar.asset_id})
+        self.assertEqual(next(item['caption'] for item in required.output['candidates']
+                              if item['sticker_id'] == similar.asset_id), '抱抱')
+        exact = await StickerQueryTool(self.catalog).run({'intent_core': similar.asset_id}, self.ctx)
+        self.assertEqual([item['sticker_id'] for item in exact.output['candidates']], [similar.asset_id])
+
+    async def test_identical_image_vectors_do_not_invent_diversity_or_discard_captions(self):
+        for caption, score in [('抱抱', .9), ('辛苦了', .8), ('休息吧', .7)]:
+            self.asset(caption=caption, reading_vectors=[[score, sqrt(1-score**2), 0]],
+                       image_vector=[.8, .6, 0])
+        first = await self.query(candidate_budget=8)
+        second = await self.query(candidate_budget=8)
+        self.assertEqual(first.output['candidates'], second.output['candidates'])
+        self.assertEqual({item['caption'] for item in first.output['candidates']}, {'抱抱', '辛苦了', '休息吧'})
+        self.assertEqual(len(first.output['candidates']), 3)
+
+    async def test_stronger_visual_cue_and_caption_requirement_keep_their_best_match(self):
+        first, _, photo, similar, _, _ = self.expression_choices()
+        cue = 'the familiar photographed gesture'
+        async def embed(text, **kwargs):
+            return similar.image_vector if text.endswith(cue) else fixtures.np.array([1., 0., 0.])
+        self.embeddings.embed_query.side_effect = embed
+
+        visual = await self.query(expression_cue=cue, candidate_budget=2)
+        self.assertEqual([item['sticker_id'] for item in visual.output['candidates']],
+                         [first.asset_id, similar.asset_id])
+        captioned = await self.query(candidate_budget=2,
+            advanced={'text_constraints': {'text_priority': 'require'}})
+        self.assertEqual([item['sticker_id'] for item in captioned.output['candidates']],
+                         [first.asset_id, similar.asset_id])
+        self.assertTrue(all(item['caption'] for item in captioned.output['candidates']))
+
+    async def test_description_fallback_does_not_claim_visual_diversity(self):
+        first, second, photo, similar, _, _ = self.expression_choices()
+        self.store.load_snapshot.side_effect = lambda _: CatalogSnapshot('r1',
+            {'embedding_space_id': 'space', 'visual_embedding_source': 'description'}, '', tuple(self.assets))
+
+        result = await self.query(candidate_budget=4)
+
+        self.assertEqual([item['sticker_id'] for item in result.output['candidates']],
+                         [first.asset_id, photo.asset_id, second.asset_id, similar.asset_id])
 
     async def test_many_readings_and_image_match_do_not_crowd_out_second_asset(self):
         multi = self.asset(

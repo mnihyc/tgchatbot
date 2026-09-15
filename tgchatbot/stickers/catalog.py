@@ -84,6 +84,36 @@ def _interleave(*rankings):
                 yield value
 
 
+def _diverse_image_lane(ranking, index, query, reading_scores):
+    """Keep the strongest visual match, then expose less redundant expressions.
+
+    Subtract the query-aligned visual similarity already represented by a
+    selected image. A promotion must have at least the next original candidate's
+    reading score, so visual novelty cannot outweigh lower measured intent relevance.
+    This only reorders the existing image pool; preferences and text ranks keep
+    their own lanes, and all candidates remain eligible.
+    """
+    if len(ranking) < 2 or not reading_scores or index.recipe.get('visual_embedding_source') == 'description':
+        return ranking
+    positions = {asset: row for row, asset in enumerate(index.image_assets)}
+    vectors = index.image_matrix[[positions[asset] for asset in ranking]]
+    scores = vectors @ query
+    represented = np.zeros(len(ranking), dtype=np.float32)
+    selected, pending = [0], list(range(1, len(ranking)))
+    while pending:
+        previous = selected[-1]
+        represented = np.maximum(represented,
+            max(0.0, float(scores[previous])) * np.maximum(0.0, vectors @ vectors[previous]))
+        first = pending[0]
+        meaning = reading_scores.get(ranking[first])
+        candidates = ([i for i in pending if reading_scores.get(ranking[i], float('-inf')) >= meaning]
+                      if meaning is not None else [first])
+        chosen = max(candidates, key=lambda i: float(scores[i] - represented[i]))
+        selected.append(chosen)
+        pending.remove(chosen)
+    return [ranking[i] for i in selected]
+
+
 
 class StickerCatalog:
     def __init__(self, catalog_store, sticker_root: Path, persona_store=None, *,
@@ -318,18 +348,21 @@ class StickerCatalog:
                     if i in allowed and (i not in by_asset or score > by_asset[i]):
                         by_asset[i] = float(score)
                         best_reading[i] = index.reading_positions[row]
-                return sorted(by_asset, key=lambda i: (-by_asset[i], index.assets[i].asset_id))
+                return sorted(by_asset, key=lambda i: (-by_asset[i], index.assets[i].asset_id)), by_asset
             def image_rank(query):
                 scores = index.image_matrix @ query if index.image_matrix is not None else []
                 by_asset = {i: float(scores[row]) for row, i in enumerate(index.image_assets) if i in allowed}
                 return sorted(by_asset, key=lambda i: (-by_asset[i], index.assets[i].asset_id))
-            reading, visual_rank = reading_rank(query_vectors[intended]), image_rank(query_vectors[visual])
+            reading, reading_scores = reading_rank(query_vectors[intended])
+            visual_rank = image_rank(query_vectors[visual])
             if exact:
                 caption_lane = [i for i in _interleave(reading, visual_rank) if i in exact]
                 caption_lane.extend(sorted(exact - set(caption_lane)))
             global_lanes = []
             for name, values in [('reading', reading), ('image', visual_rank)]:
                 lane = values[:depth]
+                if name == 'image':
+                    lane = _diverse_image_lane(lane, index, query_vectors[visual], reading_scores)
                 rankings.append(lane)
                 global_lanes.append(lane)
                 channel_members[name] = set(lane)
@@ -383,7 +416,7 @@ class StickerCatalog:
                 # every slot before the requested familiar alternative is seen.
                 # Keep their existing balanced ordering inside the global lane;
                 # novelty/style remain companion lanes rather than exclusions.
-                global_lane = list(_interleave(reading[:depth], visual_rank[:depth]))
+                global_lane = list(_interleave(*global_lanes))
                 companions = [lane for lane in rankings if lane is not family_lane
                     and not any(lane is global_lane for global_lane in global_lanes)]
                 explicit_continuity = (plan.prefer_pack or plan.preferred_character_family or
