@@ -70,8 +70,8 @@ services:
         cls.addClassCleanup(cls._stop_fixture)
         cls.compose('up', '-d', '--wait', '--wait-timeout', '40', 'postgres', 'bot')
         cls.compose('create', 'stopped-worker')
-        # Docker is forwarded except for one explicit dump-failure test. Record
-        # updater commands to prove no code download/build/image activation occurs.
+        # Forward Docker while retaining the older Compose v2 start interface.
+        # Record updater commands to prove no download/build/activation occurs.
         cls.bin = cls.root / 'bin'
         cls.bin.mkdir()
         wrapper = cls.bin / 'docker'
@@ -81,6 +81,9 @@ from pathlib import Path
 arguments = sys.argv[1:]
 with Path(os.environ['DEPLOY_TEST_CALLS']).open('a') as stream:
     stream.write(json.dumps(arguments) + '\\n')
+if arguments[:2] == ['compose', 'start'] and '--wait' in arguments:
+    print('unknown flag: --wait', file=sys.stderr)
+    raise SystemExit(125)
 if os.environ.get('DEPLOY_TEST_FAIL_DUMP') == '1' and any('pg_dump' in item for item in arguments):
     print('-- incomplete synthetic dump')
     raise SystemExit(23)

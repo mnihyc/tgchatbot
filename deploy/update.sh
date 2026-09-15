@@ -73,7 +73,7 @@ if [[ $target == backup || $target == restore ]]; then
   done <<< "$running"
   resume_apps() {
     if [[ ${#running_apps[@]} != 0 ]]; then
-      docker compose start --wait --wait-timeout "$timeout" "${running_apps[@]}"
+      docker compose start "${running_apps[@]}"
     fi
   }
   trap 'log "Restore interrupted; its result is unconfirmed. Check PostgreSQL before restarting application services." >&2; exit 130' INT
