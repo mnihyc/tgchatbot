@@ -13,7 +13,7 @@ import os
 from typing import Any
 
 from tgchatbot.domain.models import ChatMode, ConversationMessage, MessageRole
-from tgchatbot.domain.profiles import present_profile
+from tgchatbot.domain.profiles import present_profile, profile_size
 from tgchatbot.domain.provenance import message_evidence, utc_time
 from tgchatbot.embeddings import EmbeddingConfig, EmbeddingDocument
 from tgchatbot.operational import from_env
@@ -180,7 +180,7 @@ Retire facts through removals only when redundant or no longer useful in the com
 Do not retire a fact merely because this batch does not mention it. Preserve distinctive, actionable preferences over generic detail.
 Aim for about {profile_bytes} UTF-8 bytes per actor, including identity, IDs and attribution; this is a soft target.
 Keep distinctive, useful facts even if they exceed the target. Consolidate redundant detail during these updates rather than growing the profile indefinitely.
-The current profile documents contain all supplied existing facts. Reasons are audit-only and source_dates is learning-only; neither enters the chat profile.
+The current profile documents contain all supplied existing facts. current_size_bytes is an advisory measurement excluding learning-only source_dates and the hint itself. Reasons are audit-only; neither reasons nor learning hints enter the chat profile.
 Return only the requested structured patch; no tools or conversation reply.'''
 
 
@@ -610,10 +610,16 @@ class MemoryWorker:
             evidence_revisions.update(item['source_revisions'])
         if not await self.store.renew_job(job, lease_seconds=self.limits.lease_seconds):
             raise StaleScopeError('Profile source or job lease changed')
+        profiles = []
+        for profile in snapshot['profiles']:
+            rendered = present_profile(profile, self.config.default_metadata_timezone)
+            rendered['current_size_bytes'] = profile_size({**rendered,
+                'facts': [{key: value for key, value in fact.items() if key != 'source_dates'}
+                          for fact in rendered['facts']]})
+            profiles.append(rendered)
         response = await provider.generate(settings=profile_settings,
             messages=[ConversationMessage.user_text(json.dumps({'original_evidence': evidence,
-                'current_profiles': [present_profile(profile, self.config.default_metadata_timezone)
-                    for profile in snapshot['profiles']]}, ensure_ascii=False, default=str))],
+                'current_profiles': profiles}, ensure_ascii=False, default=str))],
             instructions=_PROFILE_INSTRUCTIONS.format(profile_bytes=self.config.memory.profile_bytes),
             tools=[], extra_input_items=None, response_schema=_PATCH_SCHEMA, response_schema_name='profile_patch')
         data = json.loads(response.final_text)

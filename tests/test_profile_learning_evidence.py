@@ -1,10 +1,12 @@
 """Profile learning keeps original owners and selected evidence across retries."""
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from types import SimpleNamespace
 
 from tests.business_helpers import BusinessTestCase
+from tgchatbot.core.memory import MemoryService
 from tgchatbot.core.memory_worker import MemoryWorker
 from tgchatbot.domain.models import ConversationMessage, MessagePart, PartKind, ProviderResponse
 
@@ -37,6 +39,47 @@ class ProfileLearningEvidenceWorkflows(BusinessTestCase):
     @staticmethod
     def response(*facts):
         return ProviderResponse(final_text=json.dumps({'additions': list(facts), 'removals': []}))
+
+    async def test_profile_size_hints_measure_chat_document_and_stay_in_learning_input(self):
+        self.config = replace(self.config, memory=replace(self.config.memory, profile_bytes=2048))
+        self.worker.config = self.config
+        actor = 'telegram:user:7'
+        claim = '喜欢不加糖的茉莉花茶 🍵'
+        source = await self.source(1, actor, f'我的长期偏好：{claim}。')
+        self.provider.responses = [self.response(self.fact(actor, claim, source.db_id)), self.response()]
+        self.assertTrue(await self.worker._guarded(await self.claim(), self.worker._profile))
+
+        await self.source(2, actor, '今天还是喝这个。', sent_at='2026-01-02T00:00:00+00:00')
+        self.assertTrue(await self.worker._guarded(await self.claim(), self.worker._profile))
+        request = self.provider.requests[1]
+        profiles = json.loads(request['messages'][0].parts[0].text)['current_profiles']
+        learned = next(profile for profile in profiles if profile['actor_id'] == actor)
+        self.assertEqual(learned['facts'][0]['claim'], claim)
+        self.assertEqual(learned['facts'][0]['source_dates'], {
+            'first': '2026-01-01T08:00:00+08:00', 'last': '2026-01-01T08:00:00+08:00'})
+        self.assertIn(str(self.config.memory.profile_bytes), request['instructions'])
+        for profile in profiles:
+            self.assertIs(type(profile['current_size_bytes']), int)
+            chat_document = {key: value for key, value in profile.items() if key != 'current_size_bytes'}
+            chat_document['facts'] = [{key: value for key, value in fact.items() if key != 'source_dates'}
+                                      for fact in chat_document['facts']]
+            serialized = json.dumps(chat_document, ensure_ascii=False)
+            self.assertEqual(profile['current_size_bytes'], len(serialized.encode('utf-8')))
+            if profile['actor_id'] == actor:
+                self.assertGreater(profile['current_size_bytes'], len(serialized),
+                    'Multibyte participant text must be measured as UTF-8 bytes, not characters.')
+
+        reopened = await self.new_store()
+        snapshot = await reopened.fetch_profile_snapshot(self.session, [actor], for_learning=True)
+        self.assertTrue(snapshot['profiles'][0]['facts'][0]['source_dates'])
+        self.assertNotIn('current_size_bytes', json.dumps(snapshot, default=str),
+            'Request budgeting hints must not become persistent profile fields.')
+        memory = MemoryService(reopened, SimpleNamespace(enabled=False), config=self.config.memory)
+        fetched = await memory.fetch_profiles(self.session, [actor], timezone=self.config.default_metadata_timezone)
+        self.assertNotIn('current_size_bytes', json.dumps(fetched))
+        self.assertNotIn('source_dates', json.dumps(fetched))
+        self.assertEqual(fetched['profiles'][0]['facts'][0]['claim'], claim)
+        self.assertEqual(len(self.provider.requests), 2, 'Sizing hints must not add generation requests.')
 
     async def test_same_name_reply_and_forward_keep_owners_when_invalid_patch_retries(self):
         tea = await self.source(1, 'telegram:user:7', 'I prefer jasmine tea.')
