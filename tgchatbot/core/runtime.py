@@ -323,8 +323,9 @@ class AgentRuntime:
             return await self._execute_turn_from_stored(session_id=session_id,
                 user_display_name=user_display_name, trigger_message_id=trigger_message_id, emit=emit)
 
-    async def prepare_context(self, *, session_id: str, emit: EventCallback | None = None) -> dict[str, int]:
-        """Prepare an active archive without loading it as an interactive cache."""
+    async def prepare_context(self, *, session_id: str, emit: EventCallback | None = None,
+                              force: bool = False) -> dict[str, int]:
+        """Prepare bounded history; force bypasses the trigger, not the target or reserves."""
         lock = self._execution_locks.get(session_id)
         if lock is None:
             lock = asyncio.Lock()
@@ -338,12 +339,13 @@ class AgentRuntime:
                 await self._recover_interrupted_tools(session_id)
                 state = await self.store.load_compaction_window(session_id)
                 instructions = build_system_prompt(settings, timezone=self.config.default_metadata_timezone)
+                tools = self._request_tools(settings) if force else []
                 compactions = 0
-                active = state.more_raw or state.more_blocks
+                active = force or state.more_raw or state.more_blocks
                 while True:
                     await self._check_turn_scope(session_id)
                     estimate = self._estimate_request_tokens(state, settings=settings, provider=provider,
-                        instructions=instructions, tools=[])
+                        instructions=instructions, tools=tools)
                     active = active or estimate > self._effective_compact_trigger_tokens(settings)
                     if not (state.more_raw or state.more_blocks or
                             active and estimate > self._effective_compact_target_tokens(settings)):
@@ -363,13 +365,16 @@ class AgentRuntime:
                 # Once the raw backlog fits, image retirement can follow the
                 # ordinary policy without loading the archive during preparation.
                 compacted_images = await self._compact_if_needed(session_id=session_id, settings=settings,
-                    provider=provider, state=state, instructions=instructions, tools=[], emit=emit)
+                    provider=provider, state=state, instructions=instructions, tools=tools, emit=emit, force=force)
                 if self.memory is not None and (compactions or compacted_images
                         or await self.store.compaction_needs_profile_refresh(session_id)):
                     await self._refresh_profiles_after_compaction(session_id=session_id, state=state,
-                        settings=settings, provider=provider, instructions=instructions, tools=[], emit=emit,
-                        trigger=state.raw_messages[-1] if state.raw_messages else None)
+                        settings=settings, provider=provider, instructions=instructions, tools=tools, emit=emit,
+                        trigger=state.raw_messages[-1] if state.raw_messages else None, force=force)
                 return {'compactions': compactions, 'through_message_id': state.through_message_id,
+                    'estimated_request_tokens': self._estimate_request_tokens(state, settings=settings,
+                        provider=provider, instructions=instructions, tools=tools),
+                    'target_tokens': self._effective_compact_target_tokens(settings),
                     **await self.store.context_preparation_counts(session_id, state.through_message_id)}
             finally:
                 _turn_scope.reset(token)
@@ -1351,7 +1356,8 @@ class AgentRuntime:
             await self._reload_live_state(state)
 
     async def _refresh_profiles_after_compaction(self, *, session_id, state, settings, provider,
-                                                  instructions, tools, emit, trigger, reserved='',native_from_id=None):
+                                                  instructions, tools, emit, trigger, reserved='',native_from_id=None,
+                                                  force=False):
         observed_compaction = await self.store.get_compaction_version(session_id)
         call_id = await self.store.allocate_tool_call_id('profile')
         trigger_message = trigger.message if trigger is not None else None
@@ -1390,7 +1396,7 @@ class AgentRuntime:
         try:
             await self._compact_if_needed(session_id=session_id, settings=settings, provider=provider,
                 state=state, instructions=instructions + '\n' + reserved + '\n' + summary, tools=tools, emit=emit,
-                native_from_id=native_from_id)
+                native_from_id=native_from_id, force=force)
         finally:
             _refresh_compactions.reset(receipt_token)
         while observed_compaction + 1 in committed_versions:
@@ -1746,6 +1752,7 @@ class AgentRuntime:
         tools: list[ToolSpec] | None = None,
         emit: EventCallback | None,
         native_from_id: int | None = None,
+        force: bool = False,
     ) -> bool:
         tools = tools or []
         def estimate_request():
@@ -1765,7 +1772,7 @@ class AgentRuntime:
         compact_trigger_tokens = self._effective_compact_trigger_tokens(settings)
         compact_target_tokens = self._effective_compact_target_tokens(settings)
         image_target = self._effective_compact_target_images(provider, settings)
-        token_overflow = total_estimate > compact_trigger_tokens
+        token_overflow = total_estimate > (compact_target_tokens if force else compact_trigger_tokens)
         image_overflow = image_limit is not None and image_count > image_limit
         if not token_overflow and not image_overflow:
             return False

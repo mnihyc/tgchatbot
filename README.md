@@ -77,6 +77,7 @@ Optional spontaneous group replies can be configured separately. Set
 | `/stickers auto`, `/stickers off` | Enable or disable sticker tools in a tool-enabled mode |
 | `/retry` | Retry the latest eligible user message without duplicating it |
 | `/rollback <count>` | Abandon recent consecutive user/bot blocks in the current context |
+| `/compact` | Run layered compaction now toward the configured target; retain searchable originals and profiles |
 | `/reset` or `/reset history` | Clear working context; retain searchable history, profiles and settings |
 | `/reset_full` or `/reset all` | Start a fresh agent with defaults; previous generations become operator-audit-only |
 | `/reset session` | Restore session settings while retaining conversation and learned profiles |

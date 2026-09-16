@@ -252,6 +252,15 @@ def parameter_view(status: dict, name: str, usage: str | None, changed: bool = F
     return '\n'.join(lines)
 
 
+def compaction_result(result: dict[str, int]) -> str:
+    remaining, target = result['estimated_request_tokens'], result['target_tokens']
+    title = '✅ Context ready' if remaining <= target else '⏸ Target not reached'
+    lines = [f'<b>{title}</b>', f'Estimated request: {_number(remaining)} / {_number(target)} tokens']
+    if remaining > target:
+        lines.append('/params context — inspect compaction limits')
+    return '\n'.join(lines)
+
+
 def help_view(topic: str = '') -> str:
     if topic == 'model':
         return '\n'.join([
@@ -283,6 +292,7 @@ def help_view(topic: str = '') -> str:
             '/status context — context size and compaction',
             '/status memory — searchable memory and background work',
             '/params context — compaction and image settings',
+            '/compact — compact now to the configured target; keep originals and profiles',
             '/reset — fresh context; keep searchable history, profiles and settings',
             '/reset_full — new agent with defaults; old history and profiles become audit-only',
             '/reset session — restore settings only',

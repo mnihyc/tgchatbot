@@ -378,6 +378,7 @@ class TelegramBotApp:
     def _register_handlers(self) -> None:
         self.application.add_handler(CommandHandler('start', self.start_command))
         self.application.add_handler(CommandHandler('help', self.help_command))
+        self.application.add_handler(CommandHandler('compact', self.compact_command, block=False))
         self.application.add_handler(CommandHandler('reset', self.reset_command))
         self.application.add_handler(CommandHandler('reset_full', self.reset_full_command))
         self.application.add_handler(CommandHandler('mode', self.mode_command))
@@ -431,6 +432,26 @@ class TelegramBotApp:
             return
         topic = context.args[0].strip().lower() if context.args else ''
         await self._send_command(update.effective_message, command_views.help_view(topic))
+
+    async def compact_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat, message = update.effective_chat, update.effective_message
+        if not chat or not message or not self._allowed(chat):
+            return
+        if context.args:
+            await message.reply_text('Usage: /compact\nUses the target shown in /params context.')
+            return
+        progress = await message.reply_text('⏳ Compacting context…')
+        try:
+            result = await self.runtime.prepare_context(session_id=self._session_id(chat), force=True)
+        except StaleScopeError:
+            text = 'Compaction stopped: this chat was reset or changed.'
+        except Exception:
+            logger.exception('telegram.compact.failed chat=%s', self._chat_log_id(chat.id))
+            text = ('Compaction stopped before reaching the target. Originals and completed summaries are preserved.\n'
+                    'Retry /compact; /params context shows the current limits.')
+        else:
+            text = command_views.compaction_result(result)
+        await progress.edit_text(text, parse_mode='HTML')
 
     async def reset_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
