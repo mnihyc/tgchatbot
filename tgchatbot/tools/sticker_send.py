@@ -6,6 +6,7 @@ from typing import Any
 from tgchatbot.domain.models import OutboundSticker, StickerTiming, ToolResult
 from tgchatbot.stickers.catalog import StickerCatalog, StickerMatch
 from tgchatbot.stickers.plan import StickerRetrievalPlan
+from tgchatbot.stickers.persona import present_persona
 from tgchatbot.tools.base import ToolContext, ToolSpec
 
 logger = logging.getLogger(__name__)
@@ -79,7 +80,6 @@ def _advanced_schema() -> dict[str, Any]:
                 'properties': {
                     'style_goal': _param('string', 'Preserve or switch style.', enum=['preserve', 'allow_switch', 'prefer_switch', 'ignore_style'], default='preserve'),
                     'style_hints': _param('array', 'Visual-family hints like rough manga line, pastel, or deadpan meme.', items={'type': 'string'}),
-                    'preferred_pack': _param('string', 'Preferred pack; keeps global alternatives eligible.'),
                 },
                 'additionalProperties': False,
             },
@@ -87,9 +87,7 @@ def _advanced_schema() -> dict[str, Any]:
                 'type': 'object',
                 'description': 'Caption meaning constraints.',
                 'properties': {
-                    'text_priority': _param('string', 'Caption matching priority during retrieval.', enum=['require', 'prefer', 'ignore'], default='prefer'),
-                    'must_include': _param('array', 'Caption meanings to include or imply.', items={'type': 'string'}),
-                    'avoid_text_meanings': _param('array', 'Caption meanings to avoid.', items={'type': 'string'}),
+                    'must_include': _param('array', "Meanings you'd like the sticker's text to convey, used to guide retrieval.", items={'type': 'string'}),
                 },
                 'additionalProperties': False,
             },
@@ -100,11 +98,10 @@ def _advanced_schema() -> dict[str, Any]:
                     'max_harshness': _param('integer', 'Maximum tolerated harshness on a 0-4 scale.', minimum=0, maximum=4, default=4),
                     'max_intimacy': _param('integer', 'Maximum tolerated intimacy on a 0-4 scale.', minimum=0, maximum=4, default=4),
                     'max_meme_dependence': _param('integer', 'Maximum tolerated meme dependence on a 0-4 scale.', minimum=0, maximum=4, default=4),
-                    'allow_animation': _param('boolean', 'Include animations; false restricts results to static stickers.', default=True),
                 },
                 'additionalProperties': False,
             },
-            'forbid': _param('array', 'Meanings or usages to avoid.', items={'type': 'string'}),
+            'require_caption': _param('boolean', 'Require a nonempty captured caption; caption_meaning supplies optional meaning hints.', default=False),
         },
         'additionalProperties': False,
     }
@@ -113,7 +110,7 @@ def _advanced_schema() -> dict[str, Any]:
 def _persona_schema() -> dict[str, Any]:
     return {
         'type': 'object',
-        'description': 'Recurring visual identity and expressive preferences for this session.',
+        'description': 'Visual and expressive preferences for the agent. Supply only the fields you want to set; persona_mode controls persistence.',
         'properties': {
             'visual_identity': {
                 'type': 'object',
@@ -147,12 +144,12 @@ def _persona_schema() -> dict[str, Any]:
 def _selection_lens_schema() -> dict[str, Any]:
     return {
         'type': 'object',
-        'description': 'Soft ranking guidance; not hard constraints.',
+        'description': 'Positive cues guide ranking; avoid_misread_as is a candidate-review note, not a search constraint.',
         'properties': {
             'social_read': _param('string', 'Social reading, e.g. gentle acknowledgement or teasing disbelief.'),
             'subtext': _param('string', 'Subtext, e.g. ironic support or playful refusal.'),
             'face_and_pose': _param('string', 'Face and pose that carry the reaction.'),
-            'avoid_misread_as': _param('string', 'Misinterpretation to avoid.'),
+            'avoid_misread_as': _param('string', 'Misinterpretation to check when choosing among returned candidates; does not change retrieval.'),
         },
         'additionalProperties': False,
     }
@@ -178,21 +175,25 @@ class StickerQueryTool:
             parameters_schema={
                 'type': 'object',
                 'properties': {
-                    'intent_core': _param('string', 'Intended message to the recipient, including direction: offer comfort, request a hug, accept blame or hand it back. Use the exchange, not copied identities or profiles.'),
+                    'intent_core': _param('string', 'Intended message to the recipient, including direction: offer comfort, request a hug, accept blame or hand it back. Use the exchange, not copied identities or profiles. A known sticker_id instead inspects that exact sticker.'),
                     'secondary_goals': _param('array', 'Extra nuances that materially refine the reaction.', items={'type': 'string'}),
                     'reaction_tone': _param('string', 'Reaction tone, for example dry amused, warm, irritated, bashful, or smug.'),
                     'social_intent': _param('string', 'Social intent, for example reassure, lightly tease, acknowledge, celebrate, or dismiss.'),
                     'expression_cue': _param('string', 'Face or pose cue, e.g. side-eye, blank stare, pout, or tiny shrug.'),
                     'caption_meaning': _param('string', 'Caption or overlay meaning hint when visible text matters.'),
-                    'preferred_pack': _param('string', 'Preferred pack; keeps global alternatives eligible.'),
+                    'preferred_pack': _param('string', 'Prefer a pack name returned by a candidate while keeping global alternatives.'),
                     'diversity_preference': _param('string', 'Prefer fresh variants or use normal ranking.', enum=['default', 'prefer_fresh_variant'], default='default'),
                     'allow_animation': _param('boolean', 'Include animations; false restricts results to static stickers.', default=True),
                     'candidate_budget': _param('integer', 'How many candidates to inspect.', minimum=1, maximum=catalog.config.max_candidates, default=catalog.config.candidate_count),
                     'required_pack': _param('string', 'Require this exact returned pack.'),
-                    'required_character_family': _param('string', 'Require this cataloged character family; a pack alone does not prove identity.'),
-                    'preferred_character_family': _param('string', 'Preferred cataloged character family, alongside global candidates.'),
+                    'required_character_family': _param('string', 'Require an exact character_families value from a returned candidate; omit when none is supplied.'),
+                    'preferred_character_family': _param('string', 'Prefer a character_families value from a returned candidate while keeping global alternatives.'),
                     'persona': _persona_schema(),
-                    'persona_mode': _param('string', 'How to use the optional persona for this query.', enum=['inherit', 'merge_and_remember', 'use_once', 'clear_session_persona']),
+                    'persona_mode': _param('string', 'inherit uses saved preferences; use_once applies supplied preferences to this query; '
+                        'merge_and_remember saves them; clear_session_persona clears them. '
+                        'Omitting this field remembers a supplied persona, otherwise inherits. '
+                        'Results return the persona used for the query, using the same field names.',
+                        enum=['inherit', 'merge_and_remember', 'use_once', 'clear_session_persona']),
                     'selection_lens': _selection_lens_schema(),
                     'advanced': _advanced_schema(),
                 },
@@ -203,10 +204,13 @@ class StickerQueryTool:
         )
 
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        persona_update = {}
         try:
             plan = StickerRetrievalPlan.from_payload(args, config=self.catalog.config)
             state, persona = await self.catalog.aprepare_query_context(plan=plan, session_id=ctx.session_id,
                 persist_persona=True, expected_scope=ctx.scope)
+            if persona.get('persona_update'):
+                persona_update['persona_update'] = persona['persona_update']
             matches = await self.catalog.achoose(plan=plan, session_id=ctx.session_id,
                 session_state=state, persona_context=persona)
             channels = {channel for match in matches for channel in match.channels}
@@ -214,10 +218,7 @@ class StickerQueryTool:
                 'asset_id' if 'asset_id' in channels else 'literal' if 'literal' in channels else 'none')
             constraints = {key: value for key, value in {
                 'must_include': plan.text_constraints.must_include,
-                'avoid_text_meanings': plan.text_constraints.avoid_text_meanings,
-                'avoid_misread_as': plan.selection_lens.avoid_misread_as,
-                'forbid': plan.forbid,
-                'text_priority': plan.text_priority,
+                'require_caption': plan.text_priority == 'require',
                 'style_goal': plan.style_goal,
                 'diversity_preference': plan.diversity_preference,
             }.items() if value}
@@ -231,13 +232,17 @@ class StickerQueryTool:
                 'intent': next((match.entry.agent_id for match in matches
                                 if match.entry.sticker_id == plan.intent_core), plan.intent_core),
                 'constraints': constraints,
+                **({'review_notes': {'avoid_misread_as': plan.selection_lens.avoid_misread_as}}
+                    if plan.selection_lens.avoid_misread_as else {}),
                 'search_scope': scope,
-                **({'persona': persona['effective_persona']} if persona['effective_persona'] else {}),
+                **({'persona': present_persona(persona['effective_persona'])} if persona['effective_persona'] else {}),
+                **persona_update,
                 'candidates': [_candidate_payload(match) for match in matches],
             }, evidence_parts=await self.catalog.evidence(matches))
         except Exception as exc:
             logger.exception('sticker_query failed')
-            return ToolResult(call_id='', name=self.spec.name, output={'ok': False, 'error': f'{exc.__class__.__name__}: {exc}'})
+            return ToolResult(call_id='', name=self.spec.name, output={
+                'ok': False, 'error': f'{exc.__class__.__name__}: {exc}', **persona_update})
 
 
 class StickerSendSelectedTool:
@@ -245,12 +250,16 @@ class StickerSendSelectedTool:
         self.catalog = catalog
         self.spec = ToolSpec(
             name='sticker_send_selected',
-            description='Select an exact known sticker for delivery. after_final dispatches when the turn ends, even with no final text; no second selection is needed. Queued is not confirmed delivery; inspect the receipt. Do not blindly repeat an unknown delivery or substitute for an unavailable original.',
+            description='Send one known sticker. Each call creates a new send request, including repeat calls for the same sticker_id. '
+                'queued confirms acceptance for automatic delivery after the final response; sent confirms delivery; '
+                'unknown means it may already have been delivered.',
             parameters_schema={
                 'type': 'object',
                 'properties': {
                     'selected_sticker_id': _param('string', 'Exact sticker_id returned by sticker_query.'),
-                    'delivery_timing': _param('string', 'send_now and before_final send immediately; after_final dispatches at turn completion, with or without text.', enum=['send_now', 'after_final', 'before_final']),
+                    'delivery_timing': _param('string', 'send_now sends immediately and returns the delivery outcome. '
+                        'after_final sends automatically when the turn ends, including with no final text. Defaults to after_final.',
+                        enum=['send_now', 'after_final'], default='after_final'),
                 },
                 'required': ['selected_sticker_id'],
                 'additionalProperties': False,

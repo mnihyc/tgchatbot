@@ -85,13 +85,15 @@ class StickerReviewWorkflows(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.output['ok'])
         self.assertEqual(result.output['candidates'][0]['sticker_id'], selected.agent_id)
 
-    async def test_null_advanced_groups_preserve_explicit_compatibility_exclusions(self):
+    async def test_legacy_negative_controls_do_not_claim_unsupported_exclusions(self):
         self.asset('A caption', [1, 0, 0], [1, 0, 0])
         result = await StickerQueryTool(self.catalog).run({'intent_core': 'A social acknowledgement',
             'forbid': ['humiliating the recipient'], 'text_constraints': {'avoid_text_meanings': ['asking for money']},
             'advanced': {'forbid': None, 'text_constraints': None}}, self.ctx)
-        self.assertEqual(result.output['constraints']['forbid'], ['humiliating the recipient'])
-        self.assertEqual(result.output['constraints']['avoid_text_meanings'], ['asking for money'])
+        self.assertTrue(result.output['ok'])
+        self.assertEqual(len(result.output['candidates']), 1)
+        self.assertNotIn('forbid', result.output['constraints'])
+        self.assertNotIn('avoid_text_meanings', result.output['constraints'])
         sent = ' '.join(call.args[0] for call in self.embeddings.embed_query.await_args_list)
         self.assertNotIn('humiliating', sent)
         self.assertNotIn('asking for money', sent)

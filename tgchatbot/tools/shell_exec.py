@@ -18,10 +18,9 @@ class ShellExecTool:
         self.spec = ToolSpec(
             name='shell_exec',
             description=(
-                'Run POSIX sh in this chat\'s persistent workspace (TGCHATBOT_SESSION_DIR). '
-                'Attachment paths are relative to this directory, under YYYY-MM-DD/. '
-                'Use dated or custom folders for new files. Inspect stdout, stderr and returncode; '
-                'use file_send to deliver files.'
+                'Run POSIX sh in a new process in this chat\'s remote workspace (TGCHATBOT_SESSION_DIR). '
+                'Files persist; shell state does not. Attachment paths use YYYY-MM-DD/; create dated or custom folders. '
+                'Each call executes again. Inspect stdout, stderr and returncode; file_send delivers files.'
             ),
             parameters_schema={
                 'type': 'object',
@@ -34,7 +33,8 @@ class ShellExecTool:
                         'type': 'integer',
                         'minimum': 1,
                         'maximum': self.config.ssh_exec.max_tool_timeout_s,
-                        'description': 'Execution timeout in seconds. Use null to fall back to the operator default timeout.',
+                        'description': 'Time to wait for execution, in seconds; defaults to the configured timeout. '
+                                       'A timeout may leave completion unconfirmed.',
                     },
                 },
                 'required': ['command'],
@@ -67,5 +67,6 @@ class ShellExecTool:
                 'stdout': result['stdout'],
                 'stderr': result['stderr'],
                 **{key: result[key] for key in ('stdout_truncated', 'stderr_truncated') if result.get(key)},
+                **{key: result[key] for key in ('outcome', 'error') if key in result},
             },
         )

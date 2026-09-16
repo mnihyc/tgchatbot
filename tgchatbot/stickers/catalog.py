@@ -255,6 +255,7 @@ class StickerCatalog:
                     await self.persona_store.save_sticker_persona(session_id, value, **kwargs)
             # Write-through after commit: failed/reset-racing writes cannot leak into cache.
             state.set_session_persona(value)
+            context['persona_update'] = 'cleared' if plan.persona_mode == 'clear_session_persona' else 'saved'
         return state, context
 
     def _available_path(self, asset, *, verify=True):

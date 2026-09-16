@@ -289,7 +289,10 @@ class MemoryReadTool:
                     'description': 'Optional fact_id values from user_profile_fetch. Opens their supporting originals; current=false marks historical facts. Use returned omitted_ids for further reads.'},
                 'image_ids': {'type': 'array', 'items': {'type': 'string'},
                     'description': 'Optional image references beside those originals; include each owning original in message_ids. Absent or empty keeps the read text-only.'},
-                'offset': {'type': 'integer'}, 'length': {'type': 'integer'},
+                'offset': {'type': 'integer', 'description': 'Zero-based character offset in each requested original; '
+                    'use its returned next_offset to continue reading.'},
+                'length': {'type': 'integer', 'description': 'Maximum characters to read per original from offset, '
+                    'within the configured shared response allowance.'},
                 'include_neighbors': {'type': 'boolean', 'description': 'Also read explicit reply target and nearby messages in the same topic'}},
              'additionalProperties': False}, self)
 
@@ -321,11 +324,10 @@ class UserProfileFetchTool:
     def __init__(self, memory: MemoryService) -> None:
         self.memory = memory
         self.spec = ToolSpec('user_profile_fetch',
-            'Fetch asynchronously updated, source-backed profiles for explicit actor IDs and, by default, the agent\'s continuing style preferences. '
-            'Use when personal context matters and earlier profile evidence is missing or stale. '
-            'Claims keep their kind and known validity dates; asserted_by defaults to the containing actor_id. '
-            'Use memory_read(profile_fact_ids=[fact_id]) to inspect supporting originals. '
-            'Names never select identities. Empty facts do not mean no preferences.',
+            'Read stored, asynchronously updated profiles for explicit actor IDs and, by default, the agent\'s continuing style preferences. '
+            'Fetching does not trigger learning. Claims retain kind, attribution and known validity dates; '
+            'asserted_by defaults to the containing actor_id. Use memory_read(profile_fact_ids=[fact_id]) for supporting originals. '
+            'Names do not select identities; empty facts do not establish absence of preferences.',
             {'type': 'object', 'properties': {
                 'actor_ids': {'type': 'array', 'items': {'type': 'string'},
                     'description': 'Participant references from message provenance, e.g. person_id:123; [] fetches only agent preferences'},

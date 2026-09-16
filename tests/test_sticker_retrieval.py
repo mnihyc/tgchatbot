@@ -364,14 +364,61 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual([c['sticker_id'] for c in result.output['candidates']],
                     [strongest.agent_id, appearance.agent_id, switched.agent_id, familiar.agent_id][:budget])
 
-    async def test_negative_meanings_are_constraints_not_positive_embedding_text(self):
+    async def test_negative_meanings_are_review_notes_not_positive_search_or_exclusion(self):
         self.asset()
         result = await self.query(advanced={'text_constraints': {'avoid_text_meanings': ['violent revenge']},
             'forbid': ['sexual threat']}, selection_lens={'avoid_misread_as': 'attention seeking'})
         sent_queries = ' '.join(call.args[0] for call in self.embeddings.embed_query.await_args_list)
         self.assertNotIn('violent revenge', sent_queries)
         self.assertNotIn('attention seeking', sent_queries)
-        self.assertEqual(result.output['constraints']['avoid_text_meanings'], ['violent revenge'])
+        self.assertEqual(result.output['review_notes'], {'avoid_misread_as': 'attention seeking'})
+        self.assertNotIn('avoid_text_meanings', result.output['constraints'])
+        self.assertNotIn('forbid', result.output['constraints'])
+        self.assertEqual(len(result.output['candidates']), 1)
+
+    async def test_caption_meaning_requirements_change_semantic_choice_without_becoming_literal_filters(self):
+        warm = self.asset(caption='好', reading_vectors=[[1, 0, 0]])
+        reluctant = self.asset(caption='好', reading_vectors=[[0, 1, 0]])
+        async def embed(text, **kwargs):
+            return np.array([0., 1., 0.] if 'reluctant agreement' in text else [1., 0., 0.])
+        self.embeddings.embed_query.side_effect = embed
+        baseline = await self.query(caption_meaning='好', candidate_budget=1)
+        changed = await self.query(caption_meaning='好', candidate_budget=1,
+            advanced={'text_constraints': {'must_include': ['reluctant agreement']}})
+        self.assertEqual(baseline.output['candidates'][0]['sticker_id'], warm.agent_id)
+        self.assertEqual(changed.output['candidates'][0]['sticker_id'], reluctant.agent_id)
+        self.assertEqual(changed.output['candidates'][0]['caption'], '好')
+
+    async def test_caption_presence_control_and_legacy_alias_keep_uncaptioned_default_candidates(self):
+        silent = self.asset(reading_vectors=[[1, 0, 0]])
+        captioned = self.asset(caption='辛苦了', reading_vectors=[[.8, .6, 0]])
+        for advanced in ({'require_caption': True}, {'text_constraints': {'text_priority': 'require'}},
+                         {'require_caption': None, 'text_constraints': {'text_priority': 'require'}}):
+            result = await self.query(advanced=advanced)
+            self.assertEqual([item['sticker_id'] for item in result.output['candidates']], [captioned.agent_id])
+        for advanced in ({}, {'require_caption': False}):
+            result = await self.query(advanced=advanced)
+            self.assertIn(silent.agent_id, [item['sticker_id'] for item in result.output['candidates']])
+
+    async def test_returned_persona_can_be_reused_without_losing_pack_or_saving_temporary_changes(self):
+        self.asset(pack='familiar')
+        saved = await self.query(persona={'visual_identity': {'preferred_pack': 'familiar',
+            'character_archetype': 'cat', 'style_hints': ['pastel']},
+            'affect_profile': {'default_tone': 'warm'}})
+        self.assertEqual(saved.output['persona_update'], 'saved')
+        returned = saved.output['persona']
+        self.assertEqual(returned['visual_identity']['preferred_pack'], 'familiar')
+        self.assertNotIn('prefer_pack', returned['visual_identity'])
+        reused = await self.query(persona_mode='use_once', persona=returned)
+        self.assertEqual(reused.output['persona'], returned)
+        changed = await self.query(persona_mode='use_once', persona={
+            'affect_profile': {'default_tone': 'playful'}, 'visual_identity': {'style_hints': ['ink']}})
+        self.assertEqual(changed.output['persona']['visual_identity']['style_hints'], ['pastel', 'ink'])
+        self.assertEqual(changed.output['persona']['affect_profile']['default_tone'], 'playful')
+        inherited = await self.query()
+        self.assertEqual(inherited.output['persona'], returned)
+        self.assertNotIn('persona_update', inherited.output)
+        self.personas.save_sticker_persona.assert_awaited_once()
 
     async def test_obsolete_send_argument_cannot_skip_query_or_explicit_persona_change(self):
         asset = self.asset()
@@ -393,6 +440,7 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         self.personas.clear_sticker_persona.side_effect = RuntimeError('fixture DB failure')
         failed = await self.query(persona_mode='clear_session_persona')
         self.assertFalse(failed.output['ok'])
+        self.assertNotIn('persona_update', failed.output)
         self.assertEqual(state.session_persona['visual_identity']['character_archetype'], 'cat')
         self.personas.clear_sticker_persona.side_effect = None
         await self.query(persona_mode='clear_session_persona')

@@ -16,6 +16,7 @@ from tgchatbot.domain.models import (ChatMode, ConversationMessage, MessagePart,
     OutboundArtifact, PartKind, ProviderResponse, ToolCall, ToolHistoryMode, ToolResult)
 from tgchatbot.storage.previews import PreviewCache
 from tgchatbot.tools.file_send import FileSendTool
+from tgchatbot.tools.remote_workspace import RemoteFileResult
 from tgchatbot.transports.artifact_delivery import deliver_artifact
 
 
@@ -40,7 +41,10 @@ class ContextReconstructionTests(BusinessTestCase):
                 transfer.write_bytes(original.read_bytes())
                 artifacts.append(OutboundArtifact(transfer, 'report.txt', temporary=True,
                     workspace_path=workspace_path))
-        remote = SimpleNamespace(fetch_files=AsyncMock(return_value=artifacts))
+        by_path = {artifact.workspace_path: artifact for artifact in artifacts}
+        remote = SimpleNamespace(fetch_files=AsyncMock(return_value=[
+            RemoteFileResult(path, artifact=by_path.get(path),
+                error=None if path in by_path else 'Remote file transfer failed.') for path in paths]))
         sender = FileSendTool(self.config, remote)
         self.tools.spec = sender.spec
         self.tools.list_tools.return_value = [sender.spec]
@@ -70,8 +74,9 @@ class ContextReconstructionTests(BusinessTestCase):
         original_rows = await self.store.read_messages(self.session, [row.db_id for row in state.raw_messages])
         prepared = next(row.message.metadata['tool_payload']['output'] for row in original_rows
             if row.message.metadata.get('tool_phase') == 'result')
-        self.assertEqual([item['workspace_path'] for item in prepared['prepared_files']],
-            [paths[1]] if partial_preparation else paths)
+        self.assertEqual([item['workspace_path'] for item in prepared['files']], paths)
+        self.assertEqual([item['status'] for item in prepared['files']],
+            ['failed', 'queued'] if partial_preparation else ['queued', 'queued'])
         self.assertEqual([row.message.metadata['tool_payload'] for row in original_rows
             if row.message.metadata.get('tool_phase') == 'delivery'], receipts,
             'Original delivery receipts retain transport IDs for audit.')

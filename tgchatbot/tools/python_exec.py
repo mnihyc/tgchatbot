@@ -18,9 +18,9 @@ class PythonExecTool:
         self.spec = ToolSpec(
             name='python_exec',
             description=(
-                'Run Python 3 in this chat\'s persistent workspace (TGCHATBOT_SESSION_DIR) for analysis and file transformations. '
-                'Attachment paths are relative to this directory, under YYYY-MM-DD/. '
-                'Use dated or custom folders for new files. Print useful results; use file_send to deliver files.'
+                'Run Python 3 in a new process in this chat\'s remote workspace (TGCHATBOT_SESSION_DIR). '
+                'Files persist; Python variables do not. Attachment paths use YYYY-MM-DD/; create dated or custom folders. '
+                'Each call executes again. Print useful results; file_send delivers files.'
             ),
             parameters_schema={
                 'type': 'object',
@@ -33,7 +33,8 @@ class PythonExecTool:
                         'type': 'integer',
                         'minimum': 1,
                         'maximum': self.config.ssh_exec.max_tool_timeout_s,
-                        'description': 'Execution timeout in seconds. Use null to fall back to the operator default timeout.',
+                        'description': 'Time to wait for execution, in seconds; defaults to the configured timeout. '
+                                       'A timeout may leave completion unconfirmed.',
                     },
                 },
                 'required': ['code'],
@@ -70,5 +71,6 @@ class PythonExecTool:
                 'stdout': result['stdout'],
                 'stderr': result['stderr'],
                 **{key: result[key] for key in ('stdout_truncated', 'stderr_truncated') if result.get(key)},
+                **{key: result[key] for key in ('outcome', 'error') if key in result},
             },
         )

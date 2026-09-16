@@ -17,10 +17,9 @@ class FileSendTool:
         self.spec = ToolSpec(
             name='file_send',
             description=(
-                'Prepare workspace files for delivery after this turn. '
-                'Use paths relative to the session directory, or absolute paths within it. '
-                'Returns preparation status and relative workspace_path, not file contents. '
-                'Pending preparation is not confirmed delivery.'
+                'Queue workspace files for automatic delivery after the final response. Each call creates new upload requests, '
+                'even for previously requested paths. Results give each file\'s status: queued means accepted for automatic delivery. '
+                'Use paths relative to the session directory, or absolute paths within it.'
             ),
             parameters_schema={
                 'type': 'object',
@@ -37,22 +36,21 @@ class FileSendTool:
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         try:
             paths = self._normalize_paths(args.get('paths'))
-            artifacts = await self.remote.fetch_files(
+            results = await self.remote.fetch_files(
                 session_id=ctx.session_id,
                 remote_paths=paths,
             )
+            artifacts = [result.artifact for result in results if result.artifact is not None]
             output = {
                 'ok': bool(artifacts),
-                'requested_paths': len(paths),
-                'prepared_files': [dict(filename=artifact.filename,
-                    **({'workspace_path': artifact.workspace_path} if artifact.workspace_path else {}))
-                    for artifact in artifacts],
-                'delivery_state': 'pending' if artifacts else 'unavailable',
-                'count': len(artifacts),
+                'status': ('queued' if len(artifacts) == len(results) else 'partial') if artifacts else 'failed',
+                'delivery_timing': 'after_final',
+                'files': [{'workspace_path': result.workspace_path,
+                    'status': 'queued' if result.artifact is not None else 'failed',
+                    **({'error': result.error} if result.error else {})} for result in results],
             }
             if not artifacts:
-                output['ok'] = False
-                output['error'] = 'No matching files were available to send'
+                output['error'] = 'No files were accepted for delivery'
             return ToolResult(call_id='', name=self.spec.name, output=output, artifacts=artifacts)
         except OSError as exc:
             logger.exception('file_send local transfer failed')

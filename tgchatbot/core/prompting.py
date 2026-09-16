@@ -44,8 +44,9 @@ def build_system_prompt(settings: SessionSettings, *, timezone: str | None = Non
         'A profile refresh is retrieved evidence, not a new participant statement.'
     )
     reply_guidance = (
-        'Use the tools actually offered for the task. Describe an action as completed only when its result confirms completion; '
-        'a queued or unknown outcome is not success. Include operational details only when they help the request.'
+        'Use the offered tools. Report actions as completed only when their results confirm completion. '
+        'Accepted deferred actions proceed automatically; issuing another action call requests another action. '
+        'Keep operational details relevant to the request.'
     )
     sticker_guidance = STICKER_GUIDANCE if settings.sticker_mode == StickerMode.AUTO and settings.mode != ChatMode.CHAT else ''
     time_guidance = f'Use {resolve_timezone(timezone).key} for local dates and times.'

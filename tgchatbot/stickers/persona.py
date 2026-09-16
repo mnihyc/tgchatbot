@@ -70,6 +70,15 @@ def persona_has_values(value: Any) -> bool:
     return bool(compact_persona_dict(value))
 
 
+def present_persona(value: dict[str, Any]) -> dict[str, Any]:
+    """Use the advertised persona keys without changing stored preferences."""
+    result = {group: dict(fields) for group, fields in value.items() if fields}
+    visual = result.get('visual_identity', {})
+    if 'prefer_pack' in visual:
+        visual.setdefault('preferred_pack', visual.pop('prefer_pack'))
+    return result
+
+
 def merge_persona_dicts(base: Any, override: Any) -> dict[str, Any]:
     base_persona = compact_persona_dict(base)
     override_persona = compact_persona_dict(override)

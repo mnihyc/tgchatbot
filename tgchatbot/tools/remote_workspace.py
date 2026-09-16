@@ -34,6 +34,13 @@ class RemoteSyncResult:
     paths_by_source: dict[str, str]
 
 
+@dataclass(frozen=True)
+class RemoteFileResult:
+    workspace_path: str
+    artifact: OutboundArtifact | None = None
+    error: str | None = None
+
+
 class RemoteWorkspaceClient:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
@@ -293,7 +300,7 @@ class RemoteWorkspaceClient:
         session_id: str,
         remote_paths: list[str] | None = None,
         max_files: int | None = None,
-    ) -> list[OutboundArtifact]:
+    ) -> list[RemoteFileResult]:
         paths = await self.ensure_session_dirs(session_id)
         max_files = self.ssh.max_output_files if max_files is None else max_files
         if remote_paths:
@@ -301,21 +308,27 @@ class RemoteWorkspaceClient:
             selected = [self._validate_remote_path(paths, value) for value in remote_paths]
         else:
             raise RuntimeError('At least one remote path must be specified for fetching')
-        selected = selected[:max_files]
         if not selected:
             return []
-        resolved = await self._resolve_remote_paths(paths, selected)
+        resolved = await self._resolve_remote_paths(paths, selected[:max_files])
         local_dir = self.config.artifact_dir / session_id / 'remote_fetch'
         local_dir.mkdir(parents=True, exist_ok=True)
-        artifacts: list[OutboundArtifact] = []
+        results: list[RemoteFileResult] = []
         try:
-            for requested_path, remote_path in zip(selected, resolved, strict=True):
+            for index, requested_path in enumerate(selected):
+                workspace_path = posixpath.relpath(requested_path, paths.root)
+                if index >= max_files:
+                    results.append(RemoteFileResult(workspace_path,
+                        error=f'Request exceeds the configured file limit ({max_files}).'))
+                    continue
+                remote_path = resolved[index]
                 filename = posixpath.basename(requested_path)
-                descriptor, temporary = tempfile.mkstemp(prefix='fetch-', suffix='-' + filename, dir=local_dir)
-                os.close(descriptor)
-                local_path = Path(temporary)
+                local_path = None
                 retained = False
                 try:
+                    descriptor, temporary = tempfile.mkstemp(prefix='fetch-', suffix='-' + filename, dir=local_dir)
+                    os.close(descriptor)
+                    local_path = Path(temporary)
                     scp_cmd = self._scp_base_args()
                     scp_cmd.extend([f"{self.ssh.host}:{remote_path}", str(local_path)])
                     proc = await asyncio.create_subprocess_exec(
@@ -327,25 +340,41 @@ class RemoteWorkspaceClient:
                     try:
                         _stdout, stderr = await asyncio.wait_for(proc.communicate(),
                             timeout=self.ssh.default_timeout_s + self.ssh.connect_timeout_s)
-                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                    except asyncio.CancelledError:
                         await self._terminate_process(proc)
                         raise
+                    except asyncio.TimeoutError:
+                        await self._terminate_process(proc)
+                        results.append(RemoteFileResult(workspace_path, error='Timed out fetching the file.'))
+                        continue
                     if proc.returncode != 0:
                         logger.warning('Failed to fetch remote file %s: %s', remote_path, stderr.decode('utf-8', errors='replace')[:300])
+                        results.append(RemoteFileResult(workspace_path, error='Remote file transfer failed.'))
                         continue
-                    if not local_path.is_file() or local_path.stat().st_size > self.ssh.max_output_file_bytes:
+                    if not local_path.is_file():
+                        results.append(RemoteFileResult(workspace_path, error='Fetched path is not a regular file.'))
                         continue
-                    artifacts.append(OutboundArtifact(path=local_path, filename=filename, temporary=True,
-                        workspace_path=posixpath.relpath(requested_path, paths.root)))
+                    if local_path.stat().st_size > self.ssh.max_output_file_bytes:
+                        results.append(RemoteFileResult(workspace_path,
+                            error=f'File exceeds the configured output size limit ({self.ssh.max_output_file_bytes} bytes).'))
+                        continue
+                    artifact = OutboundArtifact(path=local_path, filename=filename, temporary=True,
+                        workspace_path=workspace_path)
+                    results.append(RemoteFileResult(workspace_path, artifact=artifact))
                     retained = True
+                except OSError as exc:
+                    logger.exception('Local file transfer failed for %s', requested_path)
+                    results.append(RemoteFileResult(workspace_path,
+                        error=f'Local file transfer failed: {exc.__class__.__name__}'))
                 finally:
-                    if not retained:
+                    if local_path is not None and not retained:
                         local_path.unlink(missing_ok=True)
         except BaseException:
-            for artifact in artifacts:
-                artifact.discard()
+            for result in results:
+                if result.artifact is not None:
+                    result.artifact.discard()
             raise
-        return artifacts
+        return results
 
     async def _resolve_remote_paths(self, paths: RemoteSessionPaths, selected: list[str]) -> list[str]:
         # Lexical prefix checks cannot see remote symlinks. Resolve once before
@@ -400,8 +429,8 @@ class RemoteWorkspaceClient:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout_capture: dict[str, bool] = {}
-        stderr_capture: dict[str, bool] = {}
+        stdout_capture: dict[str, Any] = {}
+        stderr_capture: dict[str, Any] = {}
         try:
             stdout, stderr, _ = await asyncio.wait_for(asyncio.gather(
                 self._read_output(proc.stdout, None if full_stdout else
@@ -419,13 +448,20 @@ class RemoteWorkspaceClient:
                 proc.kill()
             await proc.communicate()
             logger.warning('remote.exec.timeout timeout_s=%s', timeout_s)
-            return {'ok': False, 'returncode': -9, 'stdout': '', 'stderr': f'Timed out after {timeout_s}s'}
-        result = {
-            'ok': proc.returncode == 0,
-            'returncode': proc.returncode,
-            'stdout': stdout,
-            'stderr': stderr,
-        }
+            result = {'ok': False, 'returncode': None, 'outcome': 'unknown',
+                'error': 'Timed out waiting for execution; remote completion is unconfirmed.',
+                'stdout': stdout_capture.get('text', ''), 'stderr': stderr_capture.get('text', '')}
+        else:
+            result = {
+                'ok': proc.returncode == 0,
+                'returncode': proc.returncode,
+                'stdout': stdout,
+                'stderr': stderr,
+            }
+            # SSH reserves 255 for errors; a remote exit of 255 is indistinguishable.
+            if proc.returncode == 255 or proc.returncode < 0:
+                result.update(returncode=None, outcome='unknown',
+                    error='Remote connection ended without a confirmed command result.')
         for channel, capture in (('stdout', stdout_capture), ('stderr', stderr_capture)):
             if capture.get('truncated'):
                 result[f'{channel}_truncated'] = True
@@ -435,32 +471,34 @@ class RemoteWorkspaceClient:
 
     @staticmethod
     async def _read_output(stream: asyncio.StreamReader, limit: int | None, *,
-                           capture: dict[str, bool] | None = None) -> str:
+                           capture: dict[str, Any] | None = None) -> str:
         decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
         kept: list[str] = []
         remaining = None if limit is None else max(0, limit)
         truncated = False
-        while chunk := await stream.read(64 * 1024):
-            if remaining == 0:
-                truncated = True
-                continue
-            decoded = decoder.decode(chunk)
+        try:
+            while chunk := await stream.read(64 * 1024):
+                if remaining == 0:
+                    truncated = True
+                    continue
+                decoded = decoder.decode(chunk)
+                if remaining is None:
+                    kept.append(decoded)
+                else:
+                    text = decoded[:remaining]
+                    if text:
+                        kept.append(text)
+                    remaining -= len(text)
+                    truncated = truncated or len(text) < len(decoded)
+        finally:
+            final = decoder.decode(b'', final=True)
             if remaining is None:
-                kept.append(decoded)
+                kept.append(final)
             else:
-                text = decoded[:remaining]
-                if text:
-                    kept.append(text)
-                remaining -= len(text)
-                truncated = truncated or len(text) < len(decoded)
-        final = decoder.decode(b'', final=True)
-        if remaining is None:
-            kept.append(final)
-        else:
-            kept.append(final[:remaining])
-            truncated = truncated or len(final) > remaining
-        if capture is not None:
-            capture['truncated'] = truncated
+                kept.append(final[:remaining])
+                truncated = truncated or len(final) > remaining
+            if capture is not None:
+                capture.update(text=''.join(kept), truncated=truncated)
         return ''.join(kept)
 
     async def _terminate_process(self, proc: asyncio.subprocess.Process) -> None:

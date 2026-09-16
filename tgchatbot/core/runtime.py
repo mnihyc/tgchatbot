@@ -22,6 +22,7 @@ from tgchatbot.core.policy import policy_for_mode
 from tgchatbot.core.compaction_schema import compaction_json_schema, compaction_schema_name, parse_structured_candidate
 from tgchatbot.core.prompting import build_compaction_prompt, build_system_prompt
 from tgchatbot.core.token_estimator import TokenEstimator
+from tgchatbot.stickers.persona import present_persona
 from tgchatbot.domain.models import (
     ChatMode,
     ConversationMessage,
@@ -737,9 +738,10 @@ class AgentRuntime:
                                     )
                                     if self.sticker_delivery is not None and sticker.delivery_operation_id:
                                         delivered = await self.sticker_delivery.get(sticker.delivery_operation_id)
+                                        delivery_error = self._delivery_error(delivered)
                                         tool_output = {**tool_output,'status':delivered['status'],
                                             'ok':delivered['status']=='sent',
-                                            **({'error':delivered['error']} if delivered.get('error') else {})}
+                                            **({'error':delivery_error} if delivery_error else {})}
                     if evidence_parts:
                         has_tool_evidence = True
                         updated_call = await self.store.mark_tool_evidence(session_id, stored_call.db_id,
@@ -3387,6 +3389,9 @@ class AgentRuntime:
                     details.append(f"ok={bool(output.get('ok'))}")
                 if output.get('returncode') is not None:
                     details.append(f"returncode={output.get('returncode')}")
+                for key in ('outcome', 'error'):
+                    if output.get(key):
+                        details.append(f'{key}={output[key]!r}')
                 stdout = self._clip_inline(output.get('stdout'), 180)
                 stderr = self._clip_inline(output.get('stderr'), 180)
                 if stdout:
@@ -3401,6 +3406,13 @@ class AgentRuntime:
         return prefix + (': ' + '; '.join(details) if details else ' recorded')
 
     @staticmethod
+    def _delivery_error(payload: dict[str, Any]) -> str | None:
+        if payload.get('status', payload.get('delivery_state')) == 'unknown':
+            kind = 'sticker' if 'sticker_id' in payload else 'file'
+            return f'Delivery acknowledgment was not received; the {kind} may have been sent.'
+        return payload.get('error')
+
+    @staticmethod
     def _delivery_view(payload: dict[str, Any]) -> dict[str, Any]:
         """Agent-visible receipt; transport identity remains in the ledger."""
         view = {key: payload[key] for key in ('filename', 'workspace_path', 'sticker_id',
@@ -3408,6 +3420,9 @@ class AgentRuntime:
         state = payload.get('status', payload.get('delivery_state'))
         if state is not None:
             view['status'] = state
+        error = AgentRuntime._delivery_error(payload)
+        if error:
+            view['error'] = error
         return view
 
     def _describe_tool_delivery(self, name: str, payload: dict[str, Any]) -> str:
@@ -3415,7 +3430,7 @@ class AgentRuntime:
             return 'Tool file_send delivery:\n' + json.dumps(payload, ensure_ascii=False, default=str)
         if name == 'sticker_send':
             details = self._describe_sticker_delivery(payload)
-            prefix = f'Tool {name} delivery'
+            prefix = 'Sticker delivery receipt'
             return prefix + (': ' + '; '.join(details) if details else ' recorded')
         payload_text = self._clip_inline(self._compact_json(payload, limit=220), 220)
         prefix = f'Tool {name} delivery'
@@ -3459,6 +3474,10 @@ class AgentRuntime:
     def _describe_sticker_query_result(self, output: dict[str, Any]) -> list[str]:
         details: list[str] = []
         details.append(f"ok={bool(output.get('ok'))}")
+        if output.get('persona'):
+            details.append('persona=' + json.dumps(present_persona(output['persona']), ensure_ascii=False))
+        if output.get('persona_update'):
+            details.append(f"persona_update={output['persona_update']}")
         if not output.get('ok'):
             error = self._clip_inline(output.get('error'), 120)
             if error:
@@ -3489,7 +3508,6 @@ class AgentRuntime:
             error = self._clip_inline(output.get('error'), 120)
             if error:
                 details.append(f'error={error!r}')
-            return details
         sticker_id = str(output.get('sticker_id') or '').strip()
         if sticker_id:
             details.append(f'sticker_id={sticker_id!r}')
@@ -3535,7 +3553,7 @@ class AgentRuntime:
         telegram_message_id = payload.get('telegram_message_id')
         if telegram_message_id is not None:
             details.append(f'telegram_message_id={telegram_message_id}')
-        error = self._clip_inline(payload.get('error'), 60)
+        error = str(payload.get('error') or '').strip()
         if error:
             details.append(f'error={error!r}')
         return details

@@ -10,12 +10,15 @@ class ReadDocTool:
     def __init__(self, config, remote):
         self.config, self.remote = config, remote
         self.spec = ToolSpec(name='read_doc',
-            description='Read one file in this chat\'s remote workspace in the requested format. Optionally select text lines or PDF pages. Returns contents for inspection.',
+            description='Inspect a workspace file; returned text and images are for the agent. '
+                'Select text lines or PDF pages using one-based inclusive ranges. For large documents, request smaller ranges.',
             parameters_schema={'type': 'object', 'properties': {
                 'path': {'type': 'string', 'description': 'Path relative to the session directory, or an absolute path within it.'},
-                'format': {'type': 'string', 'enum': ['text', 'image', 'pdf']},
+                'format': {'type': 'string', 'enum': ['text', 'image', 'pdf'],
+                    'description': 'text reads UTF-8 text; image returns a still image (the first frame for animation); '
+                                   'pdf returns selected page images and extracted text.'},
                 'start': {'type': 'integer', 'description': 'First line (text) or page (PDF), one-based and inclusive.'},
-                'end': {'type': 'integer', 'description': 'Last line or page, inclusive. Omit the range to read the complete file.'},
+                'end': {'type': 'integer', 'description': 'Last selected line or page, inclusive. Omit the range to request the whole file.'},
             }, 'required': ['path', 'format'], 'additionalProperties': False}, runner=self)
 
     async def run(self, args: dict, ctx: ToolContext) -> ToolResult:

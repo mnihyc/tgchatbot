@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from tgchatbot.stickers.config import StickerConfig
-from tgchatbot.stickers.persona import PERSONA_MODES, build_persona_dict, persona_has_values
+from tgchatbot.stickers.persona import PERSONA_MODES, build_persona_dict, persona_has_values, present_persona
 
 _TEXT_PRIORITIES = {'require', 'prefer', 'ignore'}
 _STYLE_GOALS = {'preserve', 'allow_switch', 'prefer_switch', 'ignore_style'}
@@ -212,13 +212,7 @@ class PersonaVisualIdentity:
         return [*fields, *list(self.style_hints)]
 
     def display_dict(self) -> dict[str, Any]:
-        return {
-            'character_archetype': self.character_archetype,
-            'rendering_style': self.rendering_style,
-            'palette_mood': self.palette_mood,
-            'style_hints': list(self.style_hints),
-            'preferred_pack': self.prefer_pack,
-        }
+        return present_persona({'visual_identity': self.as_dict()}).get('visual_identity', {})
 
 
 @dataclass(slots=True)
@@ -263,19 +257,7 @@ class StickerPersona:
         return [*self.visual_identity.request_texts(), *self.affect_profile.request_texts()]
 
     def display_dict(self) -> dict[str, Any]:
-        visual_identity = self.visual_identity.display_dict()
-        affect_profile = self.affect_profile.as_dict()
-        payload: dict[str, Any] = {}
-        has_visual_identity = any(bool(value) for key, value in visual_identity.items() if key == 'style_hints') or any(
-            str(value or '').strip()
-            for key, value in visual_identity.items()
-            if key != 'style_hints'
-        )
-        if has_visual_identity:
-            payload['visual_identity'] = visual_identity
-        if affect_profile:
-            payload['affect_profile'] = affect_profile
-        return payload
+        return present_persona(self.as_dict())
 
 
 @dataclass(slots=True)
@@ -394,6 +376,8 @@ class StickerRetrievalPlan:
         text_priority = _norm_text(_first_present(text_source.get('text_priority'), legacy_text_priority, 'prefer')).lower() or 'prefer'
         if text_priority not in _TEXT_PRIORITIES:
             text_priority = 'prefer'
+        if advanced.get('require_caption') is not None:
+            text_priority = 'require' if _norm_bool(advanced['require_caption'], default=False) else 'prefer'
         text_constraints = TextConstraints(
             text_priority=text_priority,
             must_include=must_include,

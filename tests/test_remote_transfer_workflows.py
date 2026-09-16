@@ -49,11 +49,12 @@ class RemoteTransferWorkflows(unittest.IsolatedAsyncioTestCase):
         with patch('asyncio.create_subprocess_exec', side_effect=scp):
             first = await self.remote.fetch_files(session_id='telegram:1', remote_paths=list(originals))
             second = await self.remote.fetch_files(session_id='telegram:1', remote_paths=[next(iter(originals))])
-        self.assertEqual([item.path.read_bytes() for item in first + second],
+        artifacts = [item.artifact for item in first + second]
+        self.assertEqual([item.path.read_bytes() for item in artifacts],
                          [b'first report', b'second report', b'first report'])
-        self.assertEqual(len({item.path for item in first + second}), 3)
-        self.assertTrue(all(item.filename == 'report.txt' for item in first + second))
-        for item in first + second:
+        self.assertEqual(len({item.path for item in artifacts}), 3)
+        self.assertTrue(all(item.filename == 'report.txt' for item in artifacts))
+        for item in artifacts:
             item.discard()
         self.assertFalse(list(self.config.artifact_dir.rglob('fetch-*')))
 
@@ -109,7 +110,7 @@ class RemoteTransferWorkflows(unittest.IsolatedAsyncioTestCase):
             {'paths': ['chosen.txt']}, ToolContext('telegram:1', 'Participant'))
         try:
             self.assertTrue(result.output['ok'], result.output)
-            self.assertEqual(result.output['prepared_files'], [{'filename': 'chosen.txt', 'workspace_path': 'chosen.txt'}])
+            self.assertEqual(result.output['files'], [{'workspace_path': 'chosen.txt', 'status': 'queued'}])
             self.assertEqual([artifact.path.read_bytes() for artifact in result.artifacts], [b'Selected document'])
             self.assertEqual(original.read_bytes(), b'Selected document')
         finally:
@@ -286,8 +287,10 @@ class RemoteTransferWorkflows(unittest.IsolatedAsyncioTestCase):
             ToolContext('telegram:1', 'Participant'))
         try:
             self.assertTrue(result.output['ok'], result.output)
-            self.assertEqual(result.output['requested_paths'], 2)
-            self.assertEqual(result.output['prepared_files'], [{'filename': 'available.txt', 'workspace_path': 'available.txt'}])
+            self.assertEqual(result.output['status'], 'partial')
+            self.assertEqual(result.output['files'][0], {'workspace_path': 'missing.txt',
+                'status': 'failed', 'error': 'Remote file transfer failed.'})
+            self.assertEqual(result.output['files'][1], {'workspace_path': 'available.txt', 'status': 'queued'})
             self.assertEqual([artifact.path.read_bytes() for artifact in result.artifacts], [original.read_bytes()])
             self.assertEqual(list(self.config.artifact_dir.rglob('fetch-*')), [result.artifacts[0].path])
         finally:
@@ -306,9 +309,12 @@ class RemoteTransferWorkflows(unittest.IsolatedAsyncioTestCase):
             {'paths': ['missing/report.txt', *originals]}, ToolContext('telegram:1', 'Participant'))
         try:
             self.assertTrue(result.output['ok'], result.output)
-            self.assertEqual(result.output['requested_paths'], 3)
-            self.assertEqual(result.output['prepared_files'], [
-                {'filename': 'report.txt', 'workspace_path': relative} for relative in originals])
+            self.assertEqual(result.output['status'], 'partial')
+            self.assertEqual(result.output['files'][0]['workspace_path'], 'missing/report.txt')
+            self.assertEqual(result.output['files'][0]['status'], 'failed')
+            self.assertTrue(result.output['files'][0]['error'])
+            self.assertEqual(result.output['files'][1:], [
+                {'workspace_path': relative, 'status': 'queued'} for relative in originals])
             self.assertEqual([artifact.path.read_bytes() for artifact in result.artifacts], list(originals.values()))
             bot = SimpleNamespace(send_document=AsyncMock(side_effect=[SimpleNamespace(message_id=42), BadRequest('rejected')]))
             first = await deliver_artifact(bot, chat_id=1, artifact=result.artifacts[0])
@@ -321,6 +327,103 @@ class RemoteTransferWorkflows(unittest.IsolatedAsyncioTestCase):
         finally:
             for artifact in result.artifacts:
                 artifact.discard()
+
+    async def test_partial_file_retry_requests_only_the_failed_path(self):
+        paths = self.process_workspace()
+        Path(paths.root, 'ready.txt').write_bytes(b'First requested file')
+        tool = FileSendTool(self.config, self.remote)
+        first = await tool.run({'paths': ['ready.txt', 'later.txt']}, ToolContext('telegram:1', 'Participant'))
+        self.addCleanup(lambda: [artifact.discard() for artifact in first.artifacts])
+        self.assertEqual(first.output['status'], 'partial')
+        retry_paths = [entry['workspace_path'] for entry in first.output['files'] if entry['status'] == 'failed']
+        self.assertEqual(retry_paths, ['later.txt'])
+        Path(paths.root, 'later.txt').write_bytes(b'Recovered requested file')
+        retried = await tool.run({'paths': retry_paths}, ToolContext('telegram:1', 'Participant'))
+        self.addCleanup(lambda: [artifact.discard() for artifact in retried.artifacts])
+        self.assertEqual(retried.output['status'], 'queued')
+        self.assertEqual([artifact.workspace_path for artifact in first.artifacts + retried.artifacts],
+                         ['ready.txt', 'later.txt'])
+        self.assertEqual([artifact.path.read_bytes() for artifact in first.artifacts + retried.artifacts],
+                         [b'First requested file', b'Recovered requested file'])
+
+    async def test_each_rejected_file_has_an_outcome_under_existing_operator_limits(self):
+        paths = self.process_workspace()
+        self.remote.ssh = replace(self.remote.ssh, max_output_files=2, max_output_file_bytes=4)
+        for name, data in [('small.txt', b'yes'), ('large.txt', b'too large'), ('third.txt', b'ok')]:
+            Path(paths.root, name).write_bytes(data)
+        result = await FileSendTool(self.config, self.remote).run(
+            {'paths': ['small.txt', 'large.txt', 'third.txt']}, ToolContext('telegram:1', 'Participant'))
+        self.addCleanup(lambda: [artifact.discard() for artifact in result.artifacts])
+        self.assertEqual([entry['status'] for entry in result.output['files']], ['queued', 'failed', 'failed'])
+        self.assertIn('size limit', result.output['files'][1]['error'])
+        self.assertIn('file limit', result.output['files'][2]['error'])
+        self.assertEqual([artifact.workspace_path for artifact in result.artifacts], ['small.txt'])
+        self.assertEqual(list(self.config.artifact_dir.rglob('fetch-*')), [result.artifacts[0].path])
+
+    async def test_execution_timeout_preserves_partial_output_and_never_claims_a_remote_exit_code(self):
+        self.remote.ensure_master = AsyncMock()
+        self.remote.ssh = replace(self.remote.ssh, connect_timeout_s=0, max_stdout_chars=5)
+        cases = [(ShellExecTool(self.config, self.remote), {'command': 'write-file-and-wait', 'timeout_s': 1}),
+                 (PythonExecTool(self.config, self.remote), {'code': 'write_file_then_wait()', 'timeout_s': 1})]
+        for tool, args in cases:
+            with self.subTest(tool=tool.spec.name):
+                stdout, stderr = asyncio.StreamReader(), asyncio.StreamReader()
+                stdout.feed_data(b'wrote output before timeout')
+                stderr.feed_data(b'partial diagnostic')
+                stderr.feed_eof()
+                process = SimpleNamespace(stdout=stdout, stderr=stderr, returncode=None,
+                    wait=AsyncMock(return_value=0), communicate=AsyncMock(return_value=(b'', b'')))
+                process.kill = unittest.mock.Mock(side_effect=lambda: setattr(process, 'returncode', -9))
+                with patch('asyncio.create_subprocess_exec', AsyncMock(return_value=process)):
+                    result = await tool.run(args, ToolContext('telegram:1', 'Participant'))
+                process.kill.assert_called_once()
+                self.assertFalse(result.output['ok'])
+                self.assertIsNone(result.output['returncode'])
+                self.assertEqual(result.output['outcome'], 'unknown')
+                self.assertEqual(result.output['stdout'], 'wrote')
+                self.assertTrue(result.output['stdout_truncated'])
+                self.assertEqual(result.output['stderr'], 'partial diagnostic')
+                self.assertIn('remote completion is unconfirmed', result.output['error'])
+
+    async def test_one_fetch_timeout_keeps_other_accepted_files_and_discards_its_partial_copy(self):
+        self.remote._resolve_remote_paths = AsyncMock(side_effect=lambda paths, selected: selected)
+        stalled = None
+        async def scp(*arguments, **kwargs):
+            nonlocal stalled
+            name = arguments[-2].rsplit('/', 1)[-1]
+            Path(arguments[-1]).write_bytes(name.encode())
+            if name == 'stalled.txt':
+                stalled = SimpleNamespace(kill=unittest.mock.Mock(), wait=AsyncMock(return_value=-9),
+                    communicate=AsyncMock(side_effect=asyncio.TimeoutError))
+                return stalled
+            return SimpleNamespace(returncode=0, communicate=AsyncMock(return_value=(b'', b'')))
+        with patch('asyncio.create_subprocess_exec', side_effect=scp):
+            result = await FileSendTool(self.config, self.remote).run(
+                {'paths': ['first.txt', 'stalled.txt', 'last.txt']}, ToolContext('telegram:1', 'Participant'))
+        self.addCleanup(lambda: [artifact.discard() for artifact in result.artifacts])
+        self.assertEqual(result.output['status'], 'partial')
+        self.assertEqual([entry['status'] for entry in result.output['files']], ['queued', 'failed', 'queued'])
+        self.assertEqual(result.output['files'][1]['error'], 'Timed out fetching the file.')
+        self.assertEqual([artifact.path.read_bytes() for artifact in result.artifacts], [b'first.txt', b'last.txt'])
+        self.assertEqual(set(self.config.artifact_dir.rglob('fetch-*')), {artifact.path for artifact in result.artifacts})
+        stalled.kill.assert_called_once()
+        stalled.wait.assert_awaited_once()
+
+    async def test_transport_exit_is_uncertain_while_confirmed_command_exit_remains_visible(self):
+        self.process_workspace()
+        tool = ShellExecTool(self.config, self.remote)
+        for code in (7, 255):
+            with self.subTest(code=code):
+                result = await tool.run({'command': f"printf 'diagnostic' >&2; exit {code}"},
+                    ToolContext('telegram:1', 'Participant'))
+                self.assertFalse(result.output['ok'])
+                self.assertEqual(result.output['stderr'], 'diagnostic')
+                if code == 255:
+                    self.assertIsNone(result.output['returncode'])
+                    self.assertEqual(result.output['outcome'], 'unknown')
+                else:
+                    self.assertEqual(result.output['returncode'], code)
+                    self.assertNotIn('outcome', result.output)
 
     async def test_python_source_with_shell_delimiter_executes_unchanged(self):
         paths = RemoteSessionPaths(str(self.root))

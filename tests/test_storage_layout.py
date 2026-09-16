@@ -151,7 +151,8 @@ class StorageLayoutTests(BusinessTestCase):
             return SimpleNamespace(returncode=0, communicate=AsyncMock(return_value=(b'', b'')))
 
         with patch('tgchatbot.tools.remote_workspace.asyncio.create_subprocess_exec', side_effect=scp) as execute:
-            artifacts = await remote.fetch_files(session_id=self.session, remote_paths=['report.txt'])
+            results = await remote.fetch_files(session_id=self.session, remote_paths=['report.txt'])
+        artifacts = [result.artifact for result in results]
         self.assertEqual(len(artifacts), 1)
         self.assertEqual(artifacts[0].path.parent, self.root / 'tmp' / 'bot' / 'artifacts' / self.session / 'remote_fetch')
         self.assertTrue(artifacts[0].path.name.endswith('-report.txt'))
