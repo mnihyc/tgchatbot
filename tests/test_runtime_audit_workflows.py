@@ -41,7 +41,7 @@ class RuntimeAuditWorkflows(BusinessTestCase):
         self.tools.spec = reader.spec
         self.tools.list_tools.return_value = [reader.spec]
         arguments = {'path': 'arrival.pdf' if retire_images else 'arrival.txt',
-            'format': 'pdf' if retire_images else 'text'}
+            'file_format': 'pdf' if retire_images else 'text'}
         calls = [ToolCall('read_doc', call_id, arguments)
             for call_id in (('arrival', 'verification') if parallel else ('arrival',))]
         self.provider.responses = [ProviderResponse(tool_calls=calls,

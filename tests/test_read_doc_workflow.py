@@ -15,10 +15,13 @@ import httpx
 from PIL import Image
 
 from tests.business_helpers import BusinessTestCase
+from tgchatbot.config import ReadDocConfig
 from tgchatbot.core.memory import MemoryService
 from tgchatbot.core.runtime import AgentRuntime
+from tgchatbot.core.token_estimator import TokenEstimator
 from tgchatbot.domain.models import ChatMode, ConversationMessage, MessagePart, MessageRole, PartKind
 from tgchatbot.providers.gemini import GeminiProvider
+from tgchatbot.operational import from_env
 from tgchatbot.stickers.config import StickerConfig
 from tgchatbot.storage.previews import PreviewCache
 from tgchatbot.tools.base import ToolContext
@@ -55,15 +58,20 @@ class ProcessWorkspace(RemoteWorkspaceClient):
         return {'ok': proc.returncode == 0, 'returncode': proc.returncode, 'stdout': stdout, 'stderr': stderr}
 
 
-def write_pdf(path):
-    """Two ordinary text pages; no extra PDF writer dependency is needed."""
+def write_pdf(path, texts=None):
+    """Ordinary text pages; no extra PDF writer dependency is needed."""
+    if texts is None:
+        texts = ('First page: departure at noon.', 'Second page: bring the blue ticket.')
     streams = [f'BT /F1 12 Tf 20 100 Td ({text}) Tj ET'.encode()
-        for text in ('First page: departure at noon.', 'Second page: bring the blue ticket.')]
+        for text in texts]
+    count = len(streams)
+    kids = ' '.join(f'{number} 0 R' for number in range(3, count + 3))
+    font = count + 3
     objects = [b'<< /Type /Catalog /Pages 2 0 R >>',
-        b'<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>',
+        f'<< /Type /Pages /Kids [{kids}] /Count {count} >>'.encode(),
         *[f'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 240 160] '
-          f'/Resources << /Font << /F1 5 0 R >> >> /Contents {number} 0 R >>'.encode()
-          for number in (6, 7)],
+          f'/Resources << /Font << /F1 {font} 0 R >> >> /Contents {number} 0 R >>'.encode()
+          for number in range(font + 1, font + count + 1)],
         b'<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
         *[f'<< /Length {len(stream)} >>\nstream\n'.encode() + stream + b'\nendstream' for stream in streams]]
     content, offsets = bytearray(b'%PDF-1.4\n'), [0]
@@ -104,8 +112,8 @@ class ReadDocWorkflows(BusinessTestCase):
         self.memory = MemoryService(self.store, SimpleNamespace(enabled=False))
         self.wire = []
 
-    async def read(self, path, format, **selection):
-        return await self.tool.run({'path': path, 'format': format, **selection},
+    async def read(self, path, file_format, **selection):
+        return await self.tool.run({'path': path, 'file_format': file_format, **selection},
             ToolContext(self.session, 'Participant', evidence_tokens=20000, evidence_images=4))
 
     async def gemini_runtime(self, scripts):
@@ -125,14 +133,133 @@ class ReadDocWorkflows(BusinessTestCase):
         return runtime, provider
 
     @staticmethod
-    def call(path, format, call_id, **selection):
+    def call(path, file_format, call_id, **selection):
         return {'functionCall': {'name': 'read_doc', 'id': call_id,
-            'args': {'path': path, 'format': format, **selection}},
+            'args': {'path': path, 'file_format': file_format, **selection}},
             'thoughtSignature': base64.b64encode(b'synthetic signature').decode()}
 
     def results(self, wire):
         return [part['functionResponse'] for content in wire['contents'] for part in content.get('parts', [])
             if part.get('functionResponse', {}).get('name') == 'read_doc']
+
+    async def test_pdf_windows_return_the_actual_range_and_navigation_for_overlong_requests(self):
+        write_pdf(self.workspace / 'paper.pdf', [f'Page {number}: distinct evidence.' for number in range(1, 17)])
+        context = ToolContext(self.session, 'Participant', evidence_tokens=20000, evidence_images=10)
+        for selection, expected in [({}, (1, 5)), ({'start': 3}, (3, 7)),
+                                    ({'start': 15}, (15, 16)), ({'start': 1, 'end': 8}, (1, 5)),
+                                    ({'start': 3, 'end': 5}, (3, 5)),
+                                    ({'start': 15, 'end': 100}, (15, 16))]:
+            with self.subTest(selection=selection):
+                result = await self.tool.run({'path': 'paper.pdf', 'file_format': 'pdf', **selection}, context)
+                self.assertTrue(result.output['ok'], result.output)
+                self.assertEqual(result.output['file_format'], 'pdf')
+                self.assertEqual(result.output['selection'], {'start': expected[0], 'end': expected[1], 'unit': 'pages'})
+                self.assertEqual(result.output['total_pages'], 16)
+                if expected[1] < min(selection.get('end', 16), 16):
+                    self.assertIn(f'start={expected[1] + 1}', result.output['note'])
+                else:
+                    self.assertNotIn('note', result.output)
+                self.assertEqual(sum(part.kind == PartKind.IMAGE for part in result.evidence_parts), expected[1] - expected[0] + 1)
+                text = '\n'.join(part.text or '' for part in result.evidence_parts if part.kind == PartKind.TEXT)
+                self.assertIn(f'Page {expected[0]}:', text)
+                self.assertIn(f'Page {expected[1]}:', text)
+                self.assertNotIn(f'Page {expected[1] + 1}:', text)
+
+    async def test_pdf_requested_as_text_returns_actionable_format_guidance(self):
+        for name, contents in [('paper.bin', b'%PDF-1.4\n%\xbf\xff\n'),
+                               ('schedule.pdf', (self.workspace / 'schedule.pdf').read_bytes())]:
+            with self.subTest(path=name):
+                self.workspace.joinpath(name).write_bytes(contents)
+                result = await self.read(name, 'text', start=3, end=5)
+                self.assertFalse(result.output['ok'], result.output)
+                self.assertIn('file_format="pdf"', result.output['error'])
+                self.assertIn('page', result.output['error'])
+                self.assertEqual(result.evidence_parts, [])
+
+    async def test_pdf_page_window_uses_the_environment_setting(self):
+        write_pdf(self.workspace / 'paper.pdf', ['Synthetic page.'] * 9)
+        for page_count in (3, 8):
+            with self.subTest(page_count=page_count):
+                config = replace(self.config, read_doc=from_env(ReadDocConfig, 'READ_DOC',
+                    {'READ_DOC_PDF_MAX_PAGES': str(page_count)}))
+                result = await ReadDocTool(config, self.remote).run(
+                    {'path': 'paper.pdf', 'file_format': 'pdf', 'start': 1, 'end': 9},
+                    ToolContext(self.session, 'Participant', evidence_tokens=20000, evidence_images=10))
+                self.assertTrue(result.output['ok'], result.output)
+                self.assertEqual(result.output['selection'], {'start': 1, 'end': page_count, 'unit': 'pages'})
+                self.assertEqual(result.output['total_pages'], 9)
+                self.assertIn(f'start={page_count + 1}', result.output['note'])
+
+    async def test_pdf_allowances_keep_complete_pages_instead_of_discarding_the_read(self):
+        path = self.workspace / 'paper.pdf'
+        write_pdf(path, ['Synthetic page.'] * 6)
+        original = path.read_bytes()
+        single = await self.read('paper.pdf', 'pdf', start=1, end=1)
+        page_tokens = TokenEstimator.estimate_message(ConversationMessage(
+            role=MessageRole.TOOL, parts=single.evidence_parts))
+        # Measure this fixture's prepared payload, then allow exactly one page.
+        text, image = single.evidence_parts
+        page_bytes = sum(len(json.dumps(part, ensure_ascii=False).encode('utf-8')) for part in [
+            {'kind': 'text', 'text': text.text},
+            {'kind': 'image', 'mime_type': image.mime_type, 'data_b64': image.data_b64,
+             'filename': image.filename, 'text': image.text}])
+        byte_limited = replace(self.config, ssh_exec=replace(self.config.ssh_exec,
+            max_output_file_bytes=page_bytes))
+        for label, config, tokens, images, expected in [
+            ('images', self.config, 20000, 2, 2),
+            ('tokens', self.config, page_tokens * 2, None, 2),
+            ('bytes', byte_limited, 20000, None, 1),
+        ]:
+            with self.subTest(allowance=label):
+                result = await ReadDocTool(config, self.remote).run(
+                    {'path': 'paper.pdf', 'file_format': 'pdf', 'end': 6},
+                    ToolContext(self.session, 'Participant', evidence_tokens=tokens, evidence_images=images))
+                self.assertTrue(result.output['ok'], result.output)
+                self.assertEqual(result.output['selection'], {'start': 1, 'end': expected, 'unit': 'pages'})
+                self.assertEqual([part.kind for part in result.evidence_parts], [PartKind.TEXT, PartKind.IMAGE] * expected)
+                self.assertIn(f'start={expected + 1}', result.output['note'])
+                self.assertFalse(any(f'page {expected + 1}' in (part.text or '') for part in result.evidence_parts),
+                    'An omitted page must not leave text without its image.')
+        for tokens, images in [(20000, 0), (1, 10)]:
+            result = await self.tool.run({'path': 'paper.pdf', 'file_format': 'pdf'},
+                ToolContext(self.session, 'Participant', evidence_tokens=tokens, evidence_images=images))
+            self.assertFalse(result.output['ok'], result.output)
+            self.assertEqual(result.evidence_parts, [])
+        self.assertEqual(path.read_bytes(), original)
+        self.remote.fetch_files.assert_not_awaited()
+
+    async def test_model_can_read_and_continue_a_large_pdf_without_an_overlength_retry(self):
+        write_pdf(self.workspace / 'paper.pdf', [f'Page {number}: distinct evidence.' for number in range(1, 17)])
+        runtime, _ = await self.gemini_runtime([
+            [self.call('paper.pdf', 'pdf', 'first', start=1)],
+            [self.call('paper.pdf', 'pdf', 'next', start=5, end=16)],
+            [{'text': 'I read pages one through eight.'}],
+        ])
+        await self.settings(max_interaction_rounds=3)
+        await runtime.run_turn(session_id=self.session, user_display_name='Participant',
+            incoming_message=ConversationMessage.user_text('Read the first eight pages.'))
+        for wire_index, call_id, start, end in [(1, 'first', 1, 4), (2, 'next', 5, 8)]:
+            response = next(item for item in self.results(self.wire[wire_index]) if item['id'] == call_id)
+            output = response['response']['result']
+            self.assertTrue(output['ok'], output)
+            self.assertEqual(output['file_format'], 'pdf')
+            self.assertEqual(output['selection'], {'start': start, 'end': end, 'unit': 'pages'})
+            self.assertEqual(output['total_pages'], 16)
+            self.assertIn(f'start={end + 1}', output['note'])
+            self.assertEqual(len(response['parts']), 4)
+            evidence = json.dumps(response['response']['evidence'])
+            self.assertIn(f'Page {end}: distinct evidence.', evidence)
+            self.assertNotIn(f'Page {end + 1}: distinct evidence.', evidence)
+        self.assertEqual(len(self.wire), 3)
+        self.remote.fetch_files.assert_not_awaited()
+
+    async def test_previous_format_argument_is_accepted_for_ongoing_conversations(self):
+        result = await self.tool.run({'path': 'notes.txt', 'format': 'text', 'start': 1, 'end': 1},
+            ToolContext(self.session, 'Participant', evidence_tokens=20000, evidence_images=4))
+        self.assertTrue(result.output['ok'], result.output)
+        self.assertEqual(result.output['file_format'], 'text')
+        self.assertNotIn('format', result.output)
+        self.assertEqual(result.evidence_parts[0].text, 'First line.\n')
 
     async def test_selected_text_image_and_pdf_are_parsed_in_workspace_without_fetching_originals(self):
         # These parent-process parsers must not run. Child processes have their
@@ -171,14 +298,14 @@ class ReadDocWorkflows(BusinessTestCase):
         self.assertEqual(odd.evidence_parts[0].text, 'Literal filename selected.\n')
         for name, expected in [('custom/notes.txt', 'Different output file.\n'),
                                (str(self.workspace / 'notes.txt'), 'First line.')]:
-            result = await self.tool.run({'path': name, 'format': 'text'},
+            result = await self.tool.run({'path': name, 'file_format': 'text'},
                 ToolContext(self.session, 'Participant'))
             self.assertTrue(result.output['ok'], result.output)
             self.assertIn(expected, result.evidence_parts[0].text)
         self.remote.fetch_files.assert_not_awaited()
         self.assertFalse(any(result.artifacts for result in (text, picture, pdf, full)))
 
-    async def test_missing_corrupt_outside_and_oversized_selections_return_no_partial_evidence(self):
+    async def test_missing_corrupt_outside_and_oversized_text_selections_return_no_partial_evidence(self):
         outside = self.path / 'other-session.txt'
         outside.write_text('Outside session secret.', encoding='utf-8')
         self.workspace.joinpath('escape.txt').symlink_to(outside)
@@ -190,7 +317,7 @@ class ReadDocWorkflows(BusinessTestCase):
             ('corrupt.pdf', 'pdf', {}), ('notes.txt', 'image', {}),
             ('notes.txt', 'text', {'start': 4}), ('notes.txt', 'text', {'end': 9}),
             ('schedule.pdf', 'pdf', {'start': 2, 'end': 1}),
-            ('schedule.pdf', 'pdf', {'end': 3}), ('huge.txt', 'text', {})]:
+            ('schedule.pdf', 'pdf', {'start': 3}), ('huge.txt', 'text', {})]:
             with self.subTest(path=path, format=fmt, selection=selection):
                 result = await self.read(path, fmt, **selection)
                 self.assertFalse(result.output['ok'], result.output)
@@ -204,7 +331,7 @@ class ReadDocWorkflows(BusinessTestCase):
         before = len(self.remote.commands)
         for fmt, images in [('audio', True), ('video', True), ('image', False), ('pdf', False)]:
             with self.subTest(format=fmt):
-                result = await self.tool.run({'path': 'anything', 'format': fmt},
+                result = await self.tool.run({'path': 'anything', 'file_format': fmt},
                     ToolContext(self.session, 'Participant', tool_images=images))
                 self.assertFalse(result.output['ok'])
                 self.assertEqual(result.evidence_parts, [])

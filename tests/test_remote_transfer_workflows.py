@@ -202,7 +202,7 @@ class RemoteTransferWorkflows(unittest.IsolatedAsyncioTestCase):
                     self.remote._scp_base_args.assert_called_once()
                     relative = expected.relative_to(paths.root).as_posix()
                     read = await ReadDocTool(self.config, self.remote).run(
-                        {'path': relative, 'format': 'text'},
+                        {'path': relative, 'file_format': 'text'},
                         ToolContext('telegram:1', 'Participant'))
                     self.assertTrue(read.output['ok'], read.output)
                     self.assertEqual(read.evidence_parts[0].text, incoming.read_text())
@@ -263,7 +263,7 @@ class RemoteTransferWorkflows(unittest.IsolatedAsyncioTestCase):
             command='python3 -c \'import json,os; print(json.dumps({"root":os.environ["TGCHATBOT_SESSION_DIR"],"cwd":os.getcwd()}))\'', timeout_s=10)
         self.assertEqual(json.loads(later['stdout']), expected_environment)
         read = await ReadDocTool(self.config, self.remote).run(
-            {'path': 'custom/report.txt', 'format': 'text'},
+            {'path': 'custom/report.txt', 'file_format': 'text'},
             ToolContext('telegram:1', 'Participant'))
         self.assertTrue(read.output['ok'], read.output)
         self.assertEqual(read.evidence_parts[0].text, 'A persistent report')

@@ -397,12 +397,12 @@ class RemoteWorkspaceClient:
         return json.loads(result['stdout'])
 
     async def inspect_file(self, *, session_id: str, path: str,
-                           format: str, start: int | None, end: int | None,
+                           file_format: str, start: int | None, end: int | None,
                            limits: dict[str, Any]) -> dict[str, Any]:
         paths = await self.ensure_session_dirs(session_id)
         selected = path if posixpath.isabs(path) else paths.root.rstrip('/') + '/' + path
         selected = self._validate_remote_path(paths, selected)
-        request = {'root': paths.root, 'path': selected, 'format': format,
+        request = {'root': paths.root, 'path': selected, 'file_format': file_format,
                    'start': start, 'end': end, 'limits': limits}
         program = (files('tgchatbot.media').joinpath('image_encoding.py').read_text()
                    + '\n' + files('tgchatbot.tools').joinpath('remote_reader.py').read_text())

@@ -9,10 +9,14 @@ Use each command's `--help` for its arguments.
 
 ## Workspace file reading
 
-With remote tools enabled, the agent can use `read_doc(path, format)` with a path
+With remote tools enabled, the agent can use `read_doc(path, file_format)` with a path
 relative to its session directory.
-Text and PDF reads optionally select an inclusive, one-based `start`/`end` line
-or page range. Ordinary attachments sync as files, with contents read on demand.
+`file_format` selects the source file type: use `pdf` for PDF page images and extracted
+text, and `text` for UTF-8 text files. Text and PDF reads optionally select an
+inclusive, one-based `start`/`end` line or page range. PDF reads return up to
+`READ_DOC_PDF_MAX_PAGES=5` pages per call, or fewer when the current allowance is
+smaller. Results report the returned range, total pages and where to continue
+when shortened. Ordinary attachments sync as files, with contents read on demand.
 Images and PDF pages require a provider supporting visual tool results; audio/video
 tool results are unsupported on the current API routes.
 The tool does not send files to Telegram; use `file_send` for delivery.

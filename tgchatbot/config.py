@@ -194,8 +194,13 @@ class ContextConfig:
 
 @dataclass(frozen=True)
 class ReadDocConfig:
+    pdf_max_pages: int = 5
     pdf_scale: float = 2.0
     max_image_pixels: int = 16777216
+
+    def __post_init__(self) -> None:
+        if self.pdf_max_pages < 1:
+            raise ValueError('READ_DOC_PDF_MAX_PAGES must be positive')
 
 
 @dataclass(frozen=True)
