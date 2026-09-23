@@ -136,6 +136,8 @@ class SessionSettings:
     max_input_images: int | None = None
     compact_target_images: int | None = None
     compact_trigger_tokens: int | None = None
+    compact_idle_trigger_tokens: int | None = None
+    compact_idle_seconds: float | None = None
     compact_target_tokens: int | None = None
     compact_batch_tokens: int | None = None
     compact_keep_recent_ratio: float | None = None

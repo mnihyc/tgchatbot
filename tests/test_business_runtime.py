@@ -587,7 +587,11 @@ class ProfileContextWorkflowTests(BusinessTestCase):
                 with patch.object(self.runtime, "_estimate_request_tokens", return_value=10000), \
                      patch.object(self.runtime, "_compact_old_context", stage), \
                      patch.object(self.memory, "fetch_profiles", wraps=self.memory.fetch_profiles) as fetch:
-                    await self.turn("Continue without losing the original.", number)
+                    if isinstance(outcome, CompactionModelRequestFailed):
+                        with self.assertRaises(CompactionModelRequestFailed):
+                            await self.turn("Continue without losing the original.", number)
+                    else:
+                        await self.turn("Continue without losing the original.", number)
                     fetch.assert_not_awaited()
                 self.assertEqual(await self.observations("profile_refresh"), [])
                 self.assertEqual(await self.store.list_memory_blocks(self.session), [])
@@ -629,7 +633,7 @@ class ProfileContextWorkflowTests(BusinessTestCase):
         self.assertEqual(len(await self.store.get_profile(self.session, "telegram:user:99")), 1)
         self.assertEqual(len(await self.store.get_profile(self.session, "telegram:user:10")), 1)
 
-    async def test_successful_promotion_followed_by_model_failure_still_refreshes_once(self):
+    async def test_partial_compaction_failure_retains_pending_profile_refresh_for_next_reply(self):
         source = await self.seed_profile()
         await self.settings(compact_trigger_tokens=9000, compact_target_tokens=8000)
         self.provider.responses = [ProviderResponse(final_text="The saved preference remains available.")]
@@ -648,9 +652,15 @@ class ProfileContextWorkflowTests(BusinessTestCase):
         with patch.object(self.runtime, "_estimate_request_tokens", return_value=10000), \
              patch.object(self.runtime, "_compact_old_context", side_effect=promote_then_fail), \
              patch.object(self.memory, "fetch_profiles", wraps=self.memory.fetch_profiles) as fetch:
-            await self.turn("What do you remember?", 2)
-            fetch.assert_awaited_once()
+            with self.assertRaises(CompactionModelRequestFailed):
+                await self.turn("What do you remember?", 2)
+            fetch.assert_not_awaited()
         self.assertEqual(len(await self.store.list_memory_blocks(self.session)), 1)
+        self.assertTrue(await self.store.compaction_needs_profile_refresh(self.session))
+        self.assertEqual(self.provider.requests, [])
+        with patch.object(self.memory, "fetch_profiles", wraps=self.memory.fetch_profiles) as fetch:
+            await self.turn("Continue after recovery.", 3)
+            fetch.assert_awaited_once()
         await self.refresh_pair()
         self.assertIn("Earlier drink discussion.", text_of(self.provider.requests[-1]["messages"]))
         self.assertIn(self.claim, text_of(self.provider.requests[-1]["messages"]))

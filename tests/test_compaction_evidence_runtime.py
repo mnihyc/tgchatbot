@@ -19,6 +19,8 @@ from tgchatbot.storage.previews import PreviewCache
 
 class CompactionEvidenceRuntimeTests(BusinessTestCase):
     async def prepare_retry_compaction(self, statuses):
+        self.config = replace(self.config, context=replace(self.config.context, compact_retry_delay_s=0))
+        self.runtime.config = self.config
         settings = await self.settings(provider='gemini', model='gemini-3.8-flash',
             provider_retry_count=1, min_raw_messages_reserve=1, service_tier='flex')
         earlier = await self.runtime.ingest_user_message(session_id=self.session,
@@ -77,7 +79,7 @@ class CompactionEvidenceRuntimeTests(BusinessTestCase):
             [message_body(row.message) for row in sources])
 
     async def test_exhausted_compaction_retries_preserve_warm_and_rebuilt_context_then_recover(self):
-        statuses = [503, 503]
+        statuses = [503] * 4
         settings, provider, state, sources, prior, wire = await self.prepare_retry_compaction(statuses)
         originals = await self.store.read_messages(self.session, [row.db_id for row in sources])
         history = self.runtime._build_provider_history(state, settings=settings, provider_name='gemini')
@@ -87,8 +89,8 @@ class CompactionEvidenceRuntimeTests(BusinessTestCase):
             with self.assertRaises(CompactionModelRequestFailed):
                 await self.runtime._compact_old_context(session_id=self.session,
                     settings=settings, provider=provider, state=state, pressure=True)
-        self.assertEqual(len(wire), 2)
-        self.assertEqual(wire[0], wire[1])
+        self.assertEqual(len(wire), 4)
+        self.assertTrue(all(request == wire[0] for request in wire))
         self.assertEqual(state, before)
         self.assertEqual(await self.store.read_messages(self.session, [row.db_id for row in sources]), originals)
         self.assertEqual([block.block_id for block in await self.store.list_memory_blocks(self.session)], [prior.block_id])
@@ -103,8 +105,8 @@ class CompactionEvidenceRuntimeTests(BusinessTestCase):
         statuses.append(200)
         self.assertTrue(await self.runtime._compact_old_context(session_id=self.session,
             settings=settings, provider=provider, state=state, pressure=True))
-        self.assertEqual(len(wire), 3)
-        self.assertEqual(wire[2], wire[0])
+        self.assertEqual(len(wire), 5)
+        self.assertEqual(wire[4], wire[0])
         self.assertNotIn(sources[0].db_id, [row.db_id for row in state.raw_messages])
         self.assertEqual(state.raw_messages[-1].db_id, sources[-1].db_id)
         self.assertEqual(len(await self.store.list_memory_blocks(self.session)), 2)

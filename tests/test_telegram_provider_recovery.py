@@ -93,7 +93,7 @@ class TelegramProviderRecoveryTests(BusinessTestCase):
 
         async def observe_reply(candidate):
             try:
-                await reply_to_candidate(candidate)
+                return await reply_to_candidate(candidate)
             finally:
                 finished.set()
 

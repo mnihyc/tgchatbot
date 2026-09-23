@@ -14,12 +14,13 @@ from pathlib import Path
 
 from telegram import Chat, Message, Update
 from telegram.constants import ChatAction, ChatType, MessageLimit
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, TypeHandler, filters
 
 from tgchatbot.config import AppConfig
 from tgchatbot.transports.artifact_delivery import deliver_artifact
 from tgchatbot.healthcheck import start_heartbeat, stop_heartbeat
 from tgchatbot.core.runtime import AgentRuntime
+from tgchatbot.core.idle_compaction import IdleCompaction
 from tgchatbot.domain.models import (
     ChatMode,
     ConversationMessage,
@@ -157,10 +158,36 @@ class TelegramBotApp:
         self.artifact_store = artifact_store
         self.preset_store = preset_store or PresetStore(config.preset_dir)
         self.remote_workspace = remote_workspace
-        self.application = (Application.builder().token(config.telegram.token)
-                            .post_init(start_heartbeat).post_shutdown(stop_heartbeat).build())
         self._chat_states: dict[int, ChatFlowState] = {}
+        self.idle_compaction = IdleCompaction(runtime, busy=self._chat_busy)
+        self.application = (Application.builder().token(config.telegram.token)
+                            .post_init(self._start_background).post_shutdown(self._stop_background).build())
+        self.application.add_handler(TypeHandler(Update, self._observe_activity), group=-1)
         self._register_handlers()
+
+    def _chat_busy(self, session_id: str) -> bool:
+        state = self._chat_states.get(int(session_id.removeprefix('telegram:')))
+        return bool(state and (state.ingest_inflight or (state.reply_task and not state.reply_task.done())))
+
+    async def _start_background(self, application) -> None:
+        await start_heartbeat(application)
+        for session_id in await self.store.list_session_ids():
+            chat_id = session_id.removeprefix('telegram:')
+            if session_id.startswith('telegram:') and (not self.config.telegram.whitelist or chat_id in self.config.telegram.whitelist):
+                self.idle_compaction.touch(session_id)
+
+    async def _stop_background(self, application) -> None:
+        await self.idle_compaction.close()
+        await stop_heartbeat(application)
+
+    def _record_activity(self, session_id: str) -> None:
+        scheduler = getattr(self, 'idle_compaction', None)
+        if scheduler is not None:
+            scheduler.touch(session_id)
+
+    async def _observe_activity(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if update.effective_message and update.effective_chat and self._allowed(update.effective_chat):
+            self._record_activity(self._session_id(update.effective_chat))
 
     def _provider_reasoning_effort_default(self, provider_name: str) -> str:
         return self.config.openai.reasoning_effort
@@ -269,6 +296,8 @@ class TelegramBotApp:
             'max_input_images <nonnegative integer|default>  (0 disables the image-count cap)',
             'compact_target_images <nonnegative integer|default>  (0 uses the image limit as the target)',
             'compact_trigger_tokens <positive integer|default>',
+            'compact_idle_trigger_tokens <nonnegative integer|default>  (0 disables idle compaction)',
+            'compact_idle_seconds <nonnegative number|default>',
             'compact_target_tokens <positive integer|default>',
             'compact_batch_tokens <positive integer|default>',
             'compact_keep_recent_ratio <0..1 | 50% | default>',
@@ -303,6 +332,7 @@ class TelegramBotApp:
             f"max_input_images={session_status['max_input_images']} ({session_status['max_input_images_source']})",
             f"compact_target_images={session_status['compact_target_images']} ({session_status['compact_target_images_source']})",
             f"compact_trigger_tokens={session_status['compact_trigger_tokens']} ({session_status['compact_trigger_tokens_source']})",
+            f"compact_idle_trigger_tokens={session_status['compact_idle_trigger_tokens']} ({session_status['compact_idle_trigger_tokens_source']}) compact_idle_seconds={session_status['compact_idle_seconds']} ({session_status['compact_idle_seconds_source']})",
             f"compact_target_tokens={session_status['compact_target_tokens']} ({session_status['compact_target_tokens_source']})",
             f"compact_batch_tokens={session_status['compact_batch_tokens']} ({session_status['compact_batch_tokens_source']})",
             f"compact_keep_recent_ratio={session_status['compact_keep_recent_ratio']} ({session_status['compact_keep_recent_ratio_source']})",
@@ -346,6 +376,7 @@ class TelegramBotApp:
             f"estimated_history_tokens={session_status['estimated_history_tokens']} estimated_request_tokens={session_status['estimated_request_tokens']}",
             f"estimated_request_images={session_status['estimated_request_images']} max_input_images={session_status['max_input_images']} compact_target_images={session_status['compact_target_images']}",
             f"compact_trigger_tokens={session_status['compact_trigger_tokens']} compact_target_tokens={session_status['compact_target_tokens']} compact_batch_tokens={session_status['compact_batch_tokens']} compact_keep_recent_ratio={session_status['compact_keep_recent_ratio']} compact_tool_ratio_threshold={session_status['compact_tool_ratio_threshold']} compact_tool_min_tokens={session_status['compact_tool_min_tokens']} compact_min_messages={session_status['compact_min_messages']} min_raw_messages_reserve={session_status['min_raw_messages_reserve']}",
+            f"compact_idle_trigger_tokens={session_status['compact_idle_trigger_tokens']} compact_idle_seconds={session_status['compact_idle_seconds']} compact_retry_count={session_status['compact_retry_count']} compact_retry_delay_s={session_status['compact_retry_delay_s']}",
             f"loaded_in_memory={session_status['loaded_in_memory']}",
             '',
             'Sticker index',
@@ -452,6 +483,7 @@ class TelegramBotApp:
         else:
             text = command_views.compaction_result(result)
         await progress.edit_text(text, parse_mode='HTML')
+        self._record_activity(self._session_id(chat))
 
     async def reset_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
@@ -487,6 +519,7 @@ class TelegramBotApp:
                     pass
         note = 'New context started. Prior messages remain searchable; profiles and settings are retained.' if mode == 'history' else 'Session settings reset.'
         await update.effective_message.reply_text(note)
+        self._record_activity(self._session_id(chat))
 
     async def reset_full_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
@@ -503,6 +536,7 @@ class TelegramBotApp:
         await update.effective_message.reply_text(
             'New agent started with deployment defaults. Prior messages, profiles and learned personality '
             'are audit-only. The shared sticker catalog and SSH workspace are unchanged.')
+        self._record_activity(session_id)
 
     async def retry_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
@@ -534,6 +568,7 @@ class TelegramBotApp:
             source_message=message,
         )
         await self._reply_to_candidate(candidate)
+        self._record_activity(self._session_id(chat))
         if hidden > 0:
             await message.reply_text(f'Retried from message #{trigger.db_id}; hid {hidden} newer stored message(s) first.')
 
@@ -580,6 +615,7 @@ class TelegramBotApp:
         hidden = await self.store.hide_message_ids(session_id, target_ids)
         self.runtime.invalidate_session(session_id)
         await self._cancel_pending_reply(chat.id)
+        self._record_activity(session_id)
 
         logger.info(
             'rollback.done sid=%s requested_blocks=%s hidden=%s ids=%s details=%s',
@@ -948,6 +984,18 @@ class TelegramBotApp:
                     await update.effective_message.reply_text(f'compact_trigger_tokens must be >= compact_target_tokens ({effective_target}).')
                     return
                 settings.compact_trigger_tokens = target
+        elif name in {'compact_idle_trigger_tokens', 'compact_idle_seconds'}:
+            if value == 'default':
+                setattr(settings, name, None)
+            else:
+                try:
+                    target = int(value) if name == 'compact_idle_trigger_tokens' else float(value)
+                    if not math.isfinite(target) or target < 0:
+                        raise ValueError
+                except ValueError:
+                    await update.effective_message.reply_text(f'{name} must be a nonnegative value or default.')
+                    return
+                setattr(settings, name, target)
         elif name == 'compact_target_tokens':
             if value == 'default':
                 settings.compact_target_tokens = None
@@ -976,10 +1024,6 @@ class TelegramBotApp:
                 if target < 1:
                     current = settings.compact_batch_tokens if settings.compact_batch_tokens is not None else self._compact_batch_tokens_default()
                     await update.effective_message.reply_text(f'Invalid compact_batch_tokens. Current effective value: {current}')
-                    return
-                effective_target = settings.compact_target_tokens if settings.compact_target_tokens is not None else self._compact_target_tokens_default()
-                if target > effective_target:
-                    await update.effective_message.reply_text(f'compact_batch_tokens must be <= compact_target_tokens ({effective_target}).')
                     return
                 settings.compact_batch_tokens = target
         elif name == 'compact_keep_recent_ratio':
@@ -1162,6 +1206,7 @@ class TelegramBotApp:
             return
         await self.store.save_session(self._session_id(chat), settings)
         session_status = await self.runtime.describe_settings(self._session_id(chat))
+        self._record_activity(self._session_id(chat))
         await self._send_command(update.effective_message,
             command_views.parameter_view(session_status, name, self._parameter_usage(settings).get(name), changed=True))
 
@@ -1482,6 +1527,7 @@ class TelegramBotApp:
                 self._intake_inflight.pop(intake_key, None)
                 intake_completion.set_result(None)
             await self._mark_ingest_finished(state)
+            self._record_activity(session_id)
             logger.info('tg.ingest.done chat=%s msg=%s inflight=%s', self._chat_log_id(chat.id), message.message_id, state.ingest_inflight)
 
         if is_group:
@@ -1667,16 +1713,18 @@ class TelegramBotApp:
                         return
                 try:
                     logger.info('tg.reply.run chat=%s msg=%s', self._chat_log_id(chat_id), candidate.stored_message_id)
-                    await self._reply_to_candidate(candidate)
+                    handled_id = await self._reply_to_candidate(candidate)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     logger.exception('Reply failed for chat %s message %s', chat_id, candidate.stored_message_id)
+                    handled_id = None
                 async with state.mutex:
-                    state.last_replied_message_id = max(state.last_replied_message_id, candidate.stored_message_id)
+                    state.last_replied_message_id = max(state.last_replied_message_id, candidate.stored_message_id, handled_id or 0)
                     logger.info('tg.reply.done chat=%s msg=%s last=%s', self._chat_log_id(chat_id), candidate.stored_message_id, state.last_replied_message_id)
                     if state.latest_reply_candidate and state.latest_reply_candidate.stored_message_id <= state.last_replied_message_id:
                         state.latest_reply_candidate = None
+                self._record_activity(f'telegram:{chat_id}')
         except asyncio.CancelledError:
             async with state.mutex:
                 state.reply_task = None
@@ -1686,7 +1734,7 @@ class TelegramBotApp:
             async with state.mutex:
                 state.reply_task = None
 
-    async def _reply_to_candidate(self, candidate: ReplyCandidate) -> None:
+    async def _reply_to_candidate(self, candidate: ReplyCandidate) -> int | None:
         message = candidate.source_message
         chat = message.chat
         session_id = self._session_id(chat)
@@ -1756,6 +1804,18 @@ class TelegramBotApp:
         # The stored message id identifies the debounce winner for bookkeeping and delivery flow,
         # while generation still uses the newest live session context at fire time.
         try:
+            scheduler = getattr(self, 'idle_compaction', None)
+            if scheduler is not None and await scheduler.join(session_id, emit_event):
+                state = self._flow_state(chat.id)
+                await state.ingest_idle.wait()
+                async with state.mutex:
+                    latest = state.latest_reply_candidate
+                    if latest is not None and latest.stored_message_id > candidate.stored_message_id:
+                        candidate = latest
+                        message = candidate.source_message
+                        renderer.source_message = message
+                    elif candidate.spontaneous and latest is None:
+                        return candidate.stored_message_id
             result = await self.runtime.run_turn_from_stored(
                 session_id=session_id,
                 user_display_name=candidate.user_display_name,
@@ -1812,6 +1872,7 @@ class TelegramBotApp:
                         await renderer.abort()
                     except Exception:
                         logger.exception('tg.deliver.abort_failed chat=%s msg=%s', self._chat_log_id(chat.id), candidate.stored_message_id)
+        return candidate.stored_message_id
 
     async def _deliver_result(
         self,
@@ -1951,6 +2012,9 @@ class TelegramBotApp:
             )
 
     async def _cancel_pending_reply(self, chat_id: int) -> None:
+        scheduler = getattr(self, 'idle_compaction', None)
+        if scheduler is not None:
+            await scheduler.cancel(f'telegram:{chat_id}')
         state = self._flow_state(chat_id)
         task: asyncio.Task[None] | None = None
         async with state.mutex:

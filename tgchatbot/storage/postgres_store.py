@@ -312,6 +312,10 @@ class PostgresStore:
         async with self.pool.connection() as conn:
             return int((await (await conn.execute('SELECT count(*) AS count FROM sessions')).fetchone())['count'])
 
+    async def list_session_ids(self) -> list[str]:
+        async with self.pool.connection() as conn:
+            return [row['session_id'] for row in await (await conn.execute('SELECT session_id FROM sessions')).fetchall()]
+
     async def get_sticker_persona(self, session_id: str) -> dict[str, Any] | None:
         async with self.pool.connection() as conn:
             row = await (await conn.execute('SELECT sticker_persona FROM sessions WHERE session_id=%s', (session_id,))).fetchone()

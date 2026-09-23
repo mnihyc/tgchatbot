@@ -11,6 +11,9 @@ from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from contextvars import ContextVar
 from typing import Any
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+import httpx
 from psycopg.errors import QueryCanceled
 
 from tgchatbot.config import AppConfig
@@ -79,6 +82,10 @@ class CompactionModelRequestFailed(RuntimeError):
         super().__init__(f'Compaction model request failed for provider={provider_name} mode={mode}')
         self.provider_name = provider_name
         self.mode = mode
+
+
+class ContextLimitExceeded(RuntimeError):
+    """Compaction cannot make a conversational request fit its configured ceiling."""
 
 
 class AgentRuntime:
@@ -324,6 +331,48 @@ class AgentRuntime:
             return await self._execute_turn_from_stored(session_id=session_id,
                 user_display_name=user_display_name, trigger_message_id=trigger_message_id, emit=emit)
 
+    async def compact_idle_context(self, *, session_id: str, emit: EventCallback | None = None) -> dict:
+        """Compact the live request silently; callers own inactivity and visibility."""
+        lock = self._execution_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._execution_locks[session_id] = lock
+        # Idle maintenance must never queue behind an active reply and then
+        # compact the conversation immediately after that reply finishes.
+        if lock.locked():
+            return {'status': 'busy'}
+        async with lock:
+            settings = await self.store.get_or_create_session(session_id, self.config.default_session_settings())
+            threshold = self._effective_compact_idle_trigger_tokens(settings)
+            if not threshold:
+                return {'status': 'disabled'}
+            provider = self._require_provider(settings.provider)
+            await self._load_request_estimate_bias(settings)
+            token = _turn_scope.set(await self.store.get_scope(session_id))
+            try:
+                state = await self._get_live_state(session_id)
+                instructions = build_system_prompt(settings, timezone=self.config.default_metadata_timezone)
+                tools = self._request_tools(settings)
+                estimate = self._estimate_request_tokens(state, settings=settings, provider=provider,
+                    instructions=instructions, tools=tools)
+                if estimate < threshold:
+                    return {'status': 'below_trigger', 'estimated_request_tokens': estimate}
+                await self._recover_interrupted_tools(session_id, state)
+                changed = await self._compact_if_needed(session_id=session_id, settings=settings,
+                    provider=provider, state=state, instructions=instructions, tools=tools, emit=emit, force=True)
+                if self.memory is not None and (changed or await self.store.compaction_needs_profile_refresh(session_id)):
+                    await self._refresh_profiles_after_compaction(session_id=session_id, state=state,
+                        settings=settings, provider=provider, instructions=instructions, tools=tools,
+                        emit=emit, trigger=None, force=True)
+                estimate = self._estimate_request_tokens(state, settings=settings, provider=provider,
+                    instructions=instructions, tools=tools)
+                target = self._effective_compact_target_tokens(settings)
+                self._check_request_ceiling(settings, estimate)
+                return {'status': 'ready' if estimate <= target else 'protected',
+                    'estimated_request_tokens': estimate, 'target_tokens': target}
+            finally:
+                _turn_scope.reset(token)
+
     async def prepare_context(self, *, session_id: str, emit: EventCallback | None = None,
                               force: bool = False) -> dict[str, int]:
         """Prepare bounded history; force bypasses the trigger, not the target or reserves."""
@@ -540,6 +589,7 @@ class AgentRuntime:
                 model=settings.model,
                 tool_history_mode=settings.tool_history_mode,
             )
+            self._check_request_ceiling(settings, adjusted_request_estimate.total_tokens)
             logger.info(
                 'turn.iter sid=%s step=%s round_limit=%s tools=%s extra=%s est_req=%s raw_req=%s bias=%.3f',
                 self._session_log_id(session_id),
@@ -918,6 +968,12 @@ class AgentRuntime:
             'compact_target_images_source': 'session' if settings.compact_target_images is not None else 'default',
             'compact_trigger_tokens': self._effective_compact_trigger_tokens(settings),
             'compact_trigger_tokens_source': 'session' if settings.compact_trigger_tokens is not None else 'default',
+            'compact_idle_trigger_tokens': self._effective_compact_idle_trigger_tokens(settings),
+            'compact_idle_trigger_tokens_source': 'session' if settings.compact_idle_trigger_tokens is not None else 'default',
+            'compact_idle_seconds': self._effective_compact_idle_seconds(settings),
+            'compact_idle_seconds_source': 'session' if settings.compact_idle_seconds is not None else 'default',
+            'compact_retry_count': self.config.context.compact_retry_count,
+            'compact_retry_delay_s': self.config.context.compact_retry_delay_s,
             'compact_target_tokens': self._effective_compact_target_tokens(settings),
             'compact_target_tokens_source': 'session' if settings.compact_target_tokens is not None else 'default',
             'compact_batch_tokens': self._effective_compact_batch_tokens(settings),
@@ -1027,6 +1083,20 @@ class AgentRuntime:
             return max(1, int(settings.compact_trigger_tokens))
         return max(1, int(self.config.context.compact_trigger_tokens))
 
+    def _effective_compact_idle_trigger_tokens(self, settings: SessionSettings) -> int:
+        value = settings.compact_idle_trigger_tokens
+        return max(0, int(self.config.context.compact_idle_trigger_tokens if value is None else value))
+
+    def _effective_compact_idle_seconds(self, settings: SessionSettings) -> float:
+        value = settings.compact_idle_seconds
+        return max(0.0, float(self.config.context.compact_idle_seconds if value is None else value))
+
+    def _check_request_ceiling(self, settings: SessionSettings, tokens: int) -> None:
+        ceiling = self._effective_compact_trigger_tokens(settings)
+        if tokens > ceiling:
+            raise ContextLimitExceeded(f'Context remains above the configured {ceiling:,}-token ceiling '
+                f'({tokens:,} estimated). Originals and completed summaries are preserved; retry /compact.')
+
     def _effective_compact_target_tokens(self, settings: SessionSettings) -> int:
         trigger = self._effective_compact_trigger_tokens(settings)
         if settings.compact_target_tokens is not None:
@@ -1034,10 +1104,8 @@ class AgentRuntime:
         return max(1, min(trigger, int(self.config.context.compact_target_tokens)))
 
     def _effective_compact_batch_tokens(self, settings: SessionSettings) -> int:
-        target = self._effective_compact_target_tokens(settings)
-        if settings.compact_batch_tokens is not None:
-            return max(1, min(target, int(settings.compact_batch_tokens)))
-        return max(1, min(target, int(self.config.context.compact_batch_tokens)))
+        # Input batch size and the final context target measure different work.
+        return self._configured_compact_batch_tokens(settings)
 
     def _configured_compact_batch_tokens(self, settings: SessionSettings) -> int:
         if settings.compact_batch_tokens is not None:
@@ -1107,8 +1175,31 @@ class AgentRuntime:
         payload_text = self._compact_json(payload)
         return f'[Tool event {name}: {payload_text}]'
 
-    async def _generate_with_retries(self, *, provider, settings: SessionSettings, messages: list[ConversationMessage], instructions: str, tools, extra_input_items, **request_options):
-        retries = self._effective_provider_retry_count(settings)
+    @staticmethod
+    def _compaction_retry_delay(exc: Exception, delay: float) -> float | None:
+        if isinstance(exc, httpx.TransportError):
+            return delay
+        if not isinstance(exc, httpx.HTTPStatusError):
+            return None
+        response = exc.response
+        if response.status_code != 429 and not 500 <= response.status_code <= 599:
+            return None
+        retry_after = response.headers.get('retry-after', '').strip()
+        if retry_after:
+            try:
+                seconds = float(retry_after)
+            except ValueError:
+                try:
+                    when = parsedate_to_datetime(retry_after)
+                    seconds = (when - datetime.now(timezone.utc)).total_seconds()
+                except (ValueError, TypeError, OverflowError):
+                    seconds = 0
+            if math.isfinite(seconds):
+                delay = max(delay, seconds)
+        return delay
+
+    async def _generate_with_retries(self, *, provider, settings: SessionSettings, messages: list[ConversationMessage], instructions: str, tools, extra_input_items, compaction: bool = False, **request_options):
+        retries = self.config.context.compact_retry_count if compaction else self._effective_provider_retry_count(settings)
         last_exc = None
         for attempt in range(retries + 1):
             try:
@@ -1122,7 +1213,12 @@ class AgentRuntime:
                         exc.reason, self._usage_log_text(exc.usage))
                 if attempt >= retries:
                     raise
+                delay = self._compaction_retry_delay(exc, self.config.context.compact_retry_delay_s) if compaction else 0
+                if delay is None:
+                    raise
                 logger.warning('provider.retry provider=%s model=%s attempt=%s/%s err=%s', settings.provider, settings.model, attempt + 1, retries + 1, exc.__class__.__name__)
+                if compaction:
+                    await asyncio.sleep(delay)
         raise last_exc or RuntimeError('Provider call failed')
 
     def invalidate_session(self, session_id: str) -> None:
@@ -1774,7 +1870,7 @@ class AgentRuntime:
         compact_trigger_tokens = self._effective_compact_trigger_tokens(settings)
         compact_target_tokens = self._effective_compact_target_tokens(settings)
         image_target = self._effective_compact_target_images(provider, settings)
-        token_overflow = total_estimate > (compact_target_tokens if force else compact_trigger_tokens)
+        token_overflow = total_estimate > compact_target_tokens if force else total_estimate >= compact_trigger_tokens
         image_overflow = image_limit is not None and image_count > image_limit
         if not token_overflow and not image_overflow:
             return False
@@ -1790,16 +1886,25 @@ class AgentRuntime:
 
         try:
             if token_overflow:
+                allow_digest = True
                 while total_estimate > compact_target_tokens:
-                    changed = await self._compact_old_context(session_id=session_id, settings=settings, provider=provider, state=state, pressure=False, emit=emit)
+                    before = total_estimate
+                    changed = await self._compact_old_context(session_id=session_id, settings=settings, provider=provider, state=state, pressure=False, emit=emit, allow_digest=allow_digest)
                     if not changed and total_estimate > compact_target_tokens:
-                        changed = await self._compact_old_context(session_id=session_id, settings=settings, provider=provider, state=state, pressure=True, emit=emit)
+                        changed = await self._compact_old_context(session_id=session_id, settings=settings, provider=provider, state=state, pressure=True, emit=emit, allow_digest=allow_digest)
                     if not changed:
                         logger.warning('Unable to compact session %s below target; remaining estimate=%s images=%s', session_id, total_estimate, image_count)
                         break
                     compacted = True
                     total_estimate = estimate_request()
                     image_count = self._estimate_request_images(state)
+                    # A new digest can refill the same summary allowance.
+                    # Keep that work, then give raw pressure a chance instead
+                    # of chaining more merges without reducing this request.
+                    allow_digest = total_estimate < before
+                    logger.info('compact.progress sid=%s request_tokens=%s->%s selected_blocks=%s retained_blocks=%s',
+                        self._session_log_id(session_id), before, total_estimate,
+                        len(self._select_blocks_for_prompt(state, settings=settings)), len(state.blocks))
 
             image_count = self._estimate_request_images(state)
             if image_limit is not None and image_count > image_limit:
@@ -1821,7 +1926,7 @@ class AgentRuntime:
                 exc.provider_name,
                 exc.mode,
             )
-            return compacted
+            raise
         return compacted
 
     def _estimate_request_tokens(
@@ -1847,7 +1952,9 @@ class AgentRuntime:
         return state.estimated_images
 
     def _digest_needed(self, state: LiveConversationState, settings: SessionSettings, *, total_estimate: int | None = None, pressure: bool = False) -> bool:
-        shard = self._select_digest_shard(state.blocks, settings=settings, pressure=pressure)
+        eligible = None if isinstance(state, CompactionWorkingSet) else {
+            block.block_id for block in self._select_blocks_for_prompt(state, settings=settings)}
+        shard = self._select_digest_shard(state.blocks, settings=settings, pressure=pressure, eligible_ids=eligible)
         if not shard:
             return False
         episodes = [block for block in state.blocks if block.kind == 'episode' and block.lifecycle == 'sealed']
@@ -1906,6 +2013,7 @@ class AgentRuntime:
         state: LiveConversationState,
         pressure: bool = False,
         emit: EventCallback | None = None,
+        allow_digest: bool = True,
     ) -> bool:
         skipped_message_ids: set[int] = set(_admission_protected.get())
         skipped_block_ids: set[int] = set()
@@ -2080,13 +2188,15 @@ class AgentRuntime:
                             detail=f'compact.episode raw_messages={len(raw_ids)} parent_blocks={len(parent_ids)} raw_tokens={raw_history_tokens}->{block.estimated_tokens}'))
                 return True
 
-            if not self._digest_needed(state, settings, pressure=pressure):
+            if not allow_digest or not self._digest_needed(state, settings, pressure=pressure):
                 return False
             shard = self._select_digest_shard(
                 state.blocks,
                 settings=settings,
                 pressure=pressure,
                 excluded_parent_signatures=skipped_digest_shards,
+                eligible_ids=(None if isinstance(state, CompactionWorkingSet) else {
+                    block.block_id for block in self._select_blocks_for_prompt(state, settings=settings)}),
             )
             if shard:
                 candidate = await self._make_digest_block_candidate(provider, settings, shard, session_id=session_id)
@@ -2159,10 +2269,12 @@ class AgentRuntime:
                 if _refresh_compactions.get() is not None:
                     _refresh_compactions.get().add(block.compaction_version)
                 await self._reload_live_state(state)
-                logger.info('compact.digest sid=%s parent_blocks=%s visible_blocks=%s', self._session_log_id(session_id), len(shard), len(state.blocks))
+                logger.info('compact.digest sid=%s parent_blocks=%s selected_blocks=%s retained_blocks=%s',
+                    self._session_log_id(session_id), len(shard),
+                    len(self._select_blocks_for_prompt(state, settings=settings)), len(state.blocks))
                 if emit and settings.process_visibility != ProcessVisibility.OFF:
                     await emit(RuntimeEvent(kind='phase', title='Compacting context',
-                            detail=f'compact.digest parent_blocks={len(shard)} visible_blocks={len(state.blocks)}'))
+                            detail=f'compact.digest parent_blocks={len(shard)}'))
                 return True
 
             return False
@@ -2687,7 +2799,7 @@ class AgentRuntime:
     def _is_auto_note_message(message: ConversationMessage) -> bool:
         return is_auto_note_message(message)
 
-    def _select_digest_shard(self, blocks: list[MemoryBlock], *, settings: SessionSettings, pressure: bool = False, excluded_parent_signatures: set[tuple[int, ...]] | None = None) -> list[MemoryBlock]:
+    def _select_digest_shard(self, blocks: list[MemoryBlock], *, settings: SessionSettings, pressure: bool = False, excluded_parent_signatures: set[tuple[int, ...]] | None = None, eligible_ids: set[int] | None = None) -> list[MemoryBlock]:
         episodes = [
             block for block in blocks
             if block.lifecycle == 'sealed'
@@ -2718,7 +2830,7 @@ class AgentRuntime:
         run: list[MemoryBlock] = []
         runs: list[list[MemoryBlock]] = []
         for episode in candidate_episodes:
-            if episode.block_id in covered_ids:
+            if episode.block_id in covered_ids or (eligible_ids is not None and episode.block_id not in eligible_ids):
                 if run:
                     runs.append(run)
                     run = []
@@ -2897,6 +3009,7 @@ class AgentRuntime:
                     extra_input_items=None,
                     response_schema=compaction_json_schema(mode),
                     response_schema_name=compaction_schema_name(mode),
+                    compaction=True,
                 )
                 candidate = self._parse_candidate_json(response.final_text or '', mode=mode)
                 if candidate is None:

@@ -4,13 +4,14 @@ from __future__ import annotations
 import copy
 import json
 from dataclasses import replace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import httpx
 
 from tests.business_helpers import BusinessTestCase
 from tgchatbot.config import ChatCompletionsConfig
-from tgchatbot.core.runtime import AgentRuntime, _admission_protected
+from tgchatbot.core.runtime import AgentRuntime, ContextLimitExceeded
+from tgchatbot.core.compaction_schema import compaction_json_schema
 from tgchatbot.domain.models import (ChatMode, ConversationMessage, PromptInjectionMode,
     ToolHistoryMode, ToolResult)
 from tgchatbot.providers.chat_completions import ChatCompletionsProvider
@@ -161,53 +162,52 @@ class ToolRoundLimitTests(BusinessTestCase):
 
     async def test_immediate_compaction_keeps_the_unseen_refusal(self):
         wire = []
+        blocked = self.response('gemini', calls=('blocked',))
+        # The first result fits. The next (refused) command crosses the ceiling,
+        # so the already-seen result can compact while the refusal stays intact.
+        blocked['candidates'][0]['content']['parts'][0]['functionCall']['args'] = {
+            'command': 'never execute this command; '*5000}
+        summary = {key: [] for key in compaction_json_schema('toolspan')['properties']}
+        summary.update(scope='A shell check returned diagnostic details.', interaction_mode='task_execution')
         scripts = [self.response('gemini', calls=('last',)),
-            self.response('gemini', calls=('blocked',)), self.response('gemini')]
+            blocked, self.response('gemini', text=json.dumps(summary)), self.response('gemini')]
         provider = await self.make_provider('gemini', scripts, wire)
         await self.settings(provider='gemini', model=provider.config.model, mode=ChatMode.ASSIST,
             max_interaction_rounds=1, compact_trigger_tokens=100000,
             tool_history_mode=ToolHistoryMode.NATIVE_SAME_PROVIDER)
-        older = await self.runtime.ingest_user_message(session_id=self.session,
+        await self.runtime.ingest_user_message(session_id=self.session,
             incoming_message=ConversationMessage.user_text('Earlier discussion to summarize.'))
-        # A large result triggers the real post-tool admission/compaction branch.
         self.tools.runner.run.side_effect = lambda *args: ToolResult('', 'shell_exec',
-            {'ok': True, 'stdout': 'diagnostic detail ' * 50000})
-        compacted = []
-        original_compact = self.runtime._compact_if_needed
-
-        async def compact_at_boundary(**kwargs):
-            if kwargs.get('native_from_id') is None:
-                return await original_compact(**kwargs)
-            state = kwargs['state']
-            note_rows = [row for row in state.raw_messages
-                if row.message.metadata.get('tool_payload', {}).get('output', {}).get('application_note')]
-            if not note_rows:
-                # The large successful result must first reach the model; the
-                # next continuation then compacts around the new refusal.
-                return False
-            self.assertEqual(len(note_rows), 1)
-            note = note_rows[0]
-            self.assertIn(note.db_id, _admission_protected.get())
-            self.assertIn(note.message.metadata['tool_call_message_id'], _admission_protected.get())
-            # Replace only older context with a genuine stored memory block,
-            # exercising the continuation rebuild after compaction.
-            await self.store.create_memory_block(self.session, source_message_ids=[older.db_id],
-                summary_text='Earlier discussion was retained.', estimated_tokens=8)
-            await self.runtime._reload_live_state(state)
-            compacted.append(note.db_id)
-            return True
-
-        with patch.object(self.runtime, '_compact_if_needed', side_effect=compact_at_boundary):
-            result = await self.runtime.run_turn(session_id=self.session, user_display_name='Participant',
-                incoming_message=ConversationMessage.user_text('Finish the current check.'), emit=AsyncMock())
+            {'ok': True, 'stdout': 'diagnostic detail ' * 18000})
+        result = await self.runtime.run_turn(session_id=self.session, user_display_name='Participant',
+            incoming_message=ConversationMessage.user_text('Finish the current check.'), emit=AsyncMock())
         self.assertEqual(result.text, 'Finished.')
-        self.assertEqual(len(compacted), 1)
         self.assertEqual(len(await self.store.list_memory_blocks(self.session)), 1)
         self.tools.runner.run.assert_awaited_once()
         result_output = self.results('gemini', wire[-1])['blocked']
         self.assertFalse(result_output['ok'])
         self.assertIn('application_note', result_output)
         stored = await self.store.list_uncompacted_messages(self.session)
-        self.assertIn(compacted[0], [row.db_id for row in stored])
+        self.assertEqual(sum(row.message.metadata.get('tool_payload', {}).get('call_id') == 'blocked'
+            for row in stored), 2)
         self.assertEqual(wire[0]['systemInstruction'], wire[-1]['systemInstruction'])
         self.assertEqual(wire[0]['tools'], wire[-1]['tools'])
+
+    async def test_oversized_unseen_result_blocks_next_request_and_remains_stored(self):
+        wire = []
+        summary = {key: [] for key in compaction_json_schema('episode')['properties']}
+        summary.update(scope='The user requested a diagnostic check.', interaction_mode='task_execution')
+        provider = await self.make_provider('gemini', [self.response('gemini', calls=('read',)),
+            self.response('gemini', text=json.dumps(summary))], wire)
+        await self.settings(provider='gemini', model=provider.config.model, mode=ChatMode.ASSIST,
+            compact_trigger_tokens=100000, tool_history_mode=ToolHistoryMode.NATIVE_SAME_PROVIDER)
+        output = 'diagnostic detail '*50000
+        self.tools.runner.run.return_value = ToolResult('', 'shell_exec', {'ok':True,'stdout':output})
+        with self.assertRaises(ContextLimitExceeded):
+            await self.runtime.run_turn(session_id=self.session, user_display_name='Participant',
+                incoming_message=ConversationMessage.user_text('Run the check.'))
+        self.assertEqual(len(wire),2)
+        self.assertIn('responseJsonSchema',wire[-1]['generationConfig'])
+        rows = await self.store.list_uncompacted_messages(self.session)
+        result = next(row for row in rows if row.message.metadata.get('tool_phase')=='result')
+        self.assertEqual(result.message.metadata['tool_payload']['output']['stdout'],output)

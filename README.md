@@ -102,6 +102,15 @@ open their supporting originals with `memory_read(profile_fact_ids=[...])`;
 neither read triggers profile learning. Profiles learn in background batches;
 compaction can process a pending batch, and `/reset` queues catch-up without waiting.
 
+Context compacts silently after an hour of inactivity above 600K estimated tokens,
+or before a reply at the 800K ceiling, toward a 50K target. Incoming messages are
+still stored during compaction; replies wait for it. The target preserves complete
+recent messages and tool exchanges, so some contexts remain larger. Generation
+stops if compaction cannot fit the ceiling. Configure these thresholds in `.env`
+for your model's context window; `/status context` shows effective chat settings.
+Set `CONTEXT_COMPACT_IDLE_TRIGGER_TOKENS=0` to disable idle compaction. Existing
+per-chat overrides continue to take precedence.
+
 Stickers require an explicitly built catalog. The agent retrieves candidates,
 inspects available evidence, and chooses a sticker or text. Query previews are
 not automatically sent to Telegram. Photos and documents depend on the selected

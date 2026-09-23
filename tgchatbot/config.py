@@ -182,12 +182,21 @@ class ContextConfig:
     summary_context_min_tokens: int = 256
     summary_context_floor_tokens: int = 1024
     summary_context_max_tokens: int = 16000
+    compact_idle_trigger_tokens: int = 600000
+    compact_idle_seconds: float = 3600.0
+    compact_retry_count: int = 3
+    compact_retry_delay_s: float = 3.0
 
     def __post_init__(self) -> None:
         if self.compaction_attempts < 1:
             raise ValueError('CONTEXT_COMPACTION_ATTEMPTS must be positive')
         if self.attribution_retries < 0:
             raise ValueError('CONTEXT_ATTRIBUTION_RETRIES must be nonnegative')
+        if self.compact_idle_trigger_tokens < 0 or self.compact_retry_count < 0:
+            raise ValueError('Idle compaction threshold and compaction retry count must be nonnegative')
+        for value in (self.compact_idle_seconds, self.compact_retry_delay_s):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError('Idle and retry delays must be finite and nonnegative')
         if not 1 <= self.summary_context_min_tokens <= self.summary_context_floor_tokens <= self.summary_context_max_tokens:
             raise ValueError('Summary context token allowances must be positive and ordered: min <= floor <= max')
 
@@ -439,8 +448,8 @@ def load_config(*, require_telegram: bool = True) -> AppConfig:
             control_persist_s=int(os.getenv('SSH_EXEC_CONTROL_PERSIST_S', '600')),
         ),
         context=ContextConfig(
-            compact_trigger_tokens=parse_bounded_int_env(os.getenv("CONTEXT_COMPACT_TRIGGER_TOKENS"), default=300000, minimum=COMPACT_TOKEN_MIN),
-            compact_target_tokens=parse_bounded_int_env(os.getenv("CONTEXT_COMPACT_TARGET_TOKENS"), default=100000, minimum=COMPACT_TOKEN_MIN),
+            compact_trigger_tokens=parse_bounded_int_env(os.getenv("CONTEXT_COMPACT_TRIGGER_TOKENS"), default=800000, minimum=COMPACT_TOKEN_MIN),
+            compact_target_tokens=parse_bounded_int_env(os.getenv("CONTEXT_COMPACT_TARGET_TOKENS"), default=50000, minimum=COMPACT_TOKEN_MIN),
             compact_batch_tokens=parse_bounded_int_env(os.getenv("CONTEXT_COMPACT_BATCH_TOKENS"), default=40000, minimum=COMPACT_TOKEN_MIN),
             compact_keep_recent_ratio=parse_bounded_float_env(os.getenv("CONTEXT_COMPACT_KEEP_RECENT_RAW_TOKEN_RATIO"), default=0.5, minimum=COMPACT_KEEP_RECENT_RATIO_MIN, maximum=COMPACT_KEEP_RECENT_RATIO_MAX),
             compact_tool_ratio_threshold=parse_bounded_float_env(os.getenv("CONTEXT_COMPACT_TOOL_RATIO_THRESHOLD"), default=10.0, minimum=COMPACT_TOOL_RATIO_THRESHOLD_MIN),
@@ -452,6 +461,10 @@ def load_config(*, require_telegram: bool = True) -> AppConfig:
             summary_context_min_tokens=int(os.getenv('CONTEXT_SUMMARY_MIN_TOKENS', '').strip() or 256),
             summary_context_floor_tokens=int(os.getenv('CONTEXT_SUMMARY_FLOOR_TOKENS', '').strip() or 1024),
             summary_context_max_tokens=int(os.getenv('CONTEXT_SUMMARY_MAX_TOKENS', '').strip() or 16000),
+            compact_idle_trigger_tokens=int(os.getenv('CONTEXT_COMPACT_IDLE_TRIGGER_TOKENS', '').strip() or 600000),
+            compact_idle_seconds=float(os.getenv('CONTEXT_COMPACT_IDLE_SECONDS', '').strip() or 3600),
+            compact_retry_count=int(os.getenv('CONTEXT_COMPACT_RETRY_COUNT', '').strip() or 3),
+            compact_retry_delay_s=float(os.getenv('CONTEXT_COMPACT_RETRY_DELAY_S', '').strip() or 3),
         ),
     )
 

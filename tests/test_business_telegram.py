@@ -43,7 +43,9 @@ class TelegramWorkflowTests(BusinessTestCase):
         for name, value in {'max_output_tokens': 131072, 'max_input_images': 200000,
                 'provider_retry_count': 8, 'max_interaction_rounds': 100,
                 'private_reply_delay_s': 901, 'group_spontaneous_reply_delay_s': 100000,
-                'compact_trigger_tokens': 20000000, 'compact_min_messages': 2000}.items():
+                'compact_trigger_tokens': 20000000, 'compact_min_messages': 2000,
+                'compact_idle_trigger_tokens': 15000000, 'compact_idle_seconds': 7200,
+                'compact_batch_tokens': 1000000}.items():
             with self.subTest(setting=name):
                 self.context.args = [name, str(value)]
                 await self.app.param_command(self.update, self.context)
@@ -190,7 +192,7 @@ class TelegramWorkflowTests(BusinessTestCase):
 
     async def test_worker_waits_for_ingestion_and_does_not_reply_twice(self):
         state = self.app._flow_state(100)
-        self.app._reply_to_candidate = AsyncMock()
+        self.app._reply_to_candidate = AsyncMock(return_value=None)
         await self.app._mark_ingest_started(state)
         state.latest_reply_candidate = self.candidate(1)
         worker = asyncio.create_task(self.app._reply_worker(100))
@@ -206,7 +208,7 @@ class TelegramWorkflowTests(BusinessTestCase):
         trigger = await self.runtime.ingest_user_message(session_id=self.session, incoming_message=ConversationMessage.user_text("question"))
         await self.runtime.record_tool_observation(session_id=self.session, name="shell_exec", payload={}, phase="result")
         await self.runtime.record_assistant_text(session_id=self.session, text="old answer")
-        self.app._reply_to_candidate = AsyncMock()
+        self.app._reply_to_candidate = AsyncMock(return_value=None)
         await self.app.retry_command(self.update, self.context)
         visible = await self.store.list_uncompacted_messages(self.session)
         self.assertEqual([item.db_id for item in visible], [trigger.db_id])
@@ -219,7 +221,7 @@ class TelegramWorkflowTests(BusinessTestCase):
                 "source": "telegram", "source_chat_id": "100", "source_message_id": "42",
                 "actor_id": "telegram:user:8", "actor_kind": "user", "actor_name": "Original author"}))
         await self.runtime.record_assistant_text(session_id=self.session, text="old answer")
-        self.app._reply_to_candidate = AsyncMock()
+        self.app._reply_to_candidate = AsyncMock(return_value=None)
         self.update.effective_user.full_name = "Command issuer"
         await self.app.retry_command(self.update, self.context)
         candidate = self.app._reply_to_candidate.await_args.args[0]
@@ -246,7 +248,7 @@ class TelegramWorkflowTests(BusinessTestCase):
         # reply target is an original eligible for /retry.
         await self.runtime.record_auto_user_note(session_id=self.session,
             parts=ConversationMessage.user_text("Automatic attachment status.").parts)
-        self.app._reply_to_candidate = AsyncMock()
+        self.app._reply_to_candidate = AsyncMock(return_value=None)
         await self.app.retry_command(self.update, self.context)
         candidate = self.app._reply_to_candidate.await_args.args[0]
         self.assertEqual(candidate.stored_message_id, trigger.db_id)
@@ -334,7 +336,7 @@ class TelegramWorkflowTests(BusinessTestCase):
         # 41 crosses the existing 40-row page boundary with the smallest fixture.
         for number in range(41):
             await self.runtime.record_tool_observation(session_id=self.session, name="shell_exec", payload={"sequence": number}, phase="result")
-        self.app._reply_to_candidate = AsyncMock()
+        self.app._reply_to_candidate = AsyncMock(return_value=None)
         await self.app.retry_command(self.update, self.context)
         self.assertEqual(self.app._reply_to_candidate.await_args.args[0].stored_message_id, trigger.db_id)
         self.assertEqual(len(await self.store.list_recent_visible_messages(self.session)), 1)

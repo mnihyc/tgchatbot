@@ -137,7 +137,7 @@ class TelegramCommandUIWorkflows(BusinessTestCase):
         self.message.reply_document.assert_not_awaited()
 
         await self.command('status', 'context')
-        self.assertIn('trigger 12,000 → target 6,000', self.received_text())
+        self.assertIn('ceiling 12,000 → target 6,000', self.received_text())
         self.assertIn('originals searchable', self.received_text())
         await self.command('status', 'tools')
         self.assertIn('Remote workspace: not configured', self.received_text())
