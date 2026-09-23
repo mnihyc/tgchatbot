@@ -28,7 +28,7 @@ class BuildConfig:
     model: str = 'gemini-3.8-flash'
     service_tier: str = 'flex'
     request_timeout_s: float = 600.0
-    max_output_tokens: int = 8192
+    max_output_tokens: int = 16384
     concurrency: int = 1
     image_embeddings: bool = True
 

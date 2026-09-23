@@ -357,6 +357,9 @@ class StickerBuildWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(await runtime.aget_available(target))
 
     async def test_embedding_failure_keeps_active_and_resume_reuses_successful_annotation(self):
+        # Resume a checkpoint created with the earlier output allowance.
+        self.builder = CatalogBuilder(self.catalog, self.provider, self.embeddings,
+                                      config=replace(BuildConfig(), max_output_tokens=8192))
         self.picture('pack/one.png', 'red')
         first = await self.builder.build(self.root)
         second_id = self.picture('pack/two.png', 'blue')
@@ -373,8 +376,7 @@ class StickerBuildWorkflowTests(unittest.IsolatedAsyncioTestCase):
             await self.catalog.activate(failed.revision_id)
         self.embeddings.fail_images = False
         resumed = CatalogBuilder(self.catalog, self.provider, self.embeddings,
-                                 config=replace(BuildConfig(), concurrency=2, request_timeout_s=900,
-                                                max_output_tokens=16384))
+                                 config=replace(BuildConfig(), concurrency=2, request_timeout_s=900))
         result = await resumed.build(self.root, resume=failed.revision_id)
         self.assertTrue(result.active)
         self.assertEqual(len(self.provider.calls), 2)
