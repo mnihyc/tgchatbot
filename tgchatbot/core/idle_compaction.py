@@ -27,6 +27,10 @@ class IdleCompaction:
         self.sessions: dict[str, _Session] = {}
         self.closed = False
 
+    def is_running(self, session_id: str) -> bool:
+        state = self.sessions.get(session_id)
+        return bool(state and state.operation and not state.operation.done())
+
     def touch(self, session_id: str) -> None:
         """Real chat activity restarts the timer, never an in-flight compaction."""
         if self.closed:

@@ -251,6 +251,7 @@ class IdleCompactionWorkflows(BusinessTestCase):
         app._record_delivered_assistant_text = AsyncMock()
         app.idle_compaction.touch(self.session)
         await asyncio.wait_for(entered.wait(), 5)
+        self.assertTrue((await app._flow_snapshot(100))['compacting'])
         app._send_text_message.assert_not_awaited()
         bot.send_chat_action.assert_not_awaited()
         for number in (100,101):

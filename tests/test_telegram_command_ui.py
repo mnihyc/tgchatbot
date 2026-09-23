@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from types import SimpleNamespace
+import unittest
 from unittest.mock import AsyncMock, patch
 
 from tests.business_helpers import BusinessTestCase
@@ -14,7 +15,7 @@ from tgchatbot.storage.presets import PresetStore
 from tgchatbot.storage.sticker_catalog import StickerCatalogStore
 from tgchatbot.tools.registry import ToolRegistry
 from tgchatbot.transports.telegram_adapter import TelegramBotApp
-from tgchatbot.transports.telegram_command_views import plain_text
+from tgchatbot.transports.telegram_command_views import plain_text, status_view
 
 
 class TelegramCommandUIWorkflows(BusinessTestCase):
@@ -129,16 +130,17 @@ class TelegramCommandUIWorkflows(BusinessTestCase):
         await self.store.append_message(self.session, ConversationMessage.user_text('Remember the test meeting.'))
         await self.command('status')
         brief = self.received_text()
-        self.assertIn('compaction trigger 12,000', brief)
-        self.assertIn(self.config.default_metadata_timezone, brief)
+        self.assertIn('/ 12K tokens', brief)
+        self.assertIn('░', brief)
         self.assertNotIn('compact_tool_ratio_threshold', brief)
         self.assertNotIn('provider_history_messages', brief)
+        self.assertNotIn('Time zone:', brief)
         self.assertEqual(self.message.reply_text.await_count, 1)
         self.message.reply_document.assert_not_awaited()
 
         await self.command('status', 'context')
-        self.assertIn('ceiling 12,000 → target 6,000', self.received_text())
-        self.assertIn('originals searchable', self.received_text())
+        self.assertIn('/ 12K tokens', self.received_text())
+        self.assertIn('Compaction target: 6K tokens', self.received_text())
         await self.command('status', 'tools')
         self.assertIn('Remote workspace: not configured', self.received_text())
         self.assertIn('memory_search', self.received_text())
@@ -148,7 +150,8 @@ class TelegramCommandUIWorkflows(BusinessTestCase):
         failure = 'Synthetic worker rejection: <missing & retryable>'
         self.runtime.memory.worker = SimpleNamespace(last_error=failure)
         await self.command('status')
-        self.assertIn('⚠️', self.received_text())
+        self.assertIn('Worker error', self.received_text())
+        self.assertIn('/status memory', self.received_text())
         self.assertNotIn(failure, self.received_text())
         await self.command('status', 'memory')
         self.assertIn(failure, self.received_text())
@@ -159,6 +162,7 @@ class TelegramCommandUIWorkflows(BusinessTestCase):
         self.assertIn('compact_trigger_tokens=12000', full)
         self.assertIn('compact_tool_ratio_threshold=', full)
         self.assertIn(failure, full)
+        self.assertIn(self.config.default_metadata_timezone, full)
         self.message.reply_text.assert_not_awaited()
 
     async def test_prompt_is_literal_and_shown_only_when_requested(self):
@@ -200,3 +204,53 @@ class TelegramCommandUIWorkflows(BusinessTestCase):
         # Existing permission behavior also covers focused advanced inspection.
         await self.command('param', 'thinking_level')
         self.assertIn('not allowed', self.received_text())
+
+    async def test_invalid_choices_explain_rejection_without_changing_settings(self):
+        before = await self.settings()
+        for name, value, notice in (('provider', 'missing<&>', 'Unknown provider'),
+                                    ('mode', 'missing<&>', 'Invalid option')):
+            with self.subTest(command=name):
+                await self.command(name, value)
+                self.assertIn(notice, self.received_text())
+                self.assertIn(value, self.received_text())
+                self.assertNotIn(value, self.message.reply_text.await_args.args[0])
+                self.assertEqual(await self.settings(), before)
+
+
+class StatusPresentationTests(unittest.TestCase):
+    def test_context_usage_shows_overflow_without_claiming_compaction_progress(self):
+        status = {'model':'fixture <model>', 'provider':'configured',
+                  'estimated_request_tokens':1200000, 'compact_trigger_tokens':800000}
+        rendered = status_view(status, {'compacting':True, 'reply_running':True})
+        visible = plain_text(rendered)
+        self.assertIn('Compacting context', visible)
+        self.assertNotIn('Replying', visible)
+        self.assertIn('Context ≈ 1.2M / 800K tokens', visible)
+        self.assertIn('150% · above ceiling', visible)
+        self.assertNotIn('complete', visible)
+        self.assertIn('fixture <model>', visible)
+        self.assertNotIn('fixture <model>', rendered)
+        for used, ceiling in ((0,800000), (None,800000), (1000,None), (1000,0)):
+            with self.subTest(used=used, ceiling=ceiling):
+                visible = plain_text(status_view({**status, 'estimated_request_tokens':used,
+                    'compact_trigger_tokens':ceiling}, {}))
+                self.assertNotIn('above ceiling', visible)
+                if used is None or not ceiling:
+                    self.assertNotIn('%', visible, 'No invented fraction when the budget is unavailable')
+
+    def test_memory_separates_active_work_from_old_completed_jobs_and_keeps_failures(self):
+        status = {'semantic_enabled':True, 'scope':{'generation':'private-generation', 'context_id':'private-context'},
+            'memory_jobs':[{'kind':'memory_profile','status':'pending','count':2},
+                           {'kind':'memory_profile','status':'failed','count':1},
+                           {'kind':'memory_embed','status':'done','count':123456}],
+            'memory_last_error':'<temporary & retryable>'}
+        visible = plain_text(status_view(status, {}, 'memory'))
+        self.assertIn('Profiles: 2 queued · 1 failed', visible)
+        self.assertNotIn('123456', visible)
+        self.assertNotIn('123,456', visible)
+        self.assertNotIn('private-generation', visible)
+        self.assertNotIn('private-context', visible)
+        self.assertIn('<temporary & retryable>', visible)
+        self.assertIn('/status full', visible)
+        visible = plain_text(status_view({**status, 'memory_jobs':[]}, {}, 'memory'))
+        self.assertIn('Background queue: empty', visible)

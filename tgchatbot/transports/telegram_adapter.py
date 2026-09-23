@@ -149,7 +149,7 @@ class TelegramBotApp:
         lowered = text.lower()
         if 'api_key' in lowered or 'authorization' in lowered or 'bearer ' in lowered:
             text = exc.__class__.__name__
-        return f'⚠️ {stage} failed.\n{text}'
+        return f'{stage} failed.\n{text}'
 
     def __init__(self, *, config: AppConfig, runtime: AgentRuntime, store: PostgresStore, artifact_store: ArtifactStore, preset_store: PresetStore | None = None, remote_workspace: RemoteWorkspaceClient | None = None) -> None:
         self.config = config
@@ -358,10 +358,6 @@ class TelegramBotApp:
             'Session',
             f"provider={session_status['provider']} model={session_status['model']}",
             f"mode={session_status['mode']} process={session_status['process']} delivery={session_status['delivery']} stickers={session_status['stickers']}",
-            f"raw_messages={session_status['raw_messages']} memory_blocks={session_status['memory_blocks']} l0_blocks={session_status['l0_blocks']} l1_blocks={session_status['l1_blocks']} l2_blocks={session_status['l2_blocks']} provider_history_messages={session_status['provider_history_messages']}",
-            f"estimated_request_tokens={session_status['estimated_request_tokens']} estimated_request_images={session_status['estimated_request_images']}",
-            f"compact_trigger_tokens={session_status['compact_trigger_tokens']} compact_target_tokens={session_status['compact_target_tokens']}",
-            f"reply_running={flow['reply_running']} ingest_inflight={flow['ingest_inflight']}",
             f"prompt_chars={session_status['system_prompt_chars']}",
             f"agent_generation={session_status.get('scope', {}).get('generation', '-')} context={session_status.get('scope', {}).get('context_id', '-')}",
             f"semantic_search_configured={session_status.get('semantic_enabled', False)} memory_jobs=" +
@@ -375,8 +371,7 @@ class TelegramBotApp:
             f"raw_messages={session_status['raw_messages']} tool_history_messages={session_status['tool_history_messages']} memory_blocks={session_status['memory_blocks']} l0_blocks={session_status['l0_blocks']} l1_blocks={session_status['l1_blocks']} l2_blocks={session_status['l2_blocks']} provider_history_messages={session_status['provider_history_messages']}",
             f"estimated_history_tokens={session_status['estimated_history_tokens']} estimated_request_tokens={session_status['estimated_request_tokens']}",
             f"estimated_request_images={session_status['estimated_request_images']} max_input_images={session_status['max_input_images']} compact_target_images={session_status['compact_target_images']}",
-            f"compact_trigger_tokens={session_status['compact_trigger_tokens']} compact_target_tokens={session_status['compact_target_tokens']} compact_batch_tokens={session_status['compact_batch_tokens']} compact_keep_recent_ratio={session_status['compact_keep_recent_ratio']} compact_tool_ratio_threshold={session_status['compact_tool_ratio_threshold']} compact_tool_min_tokens={session_status['compact_tool_min_tokens']} compact_min_messages={session_status['compact_min_messages']} min_raw_messages_reserve={session_status['min_raw_messages_reserve']}",
-            f"compact_idle_trigger_tokens={session_status['compact_idle_trigger_tokens']} compact_idle_seconds={session_status['compact_idle_seconds']} compact_retry_count={session_status['compact_retry_count']} compact_retry_delay_s={session_status['compact_retry_delay_s']}",
+            f"compact_retry_count={session_status['compact_retry_count']} compact_retry_delay_s={session_status['compact_retry_delay_s']}",
             f"loaded_in_memory={session_status['loaded_in_memory']}",
             '',
             'Sticker index',
@@ -385,7 +380,7 @@ class TelegramBotApp:
             'Remote + queue',
             f"remote_enabled={session_status['remote_enabled']} remote_master_ready={session_status['remote_master_ready']}",
             'available_tools=' + ', '.join(session_status['available_tools']),
-            f"ingest_inflight={flow['ingest_inflight']} reply_running={flow['reply_running']}",
+            f"ingest_inflight={flow['ingest_inflight']} reply_running={flow['reply_running']} compacting={flow.get('compacting', False)}",
             f"latest_pending_reply_message_id={flow['latest_pending_reply_message_id']} last_replied_message_id={flow['last_replied_message_id']}",
             '',
         ])
@@ -450,7 +445,7 @@ class TelegramBotApp:
             return
         settings = await self.store.get_or_create_session(self._session_id(chat), self._default_settings())
         await self._send_command(update.effective_message,
-            '👋 <b>Ready to chat</b>\n'
+            '<b>Ready to chat</b>\n'
             f'<code>{html.escape(settings.model)}</code> · {html.escape(settings.provider)}\n'
             f'Mode: <b>{html.escape(settings.mode.value)}</b>\n\n'
             '/status — current state\n/settings — customize this chat\n/help — commands'
@@ -471,7 +466,7 @@ class TelegramBotApp:
         if context.args:
             await message.reply_text('Usage: /compact\nUses the target shown in /params context.')
             return
-        progress = await message.reply_text('⏳ Compacting context…')
+        progress = await message.reply_text('Compacting context…')
         try:
             result = await self.runtime.prepare_context(session_id=self._session_id(chat), force=True)
         except StaleScopeError:
@@ -517,7 +512,7 @@ class TelegramBotApp:
                     await task
                 except asyncio.CancelledError:
                     pass
-        note = 'New context started. Prior messages remain searchable; profiles and settings are retained.' if mode == 'history' else 'Session settings reset.'
+        note = 'New context started. Prior messages remain searchable; profiles and settings are retained.' if mode == 'history' else 'Chat settings restored to configured defaults.'
         await update.effective_message.reply_text(note)
         self._record_activity(self._session_id(chat))
 
@@ -570,7 +565,7 @@ class TelegramBotApp:
         await self._reply_to_candidate(candidate)
         self._record_activity(self._session_id(chat))
         if hidden > 0:
-            await message.reply_text(f'Retried from message #{trigger.db_id}; hid {hidden} newer stored message(s) first.')
+            await message.reply_text(f'{hidden} newer message(s) hidden from context for this retry.')
 
     async def rollback_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
@@ -606,10 +601,12 @@ class TelegramBotApp:
         targets = [by_id[mid] for mid in target_ids if mid in by_id]
 
         preview_lines: list[str] = []
+        previews: list[tuple[str, str]] = []
         for item in targets[-10:]:
+            kind, preview = self._rollback_item_type(item), self._rollback_item_preview(item)
+            previews.append((kind, preview))
             preview_lines.append(
-                f'- #{item.db_id} {self._rollback_item_type(item)}: '
-                f'{self._rollback_item_preview(item)}'
+                f'- #{item.db_id} {kind}: {preview}'
             )
 
         hidden = await self.store.hide_message_ids(session_id, target_ids)
@@ -626,19 +623,7 @@ class TelegramBotApp:
             clip_for_log(' || '.join(preview_lines), limit=400, rlimit=120),
         )
 
-        lines = [
-            'Rollback complete.',
-            f'- requested blocks: {count}',
-            f'- hidden visible messages: {hidden}',
-            f'- stored ids: {", ".join(str(x) for x in target_ids[:12])}'
-            + (f' ... (+{len(target_ids) - 12} more)' if len(target_ids) > 12 else ''),
-        ]
-        if preview_lines:
-            lines.append('')
-            lines.append('Hidden messages:')
-            lines.extend(preview_lines)
-
-        await message.reply_text('\n'.join(lines))
+        await self._send_command(message, command_views.rollback_result(hidden, previews))
 
     async def mode_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._command_allowed(update):
@@ -669,9 +654,11 @@ class TelegramBotApp:
         available = set(self.runtime.providers.keys())
         if value not in available:
             available_text = '|'.join(sorted(available))
+            feedback = f'Unknown provider: <code>{html.escape(value)}</code>\n' if value else ''
             await self._send_command(update.effective_message,
-                '🤖 <b>Provider</b>\n'
+                '<b>Provider</b>\n'
                 f'{html.escape(settings.provider)} · <code>{html.escape(settings.model)}</code>\n\n'
+                f'{feedback}'
                 f'<code>/provider {html.escape(available_text)}</code>\n'
                 'Switching also selects that provider’s configured default model.'
             )
@@ -680,7 +667,7 @@ class TelegramBotApp:
         settings.model = self.config.default_model_for_provider(value)
         await self.store.save_session(self._session_id(chat), settings)
         await self._send_command(update.effective_message,
-            f'✅ <b>Provider updated</b>\n{html.escape(value)} · <code>{html.escape(settings.model)}</code>')
+            f'<b>Provider updated</b>\n{html.escape(value)} · <code>{html.escape(settings.model)}</code>')
 
     async def model_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
@@ -690,7 +677,7 @@ class TelegramBotApp:
         value = (" ".join(context.args).strip() if context.args else '')
         if not value:
             await self._send_command(update.effective_message,
-                f'🤖 <b>Model</b> · {html.escape(settings.provider)}\n'
+                f'<b>Model</b> · {html.escape(settings.provider)}\n'
                 f'<code>{html.escape(settings.model)}</code>\n\n'
                 '<code>/model &lt;name&gt;</code> — use an exact model name\n'
                 '/model default — use the configured default\n'
@@ -703,7 +690,7 @@ class TelegramBotApp:
             settings.model = value
         await self.store.save_session(self._session_id(chat), settings)
         await self._send_command(update.effective_message,
-            f'✅ <b>Model updated</b>\n{html.escape(settings.provider)} · <code>{html.escape(settings.model)}</code>')
+            f'<b>Model updated</b>\n{html.escape(settings.provider)} · <code>{html.escape(settings.model)}</code>')
 
 
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1182,7 +1169,7 @@ class TelegramBotApp:
                 if delay_s < 0.0 or not math.isfinite(delay_s):
                     current_private = settings.private_reply_delay_s if settings.private_reply_delay_s is not None else self.config.default_private_reply_delay_s
                     current_group = settings.group_reply_delay_s if settings.group_reply_delay_s is not None else self.config.default_group_reply_delay_s
-                    await update.effective_message.reply_text(f'Invalid legacy reply_delay_s. Current effective private/group values: {current_private}/{current_group}')
+                    await update.effective_message.reply_text(f'Invalid reply_delay_s. Current private/group values: {current_private}/{current_group}')
                     return
                 settings.private_reply_delay_s = delay_s
                 settings.group_reply_delay_s = delay_s
@@ -1215,10 +1202,10 @@ class TelegramBotApp:
             return
         names = self.preset_store.list_names()
         if not names:
-            await self._send_command(update.effective_message, '📝 <b>Prompt presets</b>\nNo presets available.\n/prompt — edit this chat’s prompt')
+            await self._send_command(update.effective_message, '<b>Prompt presets</b>\nNo presets available.\n/prompt — edit this chat’s prompt')
             return
         await self._send_command(update.effective_message,
-            '📝 <b>Prompt presets</b>\n' + '\n'.join(f'<code>{html.escape(name)}</code>' for name in names)
+            '<b>Prompt presets</b>\n' + '\n'.join(f'<code>{html.escape(name)}</code>' for name in names)
             + '\n\n<code>/preset &lt;name&gt;</code> — apply a preset\n/help model — prompt modes')
 
     async def preset_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1228,7 +1215,7 @@ class TelegramBotApp:
         settings = await self.store.get_or_create_session(self._session_id(chat), self._default_settings())
         if not context.args:
             await self._send_command(update.effective_message,
-                '📝 <b>Prompt preset</b>\n'
+                '<b>Prompt preset</b>\n'
                 f'Mode: <code>{settings.prompt_injection_mode.value}</code>\n\n'
                 '<code>/preset &lt;name&gt; [augment|exact]</code>\n'
                 '/presets — available presets\n'
@@ -1257,7 +1244,7 @@ class TelegramBotApp:
         settings.system_prompt = text
         await self.store.save_session(self._session_id(chat), settings)
         await self._send_command(update.effective_message,
-            f'✅ <b>Preset loaded</b>: {html.escape(name)}\nMode: <code>{settings.prompt_injection_mode.value}</code>')
+            f'<b>Preset loaded</b>: {html.escape(name)}\nMode: <code>{settings.prompt_injection_mode.value}</code>')
 
     async def prompt_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
@@ -1266,7 +1253,7 @@ class TelegramBotApp:
         settings = await self.store.get_or_create_session(self._session_id(chat), self._default_settings())
         if not context.args:
             await self._send_command(update.effective_message,
-                '📝 <b>Chat prompt</b>\n'
+                '<b>Chat prompt</b>\n'
                 f'Mode: <code>{settings.prompt_injection_mode.value}</code> · {len(settings.system_prompt):,} characters\n\n'
                 '/prompt show — read the full prompt\n'
                 '<code>/prompt set &lt;text&gt;</code> — replace\n'
@@ -1279,7 +1266,7 @@ class TelegramBotApp:
         rest = ' '.join(context.args[1:]).strip()
         if sub == 'show':
             await self._send_command(update.effective_message,
-                f'📝 <b>Chat prompt</b> · {settings.prompt_injection_mode.value}\n\n'
+                f'<b>Chat prompt</b> · {settings.prompt_injection_mode.value}\n\n'
                 + html.escape(settings.system_prompt or '(empty)'))
             return
         if sub == 'reset':
@@ -2100,10 +2087,12 @@ class TelegramBotApp:
 
     async def _flow_snapshot(self, chat_id: int) -> dict[str, object]:
         state = self._flow_state(chat_id)
+        scheduler = getattr(self, 'idle_compaction', None)
         async with state.mutex:
             return {
                 'ingest_inflight': state.ingest_inflight,
                 'reply_running': bool(state.reply_task and not state.reply_task.done()),
+                'compacting': bool(scheduler and scheduler.is_running(f'telegram:{chat_id}')),
                 'latest_pending_reply_message_id': state.latest_reply_candidate.stored_message_id if state.latest_reply_candidate else None,
                 'last_replied_message_id': state.last_replied_message_id,
             }
@@ -2124,14 +2113,16 @@ class TelegramBotApp:
             selected = enum(value)
         except ValueError:
             choices = '|'.join(item.value for item in enum)
+            feedback = f'Invalid option: <code>{html.escape(value)}</code>\n' if value else ''
             await self._send_command(update.effective_message,
-                f'⚙️ <b>{label}</b> · <code>{getattr(settings, attribute).value}</code>\n\n'
+                f'<b>{label}</b> · <code>{getattr(settings, attribute).value}</code>\n'
+                f'{feedback}'
                 f'<code>/{target} {choices}</code>\n/help {help_topic} — what each option means')
             return
         setattr(settings, attribute, selected)
         await self.store.save_session(self._session_id(chat), settings)
         await self._send_command(update.effective_message,
-            f'✅ <b>{label}</b> · <code>{selected.value}</code>')
+            f'<b>{label}</b> · <code>{selected.value}</code>')
 
     def _command_allowed(self, update: Update) -> bool:
         chat = update.effective_chat

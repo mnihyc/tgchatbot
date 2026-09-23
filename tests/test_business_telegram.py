@@ -11,6 +11,7 @@ from tgchatbot.domain.models import (
     ProcessVisibility, ProviderResponse, StickerTiming, TurnResult,
 )
 from tgchatbot.transports.telegram_adapter import ReplyCandidate, TelegramBotApp
+from tgchatbot.transports.telegram_command_views import plain_text
 from tgchatbot.stickers.catalog import StickerCatalog
 from tgchatbot.stickers.plan import StickerRetrievalPlan
 from tgchatbot.storage.postgres_store import StaleScopeError
@@ -326,10 +327,23 @@ class TelegramWorkflowTests(BusinessTestCase):
     async def test_rollback_groups_tool_and_assistant_as_one_bot_block(self):
         first = await self.runtime.ingest_user_message(session_id=self.session, incoming_message=ConversationMessage.user_text("question"))
         await self.runtime.record_tool_observation(session_id=self.session, name="shell_exec", payload={}, phase="result")
-        await self.runtime.record_assistant_text(session_id=self.session, text="answer")
+        answer = '<b>Done & saved</b> 😀\n' + 'Full details remain in the original. ' * 5
+        stored = await self.runtime.record_assistant_text(session_id=self.session, text=answer)
         await self.app.rollback_command(self.update, self.context)
         visible = await self.store.list_uncompacted_messages(self.session)
         self.assertEqual([item.db_id for item in visible], [first.db_id])
+        response = self.message.reply_text.await_args
+        self.assertEqual(response.kwargs['parse_mode'], 'HTML')
+        preview = plain_text(response.args[0])
+        self.assertIn('2 message(s) hidden', preview)
+        self.assertIn('tool:shell_exec:result', preview)
+        self.assertIn('assistant: <b>Done & saved</b> 😀', preview)
+        self.assertNotIn('<b>Done & saved</b>', response.args[0])
+        self.assertIn('…', preview)
+        self.assertNotIn(answer, preview)
+        # Presentation may shorten an excerpt; rollback keeps the original for audit.
+        revisions = await self.store.list_message_revisions(self.session, stored.db_id)
+        self.assertEqual(revisions[0]['body'], answer)
 
     async def test_retry_finds_user_before_more_than_one_page_of_tool_outputs(self):
         trigger = await self.runtime.ingest_user_message(session_id=self.session, incoming_message=ConversationMessage.user_text("long task"))
@@ -347,6 +361,12 @@ class TelegramWorkflowTests(BusinessTestCase):
             await self.runtime.record_assistant_text(session_id=self.session, text=f"output {number}")
         await self.app.rollback_command(self.update, self.context)
         self.assertEqual([item.db_id for item in await self.store.list_recent_visible_messages(self.session)], [trigger.db_id])
+        preview = plain_text(self.message.reply_text.await_args.args[0])
+        self.assertIn('41 message(s) hidden', preview)
+        self.assertIn('assistant: output 31', preview)
+        self.assertIn('assistant: output 40', preview)
+        self.assertNotIn('assistant: output 30', preview)
+        self.assertIn('31 earlier message(s)', preview)
 
     async def test_visible_history_cursor_does_not_cross_sessions_or_repeat_rows(self):
         first = await self.store.append_message(self.session, ConversationMessage.user_text("first"))

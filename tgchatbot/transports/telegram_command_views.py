@@ -88,12 +88,49 @@ def _number(value: object) -> str:
     return _text(f'{value:,}' if isinstance(value, int) else value)
 
 
-def _value(status: dict, name: str) -> str:
+def _short_number(value: int | float | None) -> str:
+    if value is None:
+        return '—'
+    for scale, suffix in ((1_000_000, 'M'), (1_000, 'K')):
+        if abs(value) >= scale:
+            return f'{value / scale:.1f}'.rstrip('0').rstrip('.') + suffix
+    return f'{value:g}'
+
+
+def _duration(seconds: float | None) -> str:
+    if seconds is None:
+        return '—'
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return f'{seconds / 3600:g} h'
+    if seconds >= 60 and seconds % 60 == 0:
+        return f'{seconds / 60:g} min'
+    return f'{seconds:g} s'
+
+
+def _context_meter(status: dict) -> list[str]:
+    used, ceiling = status.get('estimated_request_tokens'), status.get('compact_trigger_tokens')
+    lines = [f'Context ≈ {_short_number(used)} / {_short_number(ceiling)} tokens']
+    if used is not None and ceiling and ceiling > 0:
+        # Ten cells fit a phone; the number retains finer detail and overflow.
+        filled = min(10, max(0, int(used * 10 / ceiling)))
+        percent = used * 100 / ceiling
+        label = f'{percent:.0f}%' + (' · above ceiling' if used > ceiling else '')
+        lines.append(_code('█' * filled + '░' * (10 - filled)) + ' ' + label)
+    return lines
+
+
+def _value(status: dict, name: str, *, compact: bool = False) -> str:
     spec = PARAMETERS[name]
     if name == 'reply_delay_s':
         return (f"private {_code(status.get('private_reply_delay_s'))} s · "
                 f"group {_code(status.get('group_reply_delay_s'))} s")
     value = status.get(spec.status_key or name)
+    if compact and spec.unit == 'tokens' and isinstance(value, (int, float)):
+        return _short_number(value) + ' tokens'
+    if compact and spec.unit == 's' and isinstance(value, (int, float)):
+        return _duration(value)
+    if compact and name == 'compact_keep_recent_ratio' and value is not None:
+        return f'{float(value):.0%}'
     rendered = _code(value)
     return rendered + (f' {spec.unit}' if spec.unit else '')
 
@@ -118,88 +155,79 @@ def _queue_counts(status: dict) -> dict[str, int]:
 
 def status_view(status: dict, flow: dict, topic: str = '') -> str:
     if topic == 'context':
-        return '\n'.join([
-            '🧠 <b>Context</b>',
-            f"Estimated request: <b>{_number(status.get('estimated_request_tokens'))}</b> tokens",
-            f"Compaction: ceiling {_number(status.get('compact_trigger_tokens'))} → target {_number(status.get('compact_target_tokens'))}",
-            f"Idle: {_number(status.get('compact_idle_trigger_tokens'))} tokens · {_text(status.get('compact_idle_seconds'))} s",
-            f"Episode batch: {_number(status.get('compact_batch_tokens'))} tokens",
-            f"Recent raw preference: {_text(status.get('compact_keep_recent_ratio'))} per step; softer under pressure",
-            f"Recent messages: {_number(status.get('raw_messages'))} · summaries: {_number(status.get('memory_blocks'))}",
-            f"Summary layers: L0 {_number(status.get('l0_blocks'))} · L1 {_number(status.get('l1_blocks'))} · L2 {_number(status.get('l2_blocks'))}",
-            f"Images: {_number(status.get('estimated_request_images'))} · limit {_text(status.get('max_input_images'))} · target {_text(status.get('compact_target_images'))}",
-            'Compaction keeps originals searchable.',
-            '',
-            '/params context · /status full (file)',
-        ])
+        idle = status.get('compact_idle_trigger_tokens')
+        lines = [*_context_meter(status),
+            f"Compaction target: {_short_number(status.get('compact_target_tokens'))} tokens",
+            (f"Idle compaction: {_short_number(idle)} tokens after {_duration(status.get('compact_idle_seconds'))}"
+             if idle else 'Idle compaction: off'),
+            f"{_number(status.get('raw_messages'))} recent messages · {_number(status.get('memory_blocks'))} summaries"]
+        images, limit = status.get('estimated_request_images'), status.get('max_input_images')
+        if images or limit:
+            image_line = f'Images: {_number(images)}'
+            image_line += f' / {_number(limit)}' if limit else ' · no count limit'
+            target = status.get('compact_target_images')
+            if target and target != limit:
+                image_line += f' · target {_number(target)}'
+            lines.append(image_line)
+        lines.extend(['', '/params context · /status full'])
+        return '\n'.join(lines)
     if topic == 'memory':
-        semantic = 'semantic + text' if status.get('semantic_enabled') else 'text; semantic search not configured'
-        scope = status.get('scope') or {}
-        lines = [
-            '🗂 <b>Memory</b>',
-            f'Search: {semantic}',
-            f"Agent generation: {_code(scope.get('generation'))} · context: {_code(scope.get('context_id'))}",
-        ]
-        jobs = status.get('memory_jobs', [])
-        if jobs:
-            lines.append('<b>Background work</b>')
-            lines.extend(f"{_code(job['kind'])}: {_text(job['status'])} {_number(job['count'])}" for job in jobs)
-        else:
-            lines.append('No recorded background jobs.')
+        semantic = 'semantic + text' if status.get('semantic_enabled') else 'text only'
+        lines = ['<b>Memory</b>', f'Search: {semantic}']
+        jobs: dict[str, list[str]] = {}
+        for job in status.get('memory_jobs', []):
+            if job['status'] in {'done', 'stale'}:
+                continue
+            label = {'pending': 'queued'}.get(job['status'], job['status'])
+            jobs.setdefault(job['kind'], []).append(f"{_number(job['count'])} {_text(label)}")
+        names = {'memory_ingest': 'Indexing', 'memory_embed': 'Embeddings',
+                 'memory_profile': 'Profiles', 'memory_tail': 'Recent history',
+                 'embedding_batch': 'Embedding batches'}
+        lines.extend(_text(names.get(kind, kind)) + ': ' + ' · '.join(counts)
+                     for kind, counts in jobs.items())
+        if not jobs:
+            lines.append('Background queue: empty')
         if status.get('memory_last_error'):
-            lines.extend(['', '<b>Last worker error (all chats)</b>', _text(status['memory_last_error'])])
-        lines.extend(['', '/reset keeps searchable history and profiles.',
-                      '/reset_full makes prior generations audit-only.'])
+            lines.append('Last worker error (all chats): ' + _text(status['memory_last_error']))
+        lines.extend(['', '/status full · /help context'])
         return '\n'.join(lines)
     if topic == 'tools':
         remote = 'configured' if status.get('remote_enabled') else 'not configured'
-        if status.get('remote_enabled'):
-            remote += '; SSH master started' if status.get('remote_master_ready') else '; SSH master not started'
         lines = [
-            '🛠 <b>Tools</b>',
+            '<b>Tools</b>',
             f"Mode: {_code(status.get('mode'))} · tool-round limit: {_number(status.get('max_interaction_rounds'))}",
             f"Stickers: {_text(status.get('stickers'))} · {_number(status.get('sticker_index_count'))} in {_number(status.get('sticker_pack_count'))} packs",
-            f"Catalog: {'loaded' if status.get('sticker_index_loaded') else 'not loaded'}",
             f'Remote workspace: {remote}',
         ]
+        if not status.get('sticker_index_loaded'):
+            lines.append('Sticker catalog not loaded.')
         if 'available_tools' in status:
             lines.append('Available: ' + (', '.join(_code(name) for name in status['available_tools']) or 'none'))
         if status.get('native_web_search_supported'):
             lines.append(f"Provider web search: {_text(status.get('native_web_search'))}")
-        lines.extend(['', '/params tools · /help tools'])
+        lines.extend(['', '/params tools'])
         return '\n'.join(lines)
     if topic:
         return 'Choose /status context, /status memory, /status tools or /status full (file).'
 
-    activity = 'Replying' if flow.get('reply_running') else 'Receiving messages' if flow.get('ingest_inflight') else 'Idle'
+    activity = ('Compacting context' if flow.get('compacting') else 'Replying' if flow.get('reply_running')
+                else 'Receiving messages' if flow.get('ingest_inflight') else 'Idle')
+    lines = [f'<b>Chat status</b> · {activity}',
+        f"{_text(status.get('provider'))} · {_code(status.get('model'))}",
+        *_context_meter(status)]
     counts = _queue_counts(status)
     if counts.get('failed'):
-        memory = '⚠️ Memory needs attention · /status memory'
+        lines.append(f"Memory: {_number(counts['failed'])} failed jobs · /status memory")
     elif status.get('memory_last_error'):
-        memory = '⚠️ Worker reported an error · /status memory'
-    else:
-        queued = counts.get('pending', 0) + counts.get('running', 0)
-        memory = f"Memory: {'semantic + text' if status.get('semantic_enabled') else 'text search'}"
-        if queued:
-            memory += f' · {_number(queued)} jobs pending/running'
-    return '\n'.join([
-        f'📊 <b>Chat status</b> · {activity}',
-        f"{_text(status.get('provider'))} · {_code(status.get('model'))}",
-        f"Mode {_code(status.get('mode'))} · progress {_text(status.get('process'))}",
-        f"Context ≈ {_number(status.get('estimated_request_tokens'))} tokens · compaction trigger {_number(status.get('compact_trigger_tokens'))}",
-        f"Images {_number(status.get('estimated_request_images'))} · stickers {_text(status.get('stickers'))}",
-        memory,
-        f"Time zone: {_text(status.get('metadata_timezone'))}",
-        '',
-        '/status context · /status memory · /status tools',
-        '/params · /help',
-    ])
+        lines.append('Worker error · /status memory')
+    lines.extend(['', '/status context · /help'])
+    return '\n'.join(lines)
 
 
 def settings_view(status: dict, topic: str = '', can_change: bool = True) -> str:
     if topic not in GROUP_LABELS:
         lines = [
-            '⚙️ <b>Chat settings</b>',
+            '<b>Chat settings</b>',
             '/params model — model and generation',
             '/params context — compaction and images',
             '/params replies — timing and spontaneous replies',
@@ -208,13 +236,12 @@ def settings_view(status: dict, topic: str = '', can_change: bool = True) -> str
         ]
         if can_change:
             lines.extend([f"Inspect: {_code('/param <name>')}",
-                          f"Set: {_code('/param <name> <value>')}",
-                          f"Use configured default: {_code('/param <name> default')}"])
+                          f"Set/reset: {_code('/param <name> <value|default>')}"])
         else:
             lines.append('Only trusted users can change advanced settings.')
         lines.extend(['/params full — all values as a file', 'Settings apply to this entire chat.'])
         return '\n'.join(lines)
-    lines = [f'⚙️ <b>{GROUP_LABELS[topic]} settings</b>']
+    lines = [f'<b>{GROUP_LABELS[topic]} settings</b>']
     if topic == 'model':
         lines.extend([f"/provider — {_text(status.get('provider'))}",
                       f"/model — {_code(status.get('model'))}"])
@@ -225,7 +252,7 @@ def settings_view(status: dict, topic: str = '', can_change: bool = True) -> str
     for name, spec in PARAMETERS.items():
         key = spec.status_key or name
         if spec.group == topic and status.get(f'{key}_supported', True):
-            lines.append(f'{_code(name)} · {_value(status, name)}')
+            lines.append(f'{_code(name)} · {_value(status, name, compact=True)}')
     if can_change:
         lines.extend(['', f"Effective values. Details: {_code('/param <name>')}"])
     else:
@@ -239,7 +266,7 @@ def parameter_view(status: dict, name: str, usage: str | None, changed: bool = F
         return f'Unknown setting {_code(name)}. Use /params to find a setting.'
     spec = PARAMETERS[name]
     key = spec.status_key or name
-    lines = [f"{'✅' if changed else '⚙️'} <b>{spec.label}</b>",
+    lines = [f"<b>{spec.label}{' updated' if changed else ''}</b>",
              f'{_code(name)} · {_value(status, name)}',
              f'Source: {_source(status, name)}']
     if not status.get(f'{key}_supported', True):
@@ -251,23 +278,35 @@ def parameter_view(status: dict, name: str, usage: str | None, changed: bool = F
         lines.extend(['', _text(spec.explanation)])
         if usage:
             lines.extend(['', _code('/param ' + usage)])
-        lines.append(f"Use configured default: {_code('/param ' + name + ' default')}")
     return '\n'.join(lines)
 
 
 def compaction_result(result: dict[str, int]) -> str:
     remaining, target = result['estimated_request_tokens'], result['target_tokens']
-    title = '✅ Context ready' if remaining <= target else '⏸ Target not reached'
+    title = 'Context ready' if remaining <= target else 'Target not reached'
     lines = [f'<b>{title}</b>', f'Estimated request: {_number(remaining)} / {_number(target)} tokens']
     if remaining > target:
         lines.append('/params context — inspect compaction limits')
     return '\n'.join(lines)
 
 
+def rollback_result(hidden: int, previews: list[tuple[str, str]]) -> str:
+    lines = [f'Rollback complete. {hidden} message(s) hidden from context.']
+    for role, text in previews:
+        # Preserve the selected previews; each excerpt is one short line.
+        text = ' '.join(text.split())
+        if len(text) > 40:
+            text = text[:39] + '…'
+        lines.append(f'- {_text(role)}: {_text(text)}')
+    if hidden > len(previews):
+        lines.append(f'… {hidden - len(previews)} earlier message(s)')
+    return '\n'.join(lines)
+
+
 def help_view(topic: str = '') -> str:
     if topic == 'model':
         return '\n'.join([
-            '🤖 <b>Model and prompt</b>',
+            '<b>Model and prompt</b>',
             '/provider — show configured providers; select one by name',
             f"{_code('/model <name>')} — use an exact model name",
             '/model default — use the configured model for this provider',
@@ -275,12 +314,12 @@ def help_view(topic: str = '') -> str:
             '/presets — list prompt presets',
             f"{_code('/preset <name> [augment|exact]')} — apply a preset",
             'augment keeps the preset plus framework guidance; exact uses the preset alone.',
-            '/preset clear — clear the preset',
+            '/preset clear — restore the configured prompt',
             '/prompt — inspect prompt controls',
         ])
     if topic == 'replies':
         return '\n'.join([
-            '💬 <b>Replies</b>',
+            '<b>Replies</b>',
             f"{_code('/mode chat|assist|agent')}",
             'chat keeps memory/profile tools; assist and agent enable other tools and use their configured round defaults.',
             f"{_code('/process off|minimal|status|verbose|full')}",
@@ -291,7 +330,7 @@ def help_view(topic: str = '') -> str:
         ])
     if topic == 'context':
         return '\n'.join([
-            '🧠 <b>History and memory</b>',
+            '<b>History and memory</b>',
             '/status context — context size and compaction',
             '/status memory — searchable memory and background work',
             '/params context — compaction and image settings',
@@ -304,7 +343,7 @@ def help_view(topic: str = '') -> str:
         ])
     if topic == 'tools':
         return '\n'.join([
-            '🛠 <b>Tools</b>',
+            '<b>Tools</b>',
             f"{_code('/stickers off|auto')} — allow automatic sticker selection",
             '/mode — choose chat, assist or agent',
             '/status tools — current catalog and workspace configuration',
@@ -312,7 +351,7 @@ def help_view(topic: str = '') -> str:
             'Remote file and document tools need a configured SSH workspace.',
         ])
     return '\n'.join([
-        '💬 <b>Commands</b>',
+        '<b>Commands</b>',
         '/status — this chat at a glance',
         '/params — inspect or change settings',
         '/help replies — reply modes, progress and delivery',
