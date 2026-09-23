@@ -113,6 +113,13 @@ Resume with the reported revision ID, original source directory and semantic
 settings. Output allowance, transport timeout, concurrency and service tier can change on resume.
 Successful annotation and embedding channels are checkpointed independently.
 
+The importer shows progress for current work and counts reused entries separately.
+Incomplete or invalid annotations and transient request failures get one additional
+attempt after 10 seconds; configure `STICKER_BUILD_RETRY_COUNT` and
+`STICKER_BUILD_RETRY_DELAY_S` to change this. Embeddings keep their own retry settings.
+Progress goes to stderr; stdout retains revision/result JSON. Reported usage from
+failed annotation attempts remains in the asset's provenance.
+
 Annotation uses `STICKER_BUILD_PROVIDER`, `STICKER_BUILD_MODEL` and
 `STICKER_BUILD_SERVICE_TIER`. The configurable default is Gemini Flash with Flex;
 blank or `off` selects the provider's normal tier. Capacity failures remain visible,

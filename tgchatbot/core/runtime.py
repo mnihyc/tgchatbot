@@ -12,8 +12,6 @@ from dataclasses import replace
 from contextvars import ContextVar
 from typing import Any
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
-import httpx
 from psycopg.errors import QueryCanceled
 
 from tgchatbot.config import AppConfig
@@ -50,6 +48,7 @@ from tgchatbot.domain.identities import (actor_reference, canonical_actor_id, ac
                                         latest_actor_observations, format_actor_labels)
 from tgchatbot.domain.attachments import attachment_description
 from tgchatbot.providers.base import ModelProvider, ProviderOutcomeError, RequestTokenEstimate
+from tgchatbot.providers.retry import transient_retry_delay
 from tgchatbot.settings_schema import (
     COMPACT_KEEP_RECENT_RATIO_MAX,
     COMPACT_KEEP_RECENT_RATIO_MIN,
@@ -1175,29 +1174,6 @@ class AgentRuntime:
         payload_text = self._compact_json(payload)
         return f'[Tool event {name}: {payload_text}]'
 
-    @staticmethod
-    def _compaction_retry_delay(exc: Exception, delay: float) -> float | None:
-        if isinstance(exc, httpx.TransportError):
-            return delay
-        if not isinstance(exc, httpx.HTTPStatusError):
-            return None
-        response = exc.response
-        if response.status_code != 429 and not 500 <= response.status_code <= 599:
-            return None
-        retry_after = response.headers.get('retry-after', '').strip()
-        if retry_after:
-            try:
-                seconds = float(retry_after)
-            except ValueError:
-                try:
-                    when = parsedate_to_datetime(retry_after)
-                    seconds = (when - datetime.now(timezone.utc)).total_seconds()
-                except (ValueError, TypeError, OverflowError):
-                    seconds = 0
-            if math.isfinite(seconds):
-                delay = max(delay, seconds)
-        return delay
-
     async def _generate_with_retries(self, *, provider, settings: SessionSettings, messages: list[ConversationMessage], instructions: str, tools, extra_input_items, compaction: bool = False, **request_options):
         retries = self.config.context.compact_retry_count if compaction else self._effective_provider_retry_count(settings)
         last_exc = None
@@ -1213,7 +1189,7 @@ class AgentRuntime:
                         exc.reason, self._usage_log_text(exc.usage))
                 if attempt >= retries:
                     raise
-                delay = self._compaction_retry_delay(exc, self.config.context.compact_retry_delay_s) if compaction else 0
+                delay = transient_retry_delay(exc, self.config.context.compact_retry_delay_s) if compaction else 0
                 if delay is None:
                     raise
                 logger.warning('provider.retry provider=%s model=%s attempt=%s/%s err=%s', settings.provider, settings.model, attempt + 1, retries + 1, exc.__class__.__name__)

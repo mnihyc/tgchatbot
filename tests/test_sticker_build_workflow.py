@@ -1,7 +1,10 @@
 """Catalog publication and maintenance with original files, real PG and mock models."""
 from __future__ import annotations
 import copy
+import asyncio
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
+import io
 import json
 import hashlib
 import os
@@ -13,17 +16,19 @@ from unittest.mock import AsyncMock, patch
 import uuid
 
 import numpy as np
+import httpx
 from PIL import Image
 from psycopg import AsyncConnection, sql
 
-from tgchatbot.domain.models import ProviderResponse
+from tgchatbot.domain.models import ProviderResponse, UsageInfo
 from tgchatbot.config import ChatCompletionsConfig
-from tgchatbot.providers.base import ProviderCapabilities
+from tgchatbot.providers.base import ProviderCapabilities, ProviderOutcomeError
 from tgchatbot.providers.chat_completions import ChatCompletionsProvider
 from tgchatbot.storage.postgres_store import DatabaseConfig, PostgresStore
 from tgchatbot.storage.sticker_catalog import StickerCatalogStore, CatalogConflict
 from tgchatbot.storage.sticker_delivery import StickerDeliveryStore
 from tgchatbot.stickers.build import CatalogBuilder, BuildConfig
+from tgchatbot.stickers import build as build_cli
 from tgchatbot.stickers.catalog import StickerCatalog
 from tgchatbot.stickers.media import MediaConfig, PreparedMedia, content_hash, prepare_media
 from tgchatbot.stickers.plan import StickerRetrievalPlan
@@ -381,6 +386,147 @@ class StickerBuildWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.active)
         self.assertEqual(len(self.provider.calls), 2)
         self.assertEqual(len([call for call in self.embeddings.calls if not call[0].media]), 2)
+
+    async def test_incomplete_or_invalid_annotations_retry_without_rebuying_ready_assets(self):
+        self.picture('pack/existing.png', 'red')
+        await self.builder.build(self.root)
+        usage = UsageInfo(input_tokens=100, output_tokens=20, total_tokens=120)
+        outcomes = [ProviderOutcomeError('gemini', 'finish reason: PROHIBITED_CONTENT', usage),
+                    ProviderOutcomeError('gemini', 'finish reason: MAX_TOKENS', usage),
+                    ProviderResponse(final_text='{', usage=usage),
+                    ProviderResponse(final_text=json.dumps({'caption': 'Incomplete card'}), usage=usage)]
+        for index, outcome in enumerate(outcomes):
+            with self.subTest(outcome=index):
+                asset_id = self.picture(f'pack/new-{index}.png', (index, 90, 180))
+                self.provider.generate = AsyncMock(side_effect=[outcome, ProviderResponse(final_text=json.dumps(CARD))])
+                events = []
+                builder = CatalogBuilder(self.catalog, self.provider, self.embeddings,
+                    config=replace(BuildConfig(), retry_delay_s=0), on_progress=events.append)
+                result = await builder.build(self.root)
+                self.assertTrue(result.active)
+                self.assertEqual(result.completed, 1)
+                self.assertEqual(self.provider.generate.await_count, 2)
+                card = await self.catalog.get_asset(asset_id)
+                self.assertEqual(card.generated_card, CARD)
+                self.assertEqual(card.provenance['annotation_failures'][0]['usage']['total_tokens'], 120)
+                start = next(event for event in events if event['event'] == 'start')
+                self.assertEqual((start['total'], start['reused']), (1, index + 1))
+                retry = next(event for event in events if event['event'] == 'retry')
+                self.assertEqual((retry['attempt'], retry['attempts'], retry['completed']), (2, 2, 0))
+                self.assertEqual((events[-1]['event'], events[-1]['completed'], events[-1]['failed']), ('published', 1, 0))
+                first, second = [call.kwargs for call in self.provider.generate.await_args_list]
+                self.assertEqual(first, second)  # Retry the same request, prompt and tier.
+
+    async def test_exhausted_annotation_retries_keep_work_for_resume_and_usage_auditable(self):
+        self.picture('pack/existing.png', 'red')
+        active = await self.builder.build(self.root)
+        asset_id = self.picture('pack/new.png', 'blue')
+        failure = ProviderOutcomeError('gemini', 'finish reason: MAX_TOKENS', UsageInfo(total_tokens=140))
+        self.provider.generate = AsyncMock(side_effect=failure)
+        events = []
+        builder = CatalogBuilder(self.catalog, self.provider, self.embeddings,
+            config=replace(BuildConfig(), retry_delay_s=0), on_progress=events.append)
+        before_embeddings = len(self.embeddings.calls)
+        result = await builder.build(self.root)
+        self.assertFalse(result.active)
+        self.assertEqual(self.provider.generate.await_count, 2)
+        self.assertEqual(len(self.embeddings.calls), before_embeddings)
+        self.assertEqual(await self.catalog.active_revision_id(), active.revision_id)
+        failed = await self.catalog.get_asset(asset_id, result.revision_id)
+        self.assertEqual(failed.state, 'failed')
+        self.assertIsNone(failed.generated_card)
+        self.assertEqual([entry['usage']['total_tokens'] for entry in failed.provenance['annotation_failures']], [140, 140])
+        self.assertEqual((events[-1]['event'], events[-1]['completed'], events[-1]['failed']), ('incomplete', 0, 1))
+        self.provider.generate = AsyncMock(return_value=ProviderResponse(final_text=json.dumps(CARD)))
+        resumed = await builder.build(self.root, resume=result.revision_id)
+        self.assertTrue(resumed.active)
+        self.assertEqual(self.provider.generate.await_count, 1)
+        saved = await self.catalog.get_asset(asset_id)
+        self.assertEqual(len(saved.provenance['annotation_failures']), 2)
+
+    async def test_transport_retries_do_not_retry_credential_errors_or_wrap_embeddings(self):
+        for index, (status, expected_calls, active) in enumerate(((503, 2, True), (401, 1, False))):
+            with self.subTest(status=status):
+                self.picture(f'pack/http-{index}.png', (index, 70, 160))
+                response = httpx.Response(status, request=httpx.Request('POST', 'https://fixture.invalid/generate'))
+                failure = httpx.HTTPStatusError('Synthetic provider response', request=response.request, response=response)
+                self.provider.generate = AsyncMock(side_effect=[failure, ProviderResponse(final_text=json.dumps(CARD))])
+                builder = CatalogBuilder(self.catalog, self.provider, self.embeddings,
+                    config=replace(BuildConfig(), retry_delay_s=0))
+                result = await builder.build(self.root)
+                self.assertEqual(result.active, active)
+                self.assertEqual(self.provider.generate.await_count, expected_calls)
+        # Embedding transport already owns its retries. Do not regenerate or add
+        # another outer retry when that independent channel reports failure.
+        self.provider.generate = AsyncMock(return_value=ProviderResponse(final_text=json.dumps(CARD)))
+        self.embeddings.fail_images = True
+        before = len(self.embeddings.calls)
+        failed = await builder.build(self.root, resume=result.revision_id)
+        self.assertFalse(failed.active)
+        self.assertEqual(self.provider.generate.await_count, 1)
+        self.assertEqual(len(self.embeddings.calls) - before, 2)  # Meaning once, then image once.
+        staged = await self.catalog.get_asset(failed.failed[0]['asset_id'], failed.revision_id)
+        self.assertIsNotNone(staged.generated_card)
+        self.assertIsNotNone(staged.reading_vectors)
+
+    async def test_concurrent_annotation_retry_counts_each_sticker_once(self):
+        for index, color in enumerate(('red', 'green', 'blue', 'yellow')):
+            self.picture(f'pack/parallel-{index}.png', color)
+        overlap = asyncio.Event()
+        attempts, active, maximum, retry_key = {}, 0, 0, None
+        async def generate(**kwargs):
+            nonlocal active, maximum, retry_key
+            key = kwargs['messages'][0].parts[1].data_b64
+            if retry_key is None:
+                retry_key = key
+            attempts[key] = attempts.get(key, 0) + 1
+            active += 1
+            maximum = max(maximum, active)
+            if active == 2:
+                overlap.set()
+            try:
+                await asyncio.wait_for(overlap.wait(), 5)
+                if key == retry_key and attempts[key] == 1:
+                    raise ProviderOutcomeError('gemini', 'finish reason: MAX_TOKENS', UsageInfo(total_tokens=100))
+                return ProviderResponse(final_text=json.dumps(CARD))
+            finally:
+                active -= 1
+        self.provider.generate = generate
+        events = []
+        builder = CatalogBuilder(self.catalog, self.provider, self.embeddings,
+            config=replace(BuildConfig(), concurrency=2, retry_delay_s=0), on_progress=events.append)
+        result = await builder.build(self.root)
+        self.assertTrue(result.active)
+        self.assertEqual((result.completed, sorted(attempts.values()), maximum), (4, [1, 1, 1, 2], 2))
+        finished = [event['completed'] for event in events if 'completed' in event]
+        self.assertEqual(finished, sorted(finished))
+        self.assertEqual((events[-1]['total'], events[-1]['completed'], events[-1]['failed']), (4, 4, 0))
+
+    async def test_import_cli_reports_progress_and_retry_without_polluting_json_results(self):
+        self.picture('pack/existing.png', 'red')
+        await self.builder.build(self.root)
+        self.picture('pack/new.png', 'blue')
+        self.provider.generate = AsyncMock(side_effect=[
+            ProviderOutcomeError('gemini', 'finish reason: MAX_TOKENS', UsageInfo(total_tokens=100)),
+            ProviderResponse(final_text=json.dumps(CARD))])
+        self.provider.aclose, self.embeddings.aclose = AsyncMock(), AsyncMock()
+        output, progress = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, {'APP_DATA_DIR': str(self.root), 'DATABASE_URL': self.dsn, 'DEFAULT_PROVIDER': 'gemini',
+                'STICKER_BUILD_RETRY_DELAY_S': '0'}, clear=True), \
+             patch.object(build_cli, 'load_dotenv'), \
+             patch.object(build_cli, 'PostgresStore', return_value=self.store), \
+             patch.object(build_cli, 'build_provider', return_value=self.provider), \
+             patch.object(build_cli, 'EmbeddingClient', return_value=self.embeddings), \
+             redirect_stdout(output), redirect_stderr(progress):
+            result = await build_cli.run(build_cli.parse_args(['--source', str(self.root)]))
+        self.assertEqual(result, 0)
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(len(records), 2)
+        self.assertIn('staging_revision', records[0])
+        self.assertTrue(records[1]['active'])
+        self.assertEqual(records[1]['completed'], 1)
+        for text in ('Scanning sticker files', '0/1 finished', 'retry 2/2', '1/1 finished', '1 reused', 'published'):
+            self.assertIn(text, progress.getvalue())
 
     async def test_selected_regeneration_preserves_deliberate_corrections_and_other_assets(self):
         target = self.picture('pack/one.png', 'red')

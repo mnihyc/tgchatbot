@@ -5,17 +5,23 @@ import argparse
 import asyncio
 from dataclasses import asdict, dataclass, replace
 import json
+import math
 import os
 from pathlib import Path
+import sys
 
+import httpx
 import numpy as np
 from dotenv import load_dotenv
+from pydantic import ValidationError
 
 from tgchatbot.config import load_config
 from tgchatbot.domain.models import ConversationMessage, MessagePart, MessageRole, PartKind, SessionSettings
 from tgchatbot.embeddings import EmbeddingClient, EmbeddingDocument, EmbeddingMedia, sticker_embedding_config
 from tgchatbot.operational import from_env
 from tgchatbot.providers.factory import build_provider
+from tgchatbot.providers.base import ProviderOutcomeError
+from tgchatbot.providers.retry import transient_retry_delay
 from tgchatbot.storage.postgres_store import PostgresStore
 from tgchatbot.storage.sticker_catalog import CatalogAlias, CatalogAsset, CatalogConflict, StickerCatalogStore
 from tgchatbot.stickers.cards import CARD_PROMPT, CARD_RECIPE, CARD_SCHEMA, appearance_text, card_hash, effective_card, reading_texts, validate_card, validate_corrections
@@ -29,12 +35,16 @@ class BuildConfig:
     service_tier: str = 'flex'
     request_timeout_s: float = 600.0
     max_output_tokens: int = 16384
+    retry_count: int = 1
+    retry_delay_s: float = 10.0
     concurrency: int = 1
     image_embeddings: bool = True
 
     def __post_init__(self):
         if self.concurrency < 1 or self.max_output_tokens < 1 or self.request_timeout_s <= 0:
             raise ValueError('Build concurrency, output allowance and timeout must be positive')
+        if self.retry_count < 0 or not math.isfinite(self.retry_delay_s) or self.retry_delay_s < 0:
+            raise ValueError('Build retry count and delay must be nonnegative')
 
     @classmethod
     def from_env(cls, env=None):
@@ -57,9 +67,11 @@ class BuildResult:
 
 class CatalogBuilder:
     def __init__(self, store: StickerCatalogStore, provider, embeddings, *, settings: SessionSettings | None = None,
-                 config: BuildConfig | None = None, media_config: MediaConfig | None = None, on_revision=None):
+                 config: BuildConfig | None = None, media_config: MediaConfig | None = None,
+                 on_revision=None, on_progress=None):
         self.store, self.provider, self.embeddings = store, provider, embeddings
         self.on_revision = on_revision
+        self.on_progress = on_progress
         self.config, self.media_config = config or BuildConfig.from_env(), media_config or MediaConfig.from_env()
         self.settings = replace(settings or SessionSettings(), provider=self.config.provider, model=self.config.model,
             service_tier=self.config.service_tier or None, max_output_tokens=self.config.max_output_tokens,
@@ -97,6 +109,8 @@ class CatalogBuilder:
     async def build(self, source_root: Path | str, *, regenerate_ids=(), regenerate_packs=(), regenerate_files=(), corrections=None,
                     resume: str | None = None, prune_missing: bool = False) -> BuildResult:
         root = Path(source_root).resolve()
+        if self.on_progress:
+            self.on_progress({'event': 'scan'})
         corrections = corrections or {}
         source_files = [path for path in sorted(root.rglob('*')) if path.is_file()]
         unsupported = tuple(path.relative_to(root).as_posix() for path in source_files
@@ -165,6 +179,7 @@ class CatalogBuilder:
                 provenance = dict(old.provenance) if old else {}
                 if regenerate:
                     provenance.pop('annotation', None)
+                    provenance.pop('annotation_failures', None)
                 same_space = old is not None and old.provenance.get('embedding_space_id') == self.embeddings.space_id
                 if card is not None:
                     provenance['effective_card_hash'] = card_hash(card)
@@ -200,25 +215,37 @@ class CatalogBuilder:
         failures, completed = [], 0
         async with self.store.build_lease(revision_id):
             snapshot = await self.store.load_snapshot(revision_id)
+            work = [asset for asset in snapshot.assets if asset.state != 'ready']
+            reused = len(snapshot.assets) - len(work)
+            def progress(event='progress', **details):
+                if self.on_progress:
+                    self.on_progress({'event': event, 'completed': completed, 'failed': len(failures),
+                                      'total': len(work), 'reused': reused, **details})
+            progress('start')
             semaphore = asyncio.Semaphore(self.config.concurrency)
             async def process(asset):
                 nonlocal completed
-                if asset.state == 'ready':
-                    return
                 async with semaphore:
                     try:
-                        await self._process(revision_id, root, asset)
+                        await self._process(revision_id, root, asset,
+                            on_retry=lambda **details: progress('retry',
+                                file=asset.aliases[0].path if asset.aliases else asset.asset_id, **details))
                         completed += 1
                     except Exception as exc:
                         latest = await self.store.get_asset(asset.asset_id, revision_id)
                         await self._save(revision_id, latest, state='failed', error=f'{type(exc).__name__}: {exc}')
                         failures.append({'asset_id': asset.asset_id, 'error': f'{type(exc).__name__}: {exc}'})
-            await asyncio.gather(*(process(asset) for asset in snapshot.assets))
+                        progress('failed', file=asset.aliases[0].path if asset.aliases else asset.asset_id,
+                                 error=f'{type(exc).__name__}: {exc}')
+                        return
+                    progress()
+            await asyncio.gather(*(process(asset) for asset in work))
             if not failures:
                 await self.store.activate(revision_id)
+            progress('published' if not failures else 'incomplete')
         return BuildResult(revision_id, not failures, completed, tuple(failures), unsupported)
 
-    async def _process(self, revision_id, root, asset):
+    async def _process(self, revision_id, root, asset, *, on_retry=None):
         if asset.generated_card is None and not self.provider.capabilities.multimodal_input:
             raise ValueError('Sticker annotation requires a provider with image input')
         prepared = None
@@ -238,10 +265,34 @@ class CatalogBuilder:
         if asset.generated_card is None:
             parts = [MessagePart(PartKind.TEXT, text='Observed media facts: ' + json.dumps(prepared.facts, ensure_ascii=False))]
             parts.extend(MessagePart(PartKind.IMAGE, mime_type=frame.mime_type, data_b64=frame.data_b64) for frame in prepared.frames)
-            response = await self.provider.generate(settings=self.settings,
-                messages=[ConversationMessage(MessageRole.USER, parts)], instructions=CARD_PROMPT,
-                tools=[], response_schema=CARD_SCHEMA, response_schema_name='sticker_card')
-            generated = validate_card(json.loads(response.final_text))
+            for attempt in range(self.config.retry_count + 1):
+                response = None
+                try:
+                    response = await self.provider.generate(settings=self.settings,
+                        messages=[ConversationMessage(MessageRole.USER, parts)], instructions=CARD_PROMPT,
+                        tools=[], response_schema=CARD_SCHEMA, response_schema_name='sticker_card')
+                    generated = validate_card(json.loads(response.final_text))
+                    break
+                except (ProviderOutcomeError, httpx.HTTPError, json.JSONDecodeError, ValidationError) as exc:
+                    delay = (self.config.retry_delay_s
+                        if isinstance(exc, (ProviderOutcomeError, json.JSONDecodeError, ValidationError))
+                        else transient_retry_delay(exc, self.config.retry_delay_s))
+                    usage = exc.usage if isinstance(exc, ProviderOutcomeError) else (response.usage if response else None)
+                    error = f'{type(exc).__name__}: {exc}'
+                    # Failed attempts can incur usage too. Keep it with the saved
+                    # asset, including when retries or a later resume succeed.
+                    provenance['annotation_failures'] = [*provenance.get('annotation_failures', []), {
+                        'provider': self.config.provider, 'model': self.config.model,
+                        'service_tier_requested': self.config.service_tier,
+                        'max_output_tokens': self.settings.max_output_tokens,
+                        'error': error, 'usage': asdict(usage) if usage else None}]
+                    await self._save(revision_id, asset, provenance=provenance, state='pending', error=error)
+                    if delay is None or attempt >= self.config.retry_count:
+                        raise
+                    if on_retry:
+                        on_retry(attempt=attempt + 2, attempts=self.config.retry_count + 1,
+                                 delay_s=delay, error=error)
+                    await asyncio.sleep(delay)
             provenance['annotation'] = {'provider': self.config.provider, 'model': self.config.model,
                 'service_tier_requested': self.config.service_tier, 'recipe': CARD_RECIPE,
                 'max_output_tokens': self.settings.max_output_tokens,
@@ -290,6 +341,29 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
+def print_progress(event):
+    if event['event'] == 'scan':
+        text = 'Scanning sticker files...'
+    else:
+        done, total = event['completed'] + event['failed'], event['total']
+        percent = 100 * done // total if total else 100
+        text = (f"Stickers: {done}/{total} finished ({percent}%) | "
+                f"{event['completed']} ready, {event['failed']} failed | {event['reused']} reused")
+        if event['event'] == 'retry':
+            text += (f" | retry {event['attempt']}/{event['attempts']} in {event['delay_s']:g}s: "
+                     f"{event['file']} — {event['error']}")
+        elif event['event'] == 'failed':
+            text += f" | {event['file']} — {event['error']}"
+        elif event['event'] == 'published':
+            text += ' | published'
+        elif event['event'] == 'incomplete':
+            text += ' | incomplete; saved work can be resumed'
+    try:
+        print(' '.join(text.splitlines()), file=sys.stderr, flush=True)
+    except OSError:
+        pass  # A closed progress stream must not discard paid work.
+
+
 async def run(args):
     load_dotenv(Path.cwd() / '.env')
     config, build_config = load_config(require_telegram=False), BuildConfig.from_env()
@@ -309,7 +383,8 @@ async def run(args):
         await catalog.initialize()
         corrections = json.loads(args.corrections.read_text()) if args.corrections else None
         builder = CatalogBuilder(catalog, provider, embeddings, settings=config.default_session_settings(), config=build_config,
-            on_revision=lambda identity: print(json.dumps({'staging_revision': identity}), flush=True))
+            on_revision=lambda identity: print(json.dumps({'staging_revision': identity}), flush=True),
+            on_progress=print_progress)
         result = await builder.build(args.source or config.sticker_dir, regenerate_ids=args.asset_id,
             regenerate_packs=args.pack, regenerate_files=args.file, corrections=corrections, resume=args.resume,
             prune_missing=args.prune_missing)

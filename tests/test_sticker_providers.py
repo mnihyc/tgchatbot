@@ -91,7 +91,8 @@ class StickerProviderWorkflows(unittest.IsolatedAsyncioTestCase):
             requests_per_minute=1e12, max_retries=0), http_client=http)
         store = Mock(stage_asset=AsyncMock())
         builder = CatalogBuilder(store, generation, embeddings, config=BuildConfig(provider=generation_backend,
-            model=app_config.default_model_for_provider(generation_backend), image_embeddings=image_embeddings), media_config=MediaConfig(max_frames=2))
+            model=app_config.default_model_for_provider(generation_backend), image_embeddings=image_embeddings,
+            retry_count=0), media_config=MediaConfig(max_frames=2))
         if completed:
             await builder._process('new-staging-revision', root, asset)
         else:
@@ -106,7 +107,8 @@ class StickerProviderWorkflows(unittest.IsolatedAsyncioTestCase):
                 requests, vectors, stages, _ = await self.run_build_asset('gemini', provider, completed=False)
                 self.assertEqual(len(requests), 1)
                 self.assertEqual(vectors, [])
-                self.assertEqual(stages, [])
+                self.assertTrue(all(stage.kwargs['generated_card'] is None for stage in stages))
+                self.assertEqual(stages[-1].kwargs['provenance']['annotation_failures'][0]['usage']['total_tokens'], 100)
 
     async def test_annotation_and_image_embedding_share_prepared_pixels_without_a_second_annotation_call(self):
         requests, vectors, stages, recipe = await self.run_build_asset('gemini')
