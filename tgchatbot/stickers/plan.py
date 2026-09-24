@@ -35,12 +35,12 @@ def _norm_mapping(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
 
-def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+def _bounded_int(value: Any, *, default: int | None, minimum: int, maximum: int) -> int | None:
     try:
         parsed = int(value)
     except Exception:
         parsed = default
-    return max(minimum, min(maximum, parsed))
+    return max(minimum, min(maximum, parsed)) if parsed is not None else None
 
 
 def _norm_bool(value: Any, *, default: bool) -> bool:
@@ -138,22 +138,6 @@ class TextConstraints:
             'text_priority': self.text_priority,
             'must_include': list(self.must_include),
             'avoid_text_meanings': list(self.avoid_text_meanings),
-        }
-
-
-@dataclass(slots=True)
-class IntensityLimits:
-    max_harshness: int = 4
-    max_intimacy: int = 4
-    max_meme_dependence: int = 4
-    allow_animation: bool = True
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            'max_harshness': self.max_harshness,
-            'max_intimacy': self.max_intimacy,
-            'max_meme_dependence': self.max_meme_dependence,
-            'allow_animation': self.allow_animation,
         }
 
 
@@ -298,7 +282,8 @@ class StickerRetrievalPlan:
     visual_focus: VisualFocus = field(default_factory=VisualFocus)
     style_focus: StyleFocus = field(default_factory=StyleFocus)
     text_constraints: TextConstraints = field(default_factory=TextConstraints)
-    intensity_limits: IntensityLimits = field(default_factory=IntensityLimits)
+    intensity_preference: dict[str, int] = field(default_factory=dict)
+    allow_animation: bool = True
     forbid: list[str] = field(default_factory=list)
     candidate_budget: int = 5
     preferred_character_family: str = ''
@@ -334,13 +319,6 @@ class StickerRetrievalPlan:
         visual_source = _norm_mapping(_first_present(advanced.get('visual_focus'), data.get('visual_focus')))
         style_source = _norm_mapping(_first_present(advanced.get('style_focus'), data.get('style_focus')))
         text_source = _norm_mapping(_first_present(advanced.get('text_constraints'), data.get('text_constraints')))
-        intensity_sources = [_norm_mapping(source) for source in (
-            advanced.get('intensity_limits'), advanced.get('safety_limits'),
-            data.get('intensity_limits'), data.get('safety_limits'))]
-
-        def intensity_value(name, default):
-            return _first_present(*(source.get(name) for source in intensity_sources), data.get(name), default)
-
         legacy_text_priority = _norm_text(data.get('text_priority', '')).lower()
         legacy_style_policy = _norm_text(data.get('style_policy', '')).lower()
 
@@ -383,12 +361,9 @@ class StickerRetrievalPlan:
             must_include=must_include,
             avoid_text_meanings=avoid_text_meanings,
         )
-        intensity_limits = IntensityLimits(
-            max_harshness=_bounded_int(intensity_value('max_harshness', 4), default=4, minimum=0, maximum=4),
-            max_intimacy=_bounded_int(intensity_value('max_intimacy', 4), default=4, minimum=0, maximum=4),
-            max_meme_dependence=_bounded_int(intensity_value('max_meme_dependence', 4), default=4, minimum=0, maximum=4),
-            allow_animation=_norm_bool(intensity_value('allow_animation', True), default=True),
-        )
+        preference_source = _norm_mapping(data.get('intensity_preference'))
+        intensity_preference = {axis: value for axis in ('harshness', 'intimacy', 'meme_dependence')
+            if (value := _bounded_int(preference_source.get(axis), default=None, minimum=0, maximum=4)) is not None}
         persona = StickerPersona(
             visual_identity=PersonaVisualIdentity(
                 character_archetype=_norm_text(persona_visual_source.get('character_archetype')),
@@ -423,7 +398,8 @@ class StickerRetrievalPlan:
             visual_focus=visual_focus,
             style_focus=style_focus,
             text_constraints=text_constraints,
-            intensity_limits=intensity_limits,
+            intensity_preference=intensity_preference,
+            allow_animation=_norm_bool(data.get('allow_animation'), default=True),
             forbid=forbid,
             candidate_budget=_bounded_int(data.get('candidate_budget'), default=config.candidate_count, minimum=1, maximum=config.max_candidates),
             preferred_character_family=_norm_text(data.get('preferred_character_family')),
@@ -455,22 +431,6 @@ class StickerRetrievalPlan:
     @property
     def text_priority(self) -> str:
         return self.text_constraints.text_priority
-
-    @property
-    def max_harshness(self) -> int:
-        return self.intensity_limits.max_harshness
-
-    @property
-    def max_intimacy(self) -> int:
-        return self.intensity_limits.max_intimacy
-
-    @property
-    def max_meme_dependence(self) -> int:
-        return self.intensity_limits.max_meme_dependence
-
-    @property
-    def allow_animation(self) -> bool:
-        return self.intensity_limits.allow_animation
 
     @property
     def style_goal(self) -> str:

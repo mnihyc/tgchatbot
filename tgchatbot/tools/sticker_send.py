@@ -91,16 +91,6 @@ def _advanced_schema() -> dict[str, Any]:
                 },
                 'additionalProperties': False,
             },
-            'intensity_limits': {
-                'type': 'object',
-                'description': 'Limits; all intensity levels and animations are eligible by default.',
-                'properties': {
-                    'max_harshness': _param('integer', 'Maximum tolerated harshness on a 0-4 scale.', minimum=0, maximum=4, default=4),
-                    'max_intimacy': _param('integer', 'Maximum tolerated intimacy on a 0-4 scale.', minimum=0, maximum=4, default=4),
-                    'max_meme_dependence': _param('integer', 'Maximum tolerated meme dependence on a 0-4 scale.', minimum=0, maximum=4, default=4),
-                },
-                'additionalProperties': False,
-            },
             'require_caption': _param('boolean', 'Require a nonempty captured caption; caption_meaning supplies optional meaning hints.', default=False),
         },
         'additionalProperties': False,
@@ -178,6 +168,16 @@ class StickerQueryTool:
                     'intent_core': _param('string', 'Intended message to the recipient, including direction: offer comfort, request a hug, accept blame or hand it back. Use the exchange, not copied identities or profiles. A known sticker_id instead inspects that exact sticker.'),
                     'secondary_goals': _param('array', 'Extra nuances that materially refine the reaction.', items={'type': 'string'}),
                     'reaction_tone': _param('string', 'Reaction tone, for example dry amused, warm, irritated, bashful, or smug.'),
+                    'intensity_preference': {
+                        'type': 'object',
+                        'description': 'Prefer levels near each supplied target (0–4) for this query; other levels remain eligible. Omitted or null axes have no preference.',
+                        'properties': {
+                            'harshness': _param('integer', 'Sharpness: 0 has no harshness; 4 is very cutting.', minimum=0, maximum=4),
+                            'intimacy': _param('integer', 'Assumed relationship closeness: 0 assumes none; 4 assumes a very close relationship.', minimum=0, maximum=4),
+                            'meme_dependence': _param('integer', 'Reliance on meme/slang knowledge: 0 is self-explanatory; 4 relies heavily on it.', minimum=0, maximum=4),
+                        },
+                        'additionalProperties': False,
+                    },
                     'social_intent': _param('string', 'Social intent, for example reassure, lightly tease, acknowledge, celebrate, or dismiss.'),
                     'expression_cue': _param('string', 'Face or pose cue, e.g. side-eye, blank stare, pout, or tiny shrug.'),
                     'caption_meaning': _param('string', 'Caption or overlay meaning hint when visible text matters.'),
@@ -225,8 +225,9 @@ class StickerQueryTool:
             scope = {key: value for key, value in {
                 'retrieval': retrieval, 'required_pack': plan.required_pack,
                 'required_character_family': plan.required_character_family,
-                'intensity_limits': plan.intensity_limits.as_dict(),
             }.items() if value}
+            if not plan.allow_animation:
+                scope['allow_animation'] = False
             return ToolResult(call_id='', name=self.spec.name, output={
                 'ok': True, 'status': 'candidates' if matches else 'no_candidates',
                 'intent': next((match.entry.agent_id for match in matches

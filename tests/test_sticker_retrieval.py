@@ -168,14 +168,12 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(candidate['readings'][0]['meaning'], 'Dismiss someone')
         self.assertNotIn('warm', str(candidate))
 
-    async def test_excluded_animation_harshness_and_missing_media_do_not_consume_slots(self):
+    async def test_excluded_animation_and_missing_media_do_not_consume_slots(self):
         self.asset(animated=True)
-        self.asset(harshness=4)
         missing = self.asset()
         (self.root / missing.aliases[0].path).rename(self.root / 'unavailable.png')
         valid = self.asset(reading_vectors=[[.8, .6, 0]], harshness=0)
-        result = await self.query(candidate_budget=1,
-            advanced={'intensity_limits': {'max_harshness': 0, 'allow_animation': False}})
+        result = await self.query(candidate_budget=1, allow_animation=False)
         self.assertEqual([x['sticker_id'] for x in result.output['candidates']], [valid.agent_id])
 
     async def test_pack_preference_keeps_global_choices_but_explicit_requirement_filters(self):
@@ -531,9 +529,8 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_only_fitting_asset_is_not_removed_because_it_was_sent_before(self):
         fitting = self.asset(caption='抱抱')
-        self.asset(harshness=4, action='Threatening the recipient')
         self.deliveries.recent.return_value = [{'sticker_id': fitting.asset_id}]
-        result = await self.query(diversity_preference='prefer_fresh_variant', max_harshness=0)
+        result = await self.query(diversity_preference='prefer_fresh_variant', intensity_preference={'harshness': 0})
         self.assertEqual([c['sticker_id'] for c in result.output['candidates']], [fitting.agent_id])
         self.assertTrue(result.output['candidates'][0].get('recently_delivered', False))
 

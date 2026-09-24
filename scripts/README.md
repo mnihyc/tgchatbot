@@ -179,6 +179,12 @@ chat's saved preferences and confirmed delivery history. `--plan` accepts the
 structured `sticker_query` arguments. Candidate
 previews are evidence for selection; they are not automatically sent to Telegram.
 
+Optional `intensity_preference` values (`harshness`, `intimacy`, `meme_dependence`)
+prefer levels near each supplied number from 0 to 4 without excluding other levels.
+Omit axes with no preference. `STICKER_INTENSITY_RANK_WEIGHT` controls their ranking
+influence (default `0.5`; `0` disables it). Existing descriptions and embeddings
+are reused.
+
 ## Import Telegram Desktop history
 
 Place an Export messages JSON file under `data/imports/`. Stop only the bot,

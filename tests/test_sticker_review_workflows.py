@@ -76,8 +76,8 @@ class StickerReviewWorkflows(unittest.IsolatedAsyncioTestCase):
     async def test_strict_nullable_advanced_controls_do_not_erase_explicit_animation_and_pack(self):
         selected = self.asset('Animated acknowledgement', [1, 0, 0], [1, 0, 0], pack='familiar', animated=True)
         payload = {'intent_core': 'Express approval', 'allow_animation': True, 'preferred_pack': 'familiar',
-            'advanced': {'intensity_limits': {'allow_animation': None, 'max_harshness': None},
-                         'style_focus': {'preferred_pack': None}}}
+            'intensity_preference': {'harshness': None, 'intimacy': None, 'meme_dependence': None},
+            'advanced': {'style_focus': {'preferred_pack': None}}}
         plan = StickerRetrievalPlan.from_payload(payload)
         self.assertTrue(plan.allow_animation)
         self.assertEqual(plan.prefer_pack, 'familiar')

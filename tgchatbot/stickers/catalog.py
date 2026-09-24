@@ -89,14 +89,28 @@ def _interleave(*rankings):
                 yield value
 
 
-def _diverse_image_lane(ranking, index, query, reading_scores):
-    """Keep the strongest visual match, then expose less redundant expressions.
+def _prefer_intensity(ranking, distances, weight, *, preserve_first=False):
+    """Reorder one original list; the preference never removes candidates."""
+    if not distances or len(ranking) < 2:
+        return ranking
+    positions = {asset: rank for rank, asset in enumerate(ranking, 1)}
+    ordered = sorted(ranking, key=lambda i: (positions[i] + weight * distances[i],
+                                            distances[i], positions[i]))
+    if preserve_first:
+        ordered.remove(ranking[0])
+        ordered.insert(0, ranking[0])
+    return ordered
+
+
+def _diverse_image_lane(ranking, index, query, reading_scores, *, intensity_distances=None):
+    """Keep the leading visual match, then expose less redundant expressions.
 
     Subtract the query-aligned visual similarity already represented by a
     selected image. A promotion must have at least the next original candidate's
     reading score, so visual novelty cannot outweigh lower measured intent relevance.
     This only reorders the existing image pool; preferences and text ranks keep
     their own lanes, and all candidates remain eligible.
+    An intensity preference, when supplied, must not be worsened by a promotion.
     """
     if len(ranking) < 2 or not reading_scores or index.recipe.get('visual_embedding_source') == 'description':
         return ranking
@@ -111,7 +125,9 @@ def _diverse_image_lane(ranking, index, query, reading_scores):
             max(0.0, float(scores[previous])) * np.maximum(0.0, vectors @ vectors[previous]))
         first = pending[0]
         meaning = reading_scores.get(ranking[first])
-        candidates = ([i for i in pending if reading_scores.get(ranking[i], float('-inf')) >= meaning]
+        candidates = ([i for i in pending if reading_scores.get(ranking[i], float('-inf')) >= meaning
+                       and (not intensity_distances or
+                            intensity_distances[ranking[i]] <= intensity_distances[ranking[first]])]
                       if meaning is not None else [first])
         chosen = max(candidates, key=lambda i: float(scores[i] - represented[i]))
         selected.append(chosen)
@@ -314,11 +330,7 @@ class StickerCatalog:
         # Eligibility is evaluated before limiting a channel, so unavailable or
         # explicitly excluded formats cannot occupy the displayed slots.
         def eligible(asset):
-            compatibility = (asset.card or {}).get('compatibility', {})
-            return bool(asset.card) and (plan.allow_animation or not asset.media.get('animated')) and all(
-                compatibility.get(key, 0) <= maximum for key, maximum in (
-                ('harshness_level', plan.max_harshness), ('intimacy_level', plan.max_intimacy),
-                ('meme_dependence_level', plan.max_meme_dependence))) and (
+            return bool(asset.card) and (plan.allow_animation or not asset.media.get('animated')) and (
                 not plan.required_pack or any(a.pack == plan.required_pack for a in asset.aliases)) and (
                 not plan.required_character_family or plan.required_character_family in
                 asset.family_ids) and (
@@ -355,6 +367,18 @@ class StickerCatalog:
                 if not exact:
                     raise ValueError('Sticker embedding space changed; rebuild the catalog vectors with the configured sticker embedding route')
                 semantic_ready = False
+        # Each channel uses the same per-query distances but its own original
+        # ranks. Do not apply the preference again to the merged shortlist.
+        intensity_distances = {}
+        if not known_id and plan.intensity_preference and self.config.intensity_rank_weight:
+            intensity_distances = {i: sum(abs(index.assets[i].card['compatibility'][axis + '_level'] - target)
+                for axis, target in plan.intensity_preference.items()) / len(plan.intensity_preference)
+                for i in allowed}
+
+        def prefer_intensity(lane, *, preserve_first=False):
+            return _prefer_intensity(lane, intensity_distances, self.config.intensity_rank_weight,
+                                     preserve_first=preserve_first)
+
         if semantic_ready:
             intended = '; '.join(filter(None, [plan.intent_core, *plan.secondary_goals,
                 plan.emotion_tone, plan.social_goal, plan.text_hint,
@@ -385,9 +409,10 @@ class StickerCatalog:
                 caption_lane.extend(sorted(exact - set(caption_lane)))
             global_lanes = []
             for name, values in [('reading', reading), ('image', visual_rank)]:
-                lane = values[:depth]
+                lane = prefer_intensity(values[:depth], preserve_first=name == 'reading')
                 if name == 'image':
-                    lane = _diverse_image_lane(lane, index, query_vectors[visual], reading_scores)
+                    lane = _diverse_image_lane(lane, index, query_vectors[visual], reading_scores,
+                                               intensity_distances=intensity_distances)
                 rankings.append(lane)
                 global_lanes.append(lane)
                 channel_members[name] = set(lane)
@@ -406,6 +431,7 @@ class StickerCatalog:
             if preferred and plan.style_goal != 'ignore_style':
                 family_lane = list(_interleave([i for i in reading if i in preferred],
                                                 [i for i in visual_rank if i in preferred]))[:depth]
+                family_lane = prefer_intensity(family_lane)
                 rankings.append(family_lane)
                 channel_members['preferred_family_or_pack'] = set(family_lane)
             style_words = [identity.get(k, '') for k in ('character_archetype', 'rendering_style', 'palette_mood')]
@@ -414,7 +440,7 @@ class StickerCatalog:
             if any(style_words) and plan.style_goal != 'ignore_style':
                 preferred_text = visual + '; preferred expression/style: ' + '; '.join(filter(None, style_words))
                 preferred_vector = await self.embeddings.embed_query(preferred_text, purpose='sticker')
-                values = image_rank(preferred_vector)[:depth]
+                values = prefer_intensity(image_rank(preferred_vector)[:depth])
                 rankings.append(values)
                 channel_members['preferred_appearance'] = set(values)
             # Fresh alternatives are exposed alongside the strongest matches. A
@@ -423,6 +449,7 @@ class StickerCatalog:
             if recent:
                 fresh = list(_interleave([i for i in reading if index.assets[i].asset_id not in recent],
                                          [i for i in visual_rank if index.assets[i].asset_id not in recent]))[:depth]
+                fresh = prefer_intensity(fresh)
                 if plan.diversity_preference == 'prefer_fresh_variant':
                     rankings.insert(0, fresh)
                     explicit_lanes.append(fresh)
@@ -432,7 +459,7 @@ class StickerCatalog:
             if plan.style_goal == 'prefer_switch' and state.recent_source_pack_ids:
                 different = [i for i in _interleave(reading, visual_rank) if not any(
                     alias.pack in state.recent_source_pack_ids for alias in index.assets[i].aliases)]
-                different = different[:depth]
+                different = prefer_intensity(different[:depth])
                 rankings.append(different)
                 explicit_lanes.append(different)
                 channel_members['different_pack'] = set(different)
@@ -457,7 +484,7 @@ class StickerCatalog:
                     rankings = [global_lane, *companions[:after_requested], family_lane,
                         *companions[after_requested:]]
         if exact and not known_id:
-            rankings.append(caption_lane)
+            rankings.append(prefer_intensity(caption_lane))
             channel_members['literal'] = exact
         selected = _interleave(*rankings)
         result = []

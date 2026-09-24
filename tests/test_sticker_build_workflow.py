@@ -241,31 +241,16 @@ class StickerBuildWorkflowTests(unittest.IsolatedAsyncioTestCase):
         all_ids = {calm_id, intense_id, animated_id}
         direct = await runtime.achoose(plan=StickerRetrievalPlan(intent_core='A greeting', candidate_budget=3))
         self.assertEqual({match.entry.sticker_id for match in direct}, all_ids)
-        nullable = {'max_harshness': None, 'max_intimacy': None,
-                    'max_meme_dependence': None, 'allow_animation': None}
+        nullable = {'harshness': None, 'intimacy': None, 'meme_dependence': None}
         cases = [
             ({}, all_ids),
-            ({**nullable, 'advanced': {'intensity_limits': nullable}}, all_ids),
+            ({'intensity_preference': nullable, 'allow_animation': None}, all_ids),
             ({'allow_animation': False}, {calm_id, intense_id}),
-            ({'max_harshness': 3}, {calm_id, animated_id}),
-            ({'advanced': {'intensity_limits': {'max_intimacy': 0}}}, {calm_id, animated_id}),
-            ({'advanced': {'intensity_limits': {'max_meme_dependence': 0}}}, {calm_id, animated_id}),
-            ({'allow_animation': False, 'max_harshness': 0,
-              'advanced': {'intensity_limits': nullable}}, {calm_id}),
-            ({'allow_animation': True, 'max_harshness': 4,
-              'advanced': {'intensity_limits': {'allow_animation': False, 'max_harshness': 0}}}, {calm_id}),
-            ({'intensity_limits': {'allow_animation': False, 'max_harshness': 0},
-              'advanced': {'intensity_limits': nullable}}, {calm_id}),
-            ({'safety_limits': {'allow_animation': False, 'max_harshness': 0},
-              'advanced': {'intensity_limits': {'max_intimacy': 4}}}, {calm_id}),
-            ({'advanced': {'intensity_limits': nullable,
-                          'safety_limits': {'allow_animation': False, 'max_harshness': 0}}}, {calm_id}),
-            ({'intensity_limits': {'allow_animation': False, 'max_harshness': 0},
-              'advanced': {'intensity_limits': {'allow_animation': True, 'max_harshness': 4}}}, all_ids),
-            ({'intensity_limits': {'allow_animation': False, 'max_harshness': 0},
-              'advanced': {'intensity_limits': {'allow_animation': True}}}, {calm_id, animated_id}),
-            ({'intensity_limits': {'allow_animation': False, 'max_harshness': 0},
-              'advanced': {'intensity_limits': {'max_harshness': 4}}}, {calm_id, intense_id}),
+            ({'intensity_preference': {'harshness': 0}}, all_ids),
+            ({'intensity_preference': {'intimacy': 0}}, all_ids),
+            ({'intensity_preference': {'meme_dependence': 0}}, all_ids),
+            ({'intensity_preference': {'harshness': 0, 'intimacy': 0, 'meme_dependence': 0},
+              'allow_animation': False}, {calm_id, intense_id}),
         ]
         for controls, expected in cases:
             with self.subTest(controls=controls):
