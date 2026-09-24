@@ -7,9 +7,9 @@ from tgchatbot.providers.gemini import GeminiProvider
 from tgchatbot.providers.openai_responses import OpenAIResponsesProvider
 
 
-def build_provider(config: AppConfig, name: str) -> ModelProvider:
+def build_provider(config: AppConfig, name: str, *, require_credentials: bool = True) -> ModelProvider:
     """Construct one configured provider, including for offline maintenance jobs."""
-    if name not in config.configured_provider_names():
+    if require_credentials and name not in config.configured_provider_names():
         available = ', '.join(config.configured_provider_names()) or 'none'
         raise RuntimeError(f'Provider {name!r} is not configured. Available providers: {available}')
     if name == 'openai':

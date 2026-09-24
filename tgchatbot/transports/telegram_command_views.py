@@ -156,20 +156,32 @@ def _queue_counts(status: dict) -> dict[str, int]:
 def status_view(status: dict, flow: dict, topic: str = '') -> str:
     if topic == 'context':
         idle = status.get('compact_idle_trigger_tokens')
-        lines = [*_context_meter(status),
-            f"Compaction target: {_short_number(status.get('compact_target_tokens'))} tokens",
-            (f"Idle compaction: {_short_number(idle)} tokens after {_duration(status.get('compact_idle_seconds'))}"
-             if idle else 'Idle compaction: off'),
-            f"{_number(status.get('raw_messages'))} recent messages · {_number(status.get('memory_blocks'))} summaries"]
+        lines = [f"<b>Saved context</b> · {_text(status.get('as_of') or '')}", *_context_meter(status),
+                 *_composition_lines(status, percentages=False)]
+        composition = status.get('input_composition')
+        if composition and status.get('summary_tokens') is not None:
+            summaries = status['summary_tokens']
+            lines.append(f"Memory: {_short_number(summaries)} summaries + {_short_number(composition['memory'] - summaries)} recalled")
+        lines.append(f"Summaries: {_number(status.get('selected_memory_blocks', 0))} included · {_number(status.get('memory_blocks'))} stored")
         images, limit = status.get('estimated_request_images'), status.get('max_input_images')
-        if images or limit:
+        projection = status.get('projected_images')
+        if projection is not None:
+            label = f"Images: {projection['projected']} projected"
+            for key, suffix in (('pending', 'pending previews'), ('unsupported', 'unsupported'), ('unavailable', 'unavailable')):
+                if projection[key]:
+                    label += f" · {projection[key]} {suffix}"
+            lines.append(label)
+        elif images or limit:
             image_line = f'Images: {_number(images)}'
             image_line += f' / {_number(limit)}' if limit else ' · no count limit'
             target = status.get('compact_target_images')
             if target and target != limit:
                 image_line += f' · target {_number(target)}'
             lines.append(image_line)
-        lines.extend(['', '/params context · /status full'])
+        lines.extend([f"Compaction target: {_short_number(status.get('compact_target_tokens'))} tokens",
+            (f"Idle compaction: {_short_number(idle)} tokens after {_duration(status.get('compact_idle_seconds'))}" if idle else 'Idle compaction: off'),
+            '/context recent · /context summaries', '/context profiles · /context tools',
+            '/context full · /params context'])
         return '\n'.join(lines)
     if topic == 'memory':
         semantic = 'semantic + text' if status.get('semantic_enabled') else 'text only'
@@ -215,13 +227,30 @@ def status_view(status: dict, flow: dict, topic: str = '') -> str:
     lines = [f'<b>Chat status</b> · {activity}',
         f"{_text(status.get('provider'))} · {_code(status.get('model'))}",
         *_context_meter(status)]
+    if status.get('input_composition') is not None:
+        lines.extend(['Share of estimated input:', *_composition_lines(status, percentages=True)])
     counts = _queue_counts(status)
     if counts.get('failed'):
         lines.append(f"Memory: {_number(counts['failed'])} failed jobs · /status memory")
     elif status.get('memory_last_error'):
         lines.append('Worker error · /status memory')
-    lines.extend(['', '/status context · /help'])
+    lines.extend(['', '/context · /help'])
     return '\n'.join(lines)
+
+
+def _composition_lines(status: dict, *, percentages: bool) -> list[str]:
+    values = status.get('input_composition')
+    if values is None:
+        return [] if percentages else ['Input shares unavailable for this provider.']
+    def value(key):
+        tokens = values[key]
+        if not percentages:
+            return _short_number(tokens)
+        percent = tokens * 100 / max(1, status['estimated_request_tokens'])
+        return '&lt;1%' if 0 < percent < 1 else f'{percent:.0f}%'
+    return [' · '.join(f'{label} {value(key)}' for key, label in group) for group in (
+        (('user', 'User'), ('assistant', 'Assistant'), ('tools', 'Tools')),
+        (('memory', 'Memory'), ('profiles', 'Profiles'), ('system', 'System')))]
 
 
 def settings_view(status: dict, topic: str = '', can_change: bool = True) -> str:
@@ -331,7 +360,16 @@ def help_view(topic: str = '') -> str:
     if topic == 'context':
         return '\n'.join([
             '<b>History and memory</b>',
-            '/status context — context size and compaction',
+            '/context — saved context size, composition and compaction',
+            '/context recent — message previews; add a count or before &lt;message_id&gt;',
+            '/context message &lt;id&gt; — read an original or tool record',
+            '/context summaries [all] — included summaries or all stored blocks',
+            '/context block &lt;id&gt; — summary, participants and sources',
+            '/context tools [tool_name] — recorded calls and results',
+            '/context profiles — saved facts and included snapshots',
+            '/context profile &lt;actor&gt; — use a listed person_id:, chat_id: or agent',
+            '/context full — complete readable context; file only when too long',
+            'Shares divide estimated input, including media; the bar divides input by the configured ceiling. Memory includes summaries and recalled results; Profiles counts fetched snapshots. Tools excludes those results; System includes instructions, definitions and framing.',
             '/status memory — searchable memory and background work',
             '/params context — compaction and image settings',
             '/compact — compact now to the configured target; keep originals and profiles',
@@ -353,6 +391,7 @@ def help_view(topic: str = '') -> str:
     return '\n'.join([
         '<b>Commands</b>',
         '/status — this chat at a glance',
+        '/context — inspect messages, summaries, profiles and tools',
         '/params — inspect or change settings',
         '/help replies — reply modes, progress and delivery',
         '/help model — provider, model and prompt',

@@ -24,8 +24,7 @@ async def expand_message_ids(store, session_id: str, message_ids: Sequence[int],
     if type(neighbors) is not int or neighbors < 0 or type(limit) is not int or limit < 1:
         raise ValueError('Neighbor count must be nonnegative and read length positive')
     async with store.pool.connection() as conn:
-        scope = await (await conn.execute('''SELECT generation,context_id,revision FROM sessions
-            WHERE session_id=%s FOR SHARE''', (session_id,))).fetchone()
+        scope = await store.read_session_scope(conn, session_id)
         if scope is None:
             return []
         store._check_scope(scope, expected_scope)

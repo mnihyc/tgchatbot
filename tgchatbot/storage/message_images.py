@@ -36,8 +36,9 @@ def _occurrences(row):
 async def _originals(store, conn, session_id, message_ids, expected_scope):
     # Share the source owner's session lock and canonical read path. Permission
     # remains stable until any selected payloads have been read in this transaction.
-    scope = await (await conn.execute('SELECT generation,context_id,revision FROM sessions '
-        'WHERE session_id=%s FOR SHARE', (session_id,))).fetchone()
+    # Operator connections cannot lock rows; pin originals and pixels to the same
+    # snapshot and recheck reset scope before returning the completed read.
+    scope = await store.read_session_scope(conn, session_id)
     if scope is None:
         return []
     store._check_scope(scope, expected_scope)
@@ -56,9 +57,12 @@ async def describe_message_images(store, session_id, message_ids, *, expected_sc
             found = await (await conn.execute('SELECT reference FROM message_previews '
                 'WHERE session_id=%s AND reference=ANY(%s)', (session_id, list(references)))).fetchall()
             available = {item['reference'] for item in found}
-        return {message_id: [{'image_id': image_id, 'available': part.preview_ref in available,
+        result = {message_id: [{'image_id': image_id, 'available': part.preview_ref in available,
             **({'mime_type': part.mime_type} if part.mime_type else {})} for image_id, part in items]
             for message_id, items in occurrences.items()}
+    if store._read_only and expected_scope is not None:
+        await store.assert_scope(session_id, expected_scope)
+    return result
 
 
 async def resolve_message_images(store, session_id, message_ids, image_ids, *, expected_scope=None, timezone='UTC'):
@@ -99,4 +103,6 @@ async def resolve_message_images(store, session_id, message_ids, image_ids, *, e
             ])
             # Selection is provisional; runtime owns final model admission.
             results.append({'image_id': image_id, 'status': 'selected'})
-        return {'image_results': results, 'evidence_parts': evidence}
+    if store._read_only and expected_scope is not None:
+        await store.assert_scope(session_id, expected_scope)
+    return {'image_results': results, 'evidence_parts': evidence}

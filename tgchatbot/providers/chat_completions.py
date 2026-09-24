@@ -18,6 +18,7 @@ from tgchatbot.tools.base import ToolSpec
 
 class ChatCompletionsProvider:
     """Stateless Chat Completions adapter for DeepSeek, OpenRouter and custom endpoints."""
+    inspection_format = 'chat_completions'
 
     def __init__(self, config: ChatCompletionsConfig) -> None:
         self.config = config
@@ -52,14 +53,17 @@ class ChatCompletionsProvider:
         return controls
 
     def _messages_for_request(self, messages: list[ConversationMessage]) -> list[dict[str, Any]]:
+        return [item for item, _owner in self._messages_with_owners(messages)]
+
+    def _messages_with_owners(self, messages: list[ConversationMessage]) -> list[tuple[dict, int]]:
         result = []
-        for message in messages:
+        for owner, message in enumerate(messages):
             for item in self._message_to_input_items(message):
-                if (result and item.get('tool_calls') and result[-1].get('tool_calls')
-                        and not item.get('content') and not result[-1].get('content')):
-                    result[-1]['tool_calls'].extend(item['tool_calls'])
+                if (result and item.get('tool_calls') and result[-1][0].get('tool_calls')
+                        and not item.get('content') and not result[-1][0].get('content')):
+                    result[-1][0]['tool_calls'].extend(item['tool_calls'])
                 else:
-                    result.append(item)
+                    result.append((item, owner))
         return result
 
     def _message_to_input_items(self, message: ConversationMessage) -> list[dict[str, Any]]:
@@ -213,6 +217,17 @@ class ChatCompletionsProvider:
     def persistent_history_items(self, response: ProviderResponse) -> list[dict]:
         return copy.deepcopy(response.continuation_items)
 
+    @staticmethod
+    def _estimate_value_tokens(value: Any) -> int:
+        if isinstance(value, dict):
+            if value.get('type') == 'image_url':
+                return TokenEstimator.IMAGE_TOKENS
+            return sum(TokenEstimator.estimate_text(str(key)) + ChatCompletionsProvider._estimate_value_tokens(item)
+                       for key, item in value.items())
+        if isinstance(value, list):
+            return sum(ChatCompletionsProvider._estimate_value_tokens(item) for item in value)
+        return TokenEstimator.estimate_text(str(value)) if value is not None else 0
+
     def estimate_request_tokens(
         self,
         *,
@@ -225,14 +240,7 @@ class ChatCompletionsProvider:
         response_schema_name: str | None = None,
         history_tokens_override: int | None = None,
     ) -> RequestTokenEstimate:
-        def estimate(value: Any) -> int:
-            if isinstance(value, dict):
-                if value.get('type') == 'image_url':
-                    return TokenEstimator.IMAGE_TOKENS
-                return sum(TokenEstimator.estimate_text(str(key)) + estimate(item) for key, item in value.items())
-            if isinstance(value, list):
-                return sum(estimate(item) for item in value)
-            return TokenEstimator.estimate_text(str(value)) if value is not None else 0
+        estimate = self._estimate_value_tokens
 
         # Match the legacy estimator's framing allowance. The runtime calibrates
         # these semantic estimates against observed token usage per provider/model.

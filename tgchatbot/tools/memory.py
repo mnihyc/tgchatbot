@@ -478,7 +478,45 @@ async def _run(args: argparse.Namespace) -> None:
     store = PostgresStore(config.database_url)
     session_id = f'telegram:{args.chat_id}' if getattr(args, 'chat_id', None) is not None else None
     try:
-        await store.initialize()
+        if args.command in {'work', 'prepare-context', 'rebuild', 'retry-jobs'}:
+            await store.initialize()
+        else:
+            await store.open_readonly()
+        if args.command == 'messages':
+            from tgchatbot.storage.inspection import inspection_snapshot
+            from tgchatbot.transports.context_views import message_text
+            async with inspection_snapshot(store, session_id, config.default_session_settings(),
+                    timezone=config.default_metadata_timezone) as reader:
+                page = await reader.recent(limit=args.limit, before_id=args.before_id, source_time=True,
+                    actor_id=args.actor_id, before=args.before, after=args.after)
+                records = []
+                for item in page['items']:
+                    stored = item['message']
+                    meta = stored.message.metadata
+                    records.append({'type': 'message', 'message_id': stored.db_id, 'role': stored.message.role.value,
+                        'actor_id': meta.get('actor_id'), 'actor_name': meta.get('actor_name'),
+                        'sent_at': format_timestamp(meta.get('sent_at'), config.default_metadata_timezone),
+                        'current_context': item['current_context'], 'compacted_by': item['compacted_by'],
+                        'text': message_text(stored.message)})
+            for record in records:
+                emit(record)
+            if page['next']:
+                emit({'type': 'page', 'before_id': page['next']})
+            return
+        if args.command == 'report' or args.command == 'context' and (args.prepared or args.block_id):
+            from tgchatbot.tools.memory_inspection import prepared_inspection
+            from tgchatbot.transports.context_views import render_context
+            topic = ('report' if args.command == 'report' else 'block' if args.block_id else 'full')
+            view = await prepared_inspection(store, config, session_id, topic=topic,
+                limit=getattr(args, 'preview_limit', 5), object_id=getattr(args, 'block_id', None))
+            rendered = render_context(view)
+            if getattr(args, 'output', None) is not None:
+                with args.output.open('x', encoding='utf-8') as output:
+                    output.write(rendered + '\n')
+                emit({'type': 'report', 'output': str(args.output)})
+            else:
+                print(rendered)
+            return
         if args.command == 'jobs':
             async for record in job_records(store, session_id, status=args.status, kind=args.kind,
                     job_id=args.job_id, generation=args.generation, options=options):
@@ -583,6 +621,20 @@ def parser() -> argparse.ArgumentParser:
     profiles.add_argument('--actor-id', help='Stable actor ID; omit to discover profiles and pending actors')
     context = commands.add_parser('context', help='Inspect current context layers and counts without model calls')
     context.add_argument('--chat-id', type=_nonzero, required=True)
+    context_view = context.add_mutually_exclusive_group()
+    context_view.add_argument('--prepared', action='store_true', help='Readable provider-projected context, without generation')
+    context_view.add_argument('--block-id', type=_positive, help='Read one summary and its exact source membership')
+    messages = commands.add_parser('messages', help='Browse visible originals by source date in the current generation')
+    messages.add_argument('--chat-id', type=_nonzero, required=True)
+    messages.add_argument('--actor-id')
+    messages.add_argument('--before-id', type=_positive, help='Continue before this message in source-time order')
+    messages.add_argument('--before')
+    messages.add_argument('--after')
+    messages.add_argument('--limit', type=_positive, default=20, help='Page length; does not limit stored history')
+    report = commands.add_parser('report', help='Readable context, profile and work overview; no model calls')
+    report.add_argument('--chat-id', type=_nonzero, required=True)
+    report.add_argument('--output', type=Path, help='Write a new report file; otherwise print it')
+    report.add_argument('--preview-limit', type=_positive, default=5, help='Entries per preview, not an archive limit')
     search = commands.add_parser('search', help='Search currently retrievable memory; may call embeddings unless --lexical-only')
     search.add_argument('--chat-id', type=_nonzero, required=True)
     search.add_argument('--query', required=True)

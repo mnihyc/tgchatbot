@@ -229,36 +229,51 @@ and background profile batches are processed separately by the memory worker.
 
 ## Memory jobs and operator audit
 
-Run a dedicated worker while the live bot is stopped:
+Start with read-only inspection of the initialized deployment database. These
+commands use the existing `.env`; normal inspection makes no model or embedding
+requests and works with a read-only database account.
 
 ```sh
-docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory work --batch
+docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory status
+docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory report --chat-id=-1001234567890
+docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory messages --chat-id=-1001234567890 --limit 20
+docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory context --chat-id=-1001234567890
+docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory profiles --chat-id=-1001234567890
+docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory jobs --chat-id=-1001234567890 --status failed
 ```
 
-`--batch` uses native Gemini asynchronous embedding Batch for bulk work. Other
-embedding routes use `work` without that option. Profile extraction still uses
-ordinary generation requests, inheriting the chat model unless `MEMORY_PROVIDER`
-or `MEMORY_MODEL` overrides it. Processing can incur both embedding and generation
-charges. `--once` performs one dispatch, not a complete queue drain.
+`report` gives a readable saved-context overview: model, prompt excerpt, input
+shares, recent messages, included summaries, profiles and queue state. It previews
+five entries per section; `--preview-limit` changes that presentation count.
+Add `--output /app/data/context-report.txt` to save a new file. Existing files are
+not overwritten. It does not capture an in-flight model request or export the
+whole archive. `context --prepared` reads the complete selected text context,
+instructions and tool declarations; images remain references and opaque provider
+continuations are omitted. `context --block-id BLOCK_ID` reads one full summary
+with its actual source links. The original `context` JSON view remains available
+and counts root summaries; prepared views distinguish included blocks from all
+valid sealed blocks in the current context.
 
-Inspect work in another terminal:
+`messages` browses visible user/assistant originals from the current generation,
+including history across soft resets. Its default is 20 entries. Use the returned
+`before_id` as `--before-id` for the next page, or filter with `--actor-id`,
+`--before` and `--after`. Source date and message ID determine order, including
+late imports; dates without offsets use the configured timezone. Telegram's
+`/context recent` instead follows current-context replay order, five entries at
+a time. These are browsing defaults, not storage or model-context limits.
+
+Focused diagnostics:
 
 ```sh
 docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory status --chat-id=-1001234567890
 docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory status --chat-id=-1001234567890 --coverage
-docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory jobs --chat-id=-1001234567890 --status failed
-docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory profiles --chat-id=-1001234567890
-docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory context --chat-id=-1001234567890
-docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory retry-jobs --chat-id=-1001234567890
-docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory rebuild --chat-id=-1001234567890
 docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory audit --chat-id=-1001234567890 --state
 ```
 
-Ordinary status is inexpensive; `--coverage` scans active source spans. Rebuild
-queues the selected embedding space without deleting originals. Retry preserves
-accepted Batch identities; ambiguous submissions are reconciled before any new
-submission. A changed or unknown space is reported rather than silently mixed.
-Inspection, queueing and audit commands themselves make no model requests.
+Ordinary status is inexpensive; `--coverage` scans active source spans. Prepared
+context accounting reads the current context and uses the selected provider's
+existing estimate and calibration. These are approximate input shares, not billed
+or cached token measurements.
 
 `status` without a chat selector discovers existing sessions. `jobs` streams saved
 errors, attempts, scheduling and provider checkpoint details; filter by `--job-id`,
@@ -293,6 +308,23 @@ internal database ID, not a Telegram ID. Treat its output as retained chat data.
 Use `audit --chat-id=CHAT_ID --telegram-message-id TELEGRAM_ID` to find an original
 directly from its Telegram ID, including delivery-chunk aliases. `--generation`
 selects retained history; without it audit includes all generations.
+
+For maintenance, run a dedicated worker while the live bot is stopped:
+
+```sh
+docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory work --batch
+docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory retry-jobs --chat-id=-1001234567890
+docker compose run --rm --no-deps bot python -m tgchatbot.tools.memory rebuild --chat-id=-1001234567890
+```
+
+`--batch` uses native Gemini asynchronous embedding Batch for bulk work. Other
+embedding routes use `work` without that option. Profile extraction still uses
+ordinary generation requests, inheriting the chat model unless `MEMORY_PROVIDER`
+or `MEMORY_MODEL` overrides it. Processing can incur embedding and generation
+charges. `--once` performs one dispatch, not a complete queue drain. Rebuild queues
+the selected embedding space without deleting originals. Retry preserves accepted
+Batch identities; ambiguous submissions are reconciled before a new submission.
+A changed or unknown space is reported rather than silently mixed.
 
 Stop the dedicated worker before restarting the bot with `./update.sh`. The bot
 can continue accepted jobs. Do not run separate workers against the same live

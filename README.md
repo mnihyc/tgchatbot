@@ -67,11 +67,13 @@ Optional spontaneous group replies can be configured separately. Set
 | Command | Purpose |
 | --- | --- |
 | `/help [replies\|model\|context\|tools]` | Short command guide, with focused help by topic |
-| `/status [context\|memory\|tools]`, `/status full` | Compact status, topic details, or full diagnostics as a text file |
+| `/status [context\|memory\|tools]`, `/status full` | Context usage and input shares, topic details, or full diagnostics |
+| `/context`, `/context recent`, `/context summaries` | Inspect the saved context, recent message excerpts, or included summaries |
+| `/context profiles`, `/context tools`, `/context full` | Browse saved profiles and fetched snapshots, tool exchanges, or the complete readable context |
 | `/mode chat`, `/mode assist`, `/mode agent` | Conversation with read-only memory, occasional tools, or multistep tools |
 | `/provider`, `/model` | Inspect or change the chat's generation route |
 | `/presets`, `/preset <name>`, `/prompt` | Manage personality prompts |
-| `/params` or `/settings`, `/params <group>` | Browse model, context, replies or tools settings; `full` downloads all values |
+| `/params` or `/settings`, `/params <group>` | Browse model, context, replies or tools settings; `full` shows all values |
 | `/param <name>`, `/param <name> <value>` | Inspect one setting and its accepted inputs, or change it; `default` restores its configured default |
 | `/process off`, `/delivery final_new` | Control progress visibility and final-answer delivery |
 | `/stickers auto`, `/stickers off` | Enable or disable sticker tools in a tool-enabled mode |
@@ -86,6 +88,14 @@ Commands send ordinary, persistent chat messages. Settings apply to the entire
 chat; `TGBOT_CONTROL_UIDS` restricts `/param` to trusted users when configured.
 Agent replies support Markdown formatting, including bold text, links and code
 blocks. Long replies retain formatting across messages.
+
+Command results stay in one message when they fit; larger results become one text
+file, including `full` views. `/help context` explains browsing and pagination.
+Input shares estimate the saved context for the current provider/model, rather
+than billing or cache hits. Memory includes summaries and recalled originals;
+Profiles counts fetched snapshots still in context, not every saved profile.
+Inspection does not generate replies, compact history or refresh profiles.
+For comprehensive operator reads and exports, see [memory inspection](scripts/README.md#memory-jobs-and-operator-audit).
 
 Retry and rollback affect the current context. They do not retract Telegram
 messages or undo remote actions. Full reset leaves the shared sticker library and

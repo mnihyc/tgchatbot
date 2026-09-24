@@ -31,6 +31,16 @@ def format_timestamp(value: Any, timezone_name: str | None = None) -> str | None
     return value.astimezone(resolve_timezone(timezone_name)).isoformat()
 
 
+def parse_time_filter(value: Any, timezone_name: str | None = None) -> datetime | None:
+    """Operator/model date filters without an offset use the configured timezone."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) or isinstance(value, str) and value.isdigit():
+        return datetime.fromtimestamp(float(value), timezone.utc)
+    parsed = datetime.fromisoformat(value.replace('Z', '+00:00')) if isinstance(value, str) else value
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=resolve_timezone(timezone_name))
+
+
 def format_timestamp_fields(record: Mapping[str, Any], fields: Iterable[str],
                             timezone_name: str | None = None) -> dict[str, Any]:
     """Copy a record and format only timestamp fields explicitly owned by its schema."""

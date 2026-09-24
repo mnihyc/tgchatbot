@@ -56,7 +56,11 @@ class RemoteWorkspaceClient:
 
     @property
     def enabled(self) -> bool:
-        return self.ssh.enabled and bool(self.ssh.host)
+        return self.configured(self.config)
+
+    @staticmethod
+    def configured(config: AppConfig) -> bool:
+        return config.ssh_exec.enabled and bool(config.ssh_exec.host)
 
     async def warmup(self) -> None:
         if not self.enabled:

@@ -12,6 +12,33 @@ from tgchatbot.domain.timestamps import format_timestamp_fields, resolve_timezon
 from tgchatbot.embeddings import EmbeddingClient
 
 
+async def prepared_inspection(store, config, session_id, *, topic='overview', limit=5, object_id=None):
+    """Construct only local adapters/declarations, never SSH or API operations."""
+    from contextlib import AsyncExitStack
+    from tgchatbot.core.inspection import inspect_context
+    from tgchatbot.core.memory import MemoryService
+    from tgchatbot.core.runtime import AgentRuntime
+    from tgchatbot.embeddings import EmbeddingConfig
+    from tgchatbot.providers.factory import build_provider
+    from tgchatbot.stickers.catalog import StickerCatalog
+    from tgchatbot.storage.sticker_catalog import StickerCatalogStore
+    from tgchatbot.tools.registry import ToolRegistry
+    from tgchatbot.tools.remote_workspace import RemoteWorkspaceClient
+    async with AsyncExitStack() as cleanup:
+        names = {'openai', 'gemini', *(profile.name for profile in config.chat_completions)}
+        providers = {}
+        for name in names:
+            provider = build_provider(config, name, require_credentials=False)
+            cleanup.push_async_callback(provider.aclose)
+            providers[name] = provider
+        catalog = StickerCatalog(StickerCatalogStore(store), config.sticker_dir, persona_store=store)
+        remote = SimpleNamespace(enabled=RemoteWorkspaceClient.configured(config), _master_started=False)
+        tools = ToolRegistry(config, remote, catalog)
+        memory = MemoryService(store, SimpleNamespace(enabled=EmbeddingConfig.from_env().enabled), config=config.memory)
+        runtime = AgentRuntime(config=config, store=store, providers=providers, tool_registry=tools, memory=memory)
+        return await inspect_context(runtime, session_id, topic, limit=limit, object_id=object_id)
+
+
 async def context_records(store, session_id, *, options):
     # Counts and summaries share a snapshot. Raw originals stay out of this view;
     # the existing search/read/audit commands own inspecting their contents.

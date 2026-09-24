@@ -189,6 +189,7 @@ class PostgresStore:
             dsn, open=False, kwargs={'row_factory': dict_row}, configure=self._configure, **pool_options,
         )
         self._initialized = False
+        self._read_only = False
         self._initialize_lock = asyncio.Lock()
 
     async def _configure(self, conn: AsyncConnection) -> None:
@@ -204,7 +205,24 @@ class PostgresStore:
         # Inline vector scans and many tiny GIN probes have high estimated cost
         # but short execution time. LLVM compilation otherwise dominates them.
         await conn.execute('SET jit = off')
+        if self._read_only:
+            await conn.execute('SET default_transaction_read_only = on')
         await conn.commit()
+
+    async def open_readonly(self) -> None:
+        """Connect to an existing schema for operator inspection, without DDL."""
+        self._read_only = True
+        await self.pool.open(wait=True)
+        async with self.pool.connection() as conn:
+            await self._check_schema(conn)
+
+    async def read_session_scope(self, conn, session_id):
+        """Start a source read: live callers lock; operator callers pin a snapshot."""
+        if self._read_only:
+            await conn.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+        lock = '' if self._read_only else ' FOR SHARE'
+        return await (await conn.execute('SELECT * FROM sessions WHERE session_id=%s' + lock,
+                                        (session_id,))).fetchone()
 
     async def initialize(self) -> None:
         async with self._initialize_lock:
@@ -284,6 +302,10 @@ class PostgresStore:
             if not payload:
                 payload = asdict(defaults)
                 await conn.execute('UPDATE sessions SET settings=%s WHERE session_id=%s', (Jsonb(payload), session_id))
+        return self.decode_settings(payload, defaults)
+
+    @staticmethod
+    def decode_settings(payload: dict, defaults: SessionSettings) -> SessionSettings:
         values = asdict(defaults)
         values.update({key: value for key, value in payload.items() if key in values})
         for key, enum in _ENUM_SETTINGS.items():
@@ -618,8 +640,7 @@ class PostgresStore:
                                       generation_only: bool = False) -> StoredConversationMessage | None:
         """Read an active original by transport identity, with the caller's scope."""
         async with self.pool.connection() as conn:
-            scope = await (await conn.execute('SELECT generation,context_id,revision FROM sessions '
-                'WHERE session_id=%s FOR SHARE', (session_id,))).fetchone()
+            scope = await self.read_session_scope(conn, session_id)
             if scope is None:
                 return None
             self._check_scope(scope, expected_scope, context=not generation_only)
@@ -661,8 +682,7 @@ class PostgresStore:
         the participant collector owns identity and direct-reply eligibility.
         """
         async with self.pool.connection() as conn:
-            scope = await (await conn.execute('SELECT generation,context_id,revision FROM sessions '
-                'WHERE session_id=%s FOR SHARE', (session_id,))).fetchone()
+            scope = await self.read_session_scope(conn, session_id)
             if scope is None:
                 return []
             self._check_scope(scope, expected_scope)
@@ -684,8 +704,11 @@ class PostgresStore:
     async def list_canonical_messages(self, session_id: str, *, after_message_id: int = 0,
                                       limit: int | None = None, expected_scope: Mapping[str, Any] | None = None) -> list[StoredConversationMessage]:
         async with self.pool.connection() as conn:
-            await self._session(conn, session_id)
-            scope = await (await conn.execute('SELECT * FROM sessions WHERE session_id=%s FOR SHARE', (session_id,))).fetchone()
+            if not self._read_only:
+                await self._session(conn, session_id)
+            scope = await self.read_session_scope(conn, session_id)
+            if scope is None:
+                return []
             self._check_scope(scope, expected_scope, context=False)
             rows = await (await conn.execute(self._select_message() + '''
                 WHERE m.session_id=%s AND m.generation=%s AND m.id>%s AND NOT m.hidden AND NOT m.deleted
@@ -717,26 +740,30 @@ class PostgresStore:
         reset cannot put originals and their replacement summaries out of sync.
         Ordinary list APIs remain limited reads for callers that need a page.
         """
-        messages, blocks = [], []
         async with self.pool.connection() as conn:
             await conn.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
-            row = await (await conn.execute('SELECT context_version FROM sessions WHERE session_id=%s', (session_id,))).fetchone()
-            version = int(row['context_version']) if row else 0
-            async with conn.cursor(name='live_context_messages') as cursor:
-                await cursor.execute(self._select_message() + '''
-                    WHERE m.session_id=%s AND m.context_id=s.context_id
-                    AND NOT m.hidden AND NOT m.deleted AND m.compacted_by_block_id IS NULL
-                    AND (replay.message_id IS NULL OR replay.detached)
-                    ORDER BY m.id''', (session_id,))
-                while rows := await cursor.fetchmany(self.config.history_page_size):
-                    messages.extend(self._message(row, presentation=True) for row in rows)
-            async with conn.cursor(name='live_context_blocks') as cursor:
-                await cursor.execute(f'''SELECT {_BLOCK_SUMMARY_COLUMNS} FROM memory_blocks b JOIN sessions s
-                    ON s.session_id=b.session_id AND s.generation=b.generation AND s.context_id=b.context_id
-                    WHERE b.session_id=%s AND b.valid AND COALESCE(b.details->>'lifecycle','sealed')='sealed'
-                    ORDER BY b.sequence_no,b.id''', (session_id,))
-                while rows := await cursor.fetchmany(self.config.memory_block_page_size):
-                    blocks.extend(self._block(row) for row in rows)
+            return await self.read_live_context(conn, session_id)
+
+    async def read_live_context(self, conn, session_id):
+        """Shared live projection inside a caller-owned read snapshot."""
+        messages, blocks = [], []
+        row = await (await conn.execute('SELECT context_version FROM sessions WHERE session_id=%s', (session_id,))).fetchone()
+        version = int(row['context_version']) if row else 0
+        async with conn.cursor(name='live_context_messages') as cursor:
+            await cursor.execute(self._select_message() + '''
+                WHERE m.session_id=%s AND m.context_id=s.context_id
+                AND NOT m.hidden AND NOT m.deleted AND m.compacted_by_block_id IS NULL
+                AND (replay.message_id IS NULL OR replay.detached)
+                ORDER BY m.id''', (session_id,))
+            while rows := await cursor.fetchmany(self.config.history_page_size):
+                messages.extend(self._message(row, presentation=True) for row in rows)
+        async with conn.cursor(name='live_context_blocks') as cursor:
+            await cursor.execute(f'''SELECT {_BLOCK_SUMMARY_COLUMNS} FROM memory_blocks b JOIN sessions s
+                ON s.session_id=b.session_id AND s.generation=b.generation AND s.context_id=b.context_id
+                WHERE b.session_id=%s AND b.valid AND COALESCE(b.details->>'lifecycle','sealed')='sealed'
+                ORDER BY b.sequence_no,b.id''', (session_id,))
+            while rows := await cursor.fetchmany(self.config.memory_block_page_size):
+                blocks.extend(self._block(row) for row in rows)
         return blocks, messages, version
 
     async def load_token_calibration(self, key: tuple[str, str, str]) -> float:
@@ -1115,7 +1142,7 @@ class PostgresStore:
                               before: Any = None, after: Any = None, topic_id: str | None = None,
                               limit: int | None = None) -> list[dict[str, Any]]:
         async with self.pool.connection() as conn:
-            scope = await (await conn.execute('SELECT session_id FROM sessions WHERE session_id=%s FOR SHARE', (session_id,))).fetchone()
+            scope = await self.read_session_scope(conn, session_id)
             if scope is None:
                 return []
             return await self._search_messages(conn, session_id, query, actor_id=actor_id,
@@ -1422,7 +1449,7 @@ class PostgresStore:
 
     async def get_excerpt(self, session_id: str, excerpt_id: int) -> dict[str, Any] | None:
         async with self.pool.connection() as conn:
-            scope = await (await conn.execute('SELECT * FROM sessions WHERE session_id=%s FOR SHARE', (session_id,))).fetchone()
+            scope = await self.read_session_scope(conn, session_id)
             if scope is None:
                 return None
             row = await (await conn.execute('''SELECT id,source_ids,source_revisions,spans,model,
@@ -1479,7 +1506,7 @@ class PostgresStore:
         async with self.pool.connection() as conn:
             # Keep lexical candidates, source revisions, and vector candidates in
             # the same reset/edit scope while rendering the bounded response.
-            scope = await (await conn.execute('SELECT * FROM sessions WHERE session_id=%s FOR SHARE', (session_id,))).fetchone()
+            scope = await self.read_session_scope(conn, session_id)
             if scope is None:
                 return []
             lexical = await self._search_messages(conn, session_id, query, actor_id=actor_id,
@@ -1621,50 +1648,58 @@ class PostgresStore:
                                      max_bytes: int | None = None, for_learning: bool = False,
                                      include_pending: bool = False) -> dict[str, Any]:
         """Read selected profiles and their internal evidence from one committed snapshot."""
+        async with self.pool.connection() as conn:
+            await conn.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+            result = await self.read_profile_snapshot(conn, session_id, actor_ids,
+                expected_scope=expected_scope, for_learning=for_learning, include_pending=include_pending)
+        if expected_scope is not None:
+            await self.assert_scope(session_id, expected_scope)
+        return result
+
+    async def read_profile_snapshot(self, conn, session_id, actor_ids, *, expected_scope=None,
+                                    for_learning=False, include_pending=False, as_of=None):
+        """Profile facts and pending inputs in the caller's existing snapshot."""
         from psycopg import AsyncServerCursor
         from tgchatbot.domain.profiles import profile_document
         from tgchatbot.storage.profiles import _identity, add_source_dates
-        async with self.pool.connection() as conn:
-            await conn.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
-            scope = await (await conn.execute('SELECT generation,context_id,revision FROM sessions '
-                                              'WHERE session_id=%s', (session_id,))).fetchone()
-            if scope is None and expected_scope is not None:
-                raise StaleScopeError('conversation scope is unavailable')
-            if scope is not None:
-                self._check_scope(scope, expected_scope)
+        scope = await (await conn.execute('SELECT generation,context_id,revision FROM sessions '
+                                          'WHERE session_id=%s', (session_id,))).fetchone()
+        if scope is None and expected_scope is not None:
+            raise StaleScopeError('conversation scope is unavailable')
+        if scope is not None:
+            self._check_scope(scope, expected_scope)
+        if as_of is None:
             as_of = (await (await conn.execute('SELECT clock_timestamp() AS at')).fetchone())['at']
-            profiles, facts = [], []
-            for actor_id in actor_ids:
-                identity, accepted = None, []
-                if scope is not None and actor_id != 'unknown':
-                    identity = await _identity(conn, session_id, scope['generation'], actor_id)
-                if scope is not None and actor_id != 'unknown':
-                    async with AsyncServerCursor(conn, name='profile_snapshot') as cursor:
-                        cursor.itersize = self.config.read_page_size
-                        await cursor.execute('SELECT f.* ' + self._current_profile_query(include_future=for_learning) + ' ORDER BY f.id DESC',
-                            (session_id, actor_id, as_of) if for_learning else (session_id, actor_id, as_of, as_of))
-                        async for fact in cursor:
-                            accepted.append(fact)
-                document = profile_document(actor_id, identity, accepted, known_agent=scope is not None)
-                profiles.append(document)
-                facts.extend(accepted)
-            if for_learning:
-                await add_source_dates(conn, profiles)
-            if include_pending:
-                # Learning publishes facts and consumes source spans atomically.
-                # Operator progress must describe that same committed snapshot.
-                pending_material = {actor_id: {'sources': 0, 'bytes': 0,
-                    'first_message_id': None, 'last_message_id': None} for actor_id in actor_ids}
-                if scope is not None:
-                    pending = await (await conn.execute('''SELECT actor_id,count(*) AS sources,
-                        sum(pending_bytes) AS bytes,min(message_id) AS first_message_id,
-                        max(message_id) AS last_message_id FROM profile_inputs
-                        WHERE session_id=%s AND generation=%s AND actor_id=ANY(%s) AND pending_bytes>0
-                        GROUP BY actor_id''', (session_id, scope['generation'], list(actor_ids)))).fetchall()
-                    pending_material.update({row['actor_id']: {key: int(value) for key, value in row.items()
-                        if key != 'actor_id'} for row in pending})
-        if expected_scope is not None:
-            await self.assert_scope(session_id, expected_scope)
+        profiles, facts = [], []
+        for actor_id in actor_ids:
+            identity, accepted = None, []
+            if scope is not None and actor_id != 'unknown':
+                identity = await _identity(conn, session_id, scope['generation'], actor_id)
+            if scope is not None and actor_id != 'unknown':
+                async with AsyncServerCursor(conn, name='profile_snapshot') as cursor:
+                    cursor.itersize = self.config.read_page_size
+                    await cursor.execute('SELECT f.* ' + self._current_profile_query(include_future=for_learning) + ' ORDER BY f.id DESC',
+                        (session_id, actor_id, as_of) if for_learning else (session_id, actor_id, as_of, as_of))
+                    async for fact in cursor:
+                        accepted.append(fact)
+            document = profile_document(actor_id, identity, accepted, known_agent=scope is not None)
+            profiles.append(document)
+            facts.extend(accepted)
+        if for_learning:
+            await add_source_dates(conn, profiles)
+        if include_pending:
+            # Learning publishes facts and consumes source spans atomically.
+            # Operator progress must describe that same committed snapshot.
+            pending_material = {actor_id: {'sources': 0, 'bytes': 0,
+                'first_message_id': None, 'last_message_id': None} for actor_id in actor_ids}
+            if scope is not None:
+                pending = await (await conn.execute('''SELECT actor_id,count(*) AS sources,
+                    sum(pending_bytes) AS bytes,min(message_id) AS first_message_id,
+                    max(message_id) AS last_message_id FROM profile_inputs
+                    WHERE session_id=%s AND generation=%s AND actor_id=ANY(%s) AND pending_bytes>0
+                    GROUP BY actor_id''', (session_id, scope['generation'], list(actor_ids)))).fetchall()
+                pending_material.update({row['actor_id']: {key: int(value) for key, value in row.items()
+                    if key != 'actor_id'} for row in pending})
         return {'scope': dict(scope) if scope is not None else None, 'as_of': as_of,
                 'profiles': profiles, 'facts': facts,
                 **({'pending_material': pending_material} if include_pending else {})}
@@ -1868,13 +1903,16 @@ class PostgresStore:
             return True
 
     async def job_status(self, session_id: str | None = None) -> list[dict[str, Any]]:
-        clause = ' AND j.session_id=%s' if session_id is not None else ''
         async with self.pool.connection() as conn:
-            return await (await conn.execute('''SELECT j.kind,j.status,count(*) AS count,min(j.created_at) AS oldest_at
-                FROM jobs j JOIN sessions s ON s.session_id=j.session_id AND s.generation=j.generation
-                WHERE (j.policy='memory' OR (j.context_id=s.context_id AND j.scope_revision=s.revision))'''
-                + clause + ' GROUP BY j.kind,j.status ORDER BY j.kind,j.status',
-                (session_id,) if session_id is not None else ())).fetchall()
+            return await self.read_job_status(conn, session_id)
+
+    async def read_job_status(self, conn, session_id=None):
+        clause = ' AND j.session_id=%s' if session_id is not None else ''
+        return await (await conn.execute('''SELECT j.kind,j.status,count(*) AS count,min(j.created_at) AS oldest_at
+            FROM jobs j JOIN sessions s ON s.session_id=j.session_id AND s.generation=j.generation
+            WHERE (j.policy='memory' OR (j.context_id=s.context_id AND j.scope_revision=s.revision))'''
+            + clause + ' GROUP BY j.kind,j.status ORDER BY j.kind,j.status',
+            (session_id,) if session_id is not None else ())).fetchall()
 
     async def cleanup_jobs(self, *, limit: int | None = None, older_than_seconds: float | None = None) -> int:
         """Bound the operational queue; originals and fact provenance are untouched."""

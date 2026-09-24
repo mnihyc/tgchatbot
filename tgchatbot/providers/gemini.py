@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 
 class GeminiProvider:
+    inspection_format = 'gemini'
     name = 'gemini'
     capabilities = ProviderCapabilities(multimodal_input=True, function_tools=True, native_web_search=True, multimodal_tool_results=True)
 

@@ -114,10 +114,10 @@ class TelegramCommandUIWorkflows(BusinessTestCase):
             self.assertIn('not a share of the target', self.received_text())
             await self.command('param', 'provider_retry_count', '3')
             await self.command('params', 'full')
-            full = self.received_document()
+            full = self.received_text()
             self.assertIn('provider_retry_count=3', full)
             self.assertIn('compact_tool_ratio_threshold=', full)
-            self.message.reply_text.assert_not_awaited()
+            self.message.reply_document.assert_not_awaited()
             await self.command('help', 'context')
             self.assertIn('audit-only', self.received_text())
             history.assert_not_awaited()
@@ -157,13 +157,13 @@ class TelegramCommandUIWorkflows(BusinessTestCase):
         self.assertIn(failure, self.received_text())
 
         await self.command('status', 'full')
-        full = self.received_document()
+        full = self.received_text()
         self.assertIn('estimated_request_tokens=', full)
         self.assertIn('compact_trigger_tokens=12000', full)
         self.assertIn('compact_tool_ratio_threshold=', full)
         self.assertIn(failure, full)
         self.assertIn(self.config.default_metadata_timezone, full)
-        self.message.reply_text.assert_not_awaited()
+        self.message.reply_document.assert_not_awaited()
 
     async def test_prompt_is_literal_and_shown_only_when_requested(self):
         prompt = '  Keep <b>these literal tags</b> & "quoted" text.\nDo not transform **source**.  '

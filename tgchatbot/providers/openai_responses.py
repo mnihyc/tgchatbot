@@ -19,21 +19,29 @@ from tgchatbot.logging_config import dump_llm_exchange
 logger = logging.getLogger(__name__)
 
 class OpenAIResponsesProvider:
+    inspection_format = 'responses'
     name = 'openai'
     capabilities = ProviderCapabilities(multimodal_input=True, function_tools=True, native_web_search=True, server_state=False, multimodal_tool_results=True)
 
     def __init__(self, config: OpenAIConfig) -> None:
-        if not config.api_key:
-            raise RuntimeError('OPENAI_API_KEY not set')
         self.config = config
-        self._client = httpx.AsyncClient(
-            base_url=config.base_url,
-            headers={'Authorization': f'Bearer {config.api_key}', 'Content-Type': 'application/json'},
-            timeout=httpx.Timeout(config.request_timeout_s, connect=config.connect_timeout_s),
-        )
+        self._client: httpx.AsyncClient | None = None
+
+    def _ensure_client(self) -> httpx.AsyncClient:
+        if not self.config.api_key:
+            raise RuntimeError('OPENAI_API_KEY not set')
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                base_url=self.config.base_url,
+                headers={'Authorization': f'Bearer {self.config.api_key}', 'Content-Type': 'application/json'},
+                timeout=httpx.Timeout(self.config.request_timeout_s, connect=self.config.connect_timeout_s),
+            )
+        return self._client
 
     async def aclose(self) -> None:
-        await self._client.aclose()
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
 
     def supports_tool_evidence(self, settings: SessionSettings) -> bool:
         return self.capabilities.multimodal_tool_results
@@ -164,7 +172,7 @@ class OpenAIResponsesProvider:
             # only built-in tool we register is web_search, so this env knob works as a simple
             # cap on native web searches without limiting function tool calls.
             payload['max_tool_calls'] = effective_native_web_search_max
-        response = await self._client.post('responses', json=payload)
+        response = await self._ensure_client().post('responses', json=payload)
         dump_llm_exchange(provider=self.name, model=settings.model, url='responses', payload=payload, response=response)
         if response.is_error:
             logger.error("OpenAI Responses error %s: %s", response.status_code, response.text[:4000])

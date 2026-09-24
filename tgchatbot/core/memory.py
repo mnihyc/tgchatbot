@@ -12,7 +12,7 @@ from tgchatbot.domain.profiles import chat_profile
 from tgchatbot.domain.identities import actor_reference, canonical_actor_id
 from tgchatbot.domain.provenance import (AGENT_PRESENTATION_VERSION, evidence_part_spans, message_evidence,
                                       present_image_evidence, present_tool_output)
-from tgchatbot.domain.timestamps import resolve_timezone
+from tgchatbot.domain.timestamps import parse_time_filter, resolve_timezone
 from tgchatbot.tools.base import ToolContext, ToolSpec
 from tgchatbot.storage.postgres_store import message_body
 from tgchatbot.operational import MemoryConfig, from_env
@@ -65,15 +65,7 @@ class MemoryService:
     async def search(self, session_id: str, query: str, *, scope=None, actor_id=None,
                      before=None, after=None, limit=None, timezone=None) -> dict[str, Any]:
         zone = resolve_timezone(timezone)
-        def search_time(value):
-            if value is None or isinstance(value, (int, float)) or str(value).isdigit():
-                return value
-            parsed = datetime.fromisoformat(value.replace('Z', '+00:00')) if isinstance(value, str) else value
-            if parsed.tzinfo is not None:
-                return parsed
-            return parsed.replace(tzinfo=zone)
-
-        before, after = search_time(before), search_time(after)
+        before, after = parse_time_filter(before, zone.key), parse_time_filter(after, zone.key)
         if scope is not None:
             await self.store.assert_scope(session_id, scope)
         query = str(query).strip()

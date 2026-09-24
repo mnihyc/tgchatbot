@@ -73,6 +73,8 @@ from tgchatbot.settings_schema import (
 )
 from tgchatbot.transports.telegram_render import MAX_TELEGRAM_TEXT_CHARS, TelegramMessageRenderer, _chunk_text_for_telegram, bot_message_safe
 from tgchatbot.transports import telegram_command_views as command_views
+from tgchatbot.transports.context_views import parse_context_arguments, render_context
+from tgchatbot.core.inspection import inspect_context
 
 logger = logging.getLogger(__name__)
 
@@ -391,13 +393,13 @@ class TelegramBotApp:
     async def _send_command_document(message: Message, text: str, *, filename: str, caption: str) -> None:
         await message.reply_document(document=text.encode('utf-8'), filename=filename, caption=caption)
 
-    async def _send_command(self, message: Message, text: str) -> None:
+    async def _send_command(self, message: Message, text: str, *, filename='command-details.txt', caption='Full details') -> None:
         plain = command_views.plain_text(text)
         # Telegram counts formatted text in UTF-16 units. Keep all content if
         # an unusually long model name, preset or diagnostic exceeds its limit.
         if len(plain.encode('utf-16-le')) // 2 > MessageLimit.MAX_TEXT_LENGTH:
             await self._send_command_document(message, plain,
-                filename='command-details.txt', caption='Full details')
+                filename=filename, caption=caption)
             return
         await message.reply_text(text, parse_mode='HTML')
 
@@ -412,6 +414,7 @@ class TelegramBotApp:
         self.application.add_handler(CommandHandler('delivery', self.delivery_command))
         self.application.add_handler(CommandHandler('stickers', self.stickers_command))
         self.application.add_handler(CommandHandler('status', self.status_command))
+        self.application.add_handler(CommandHandler('context', self.context_command))
         self.application.add_handler(CommandHandler('presets', self.presets_command))
         self.application.add_handler(CommandHandler('preset', self.preset_command))
         self.application.add_handler(CommandHandler('prompt', self.prompt_command))
@@ -697,16 +700,32 @@ class TelegramBotApp:
         chat = update.effective_chat
         if not chat or not self._allowed(chat):
             return
-        session_status = await self.runtime.describe_session(self._session_id(chat))
+        try:
+            session_status = await self.runtime.describe_session(self._session_id(chat))
+        except (ValueError, StaleScopeError) as exc:
+            await self._send_command(update.effective_message, html.escape(str(exc)))
+            return
         flow = await self._flow_snapshot(chat.id)
         topic = context.args[0].strip().lower() if context.args else ''
         if topic == 'full':
             lines = self._status_lines(session_status, flow)
-            await self._send_command_document(update.effective_message, '\n'.join(lines),
+            await self._send_command(update.effective_message, html.escape('\n'.join(lines)),
                 filename='status.txt', caption='Full chat status')
             return
         await self._send_command(update.effective_message, command_views.status_view(session_status, flow, topic))
 
+
+    async def context_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat, message = update.effective_chat, update.effective_message
+        if not chat or not message or not self._allowed(chat):
+            return
+        try:
+            topic, arguments = parse_context_arguments(context.args)
+            view = await inspect_context(self.runtime, self._session_id(chat), topic, **arguments)
+            text = render_context(view)
+        except (ValueError, StaleScopeError) as exc:
+            text = str(exc)
+        await self._send_command(message, html.escape(text), filename='context.txt', caption='Context details')
 
     async def params_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
@@ -715,8 +734,8 @@ class TelegramBotApp:
         session_status = await self.runtime.describe_settings(self._session_id(chat))
         topic = context.args[0].strip().lower() if context.args else ''
         if topic == 'full':
-            await self._send_command_document(update.effective_message,
-                '\n'.join(self._param_lines(session_status)),
+            await self._send_command(update.effective_message,
+                html.escape('\n'.join(self._param_lines(session_status))),
                 filename='settings.txt', caption='Full chat settings')
             return
         await self._send_command(update.effective_message,

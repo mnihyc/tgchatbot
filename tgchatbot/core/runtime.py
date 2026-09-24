@@ -48,6 +48,7 @@ from tgchatbot.domain.identities import (actor_reference, canonical_actor_id, ac
                                         latest_actor_observations, format_actor_labels)
 from tgchatbot.domain.attachments import attachment_description
 from tgchatbot.providers.base import ModelProvider, ProviderOutcomeError, RequestTokenEstimate
+from tgchatbot.providers.inspection import HistoryEntry
 from tgchatbot.providers.retry import transient_retry_delay
 from tgchatbot.settings_schema import (
     COMPACT_KEEP_RECENT_RATIO_MAX,
@@ -990,46 +991,8 @@ class AgentRuntime:
         }
 
     async def describe_session(self, session_id: str) -> dict[str, Any]:
-        state = await self._get_live_state(session_id)
-        settings = await self.store.get_or_create_session(session_id, self.config.default_session_settings())
-        provider = self._require_provider(settings.provider)
-        await self._load_request_estimate_bias(settings)
-        l0_blocks = sum(1 for block in state.blocks if block.level == 0)
-        l1_blocks = sum(1 for block in state.blocks if block.level == 1)
-        l2_blocks = sum(1 for block in state.blocks if block.level == 2)
-        catalog = getattr(self.tool_registry, 'sticker_catalog', None)
-        if catalog is not None:
-            await catalog.aensure_loaded()
-        tools = self._request_tools(settings)
-        instructions = build_system_prompt(settings, timezone=self.config.default_metadata_timezone)
-        sticker_stats = self.tool_registry.sticker_catalog.stats()
-        remote = self.tool_registry.remote_workspace
-        request_estimate = self._estimate_request_breakdown(
-            state=state, settings=settings, provider=provider, instructions=instructions, tools=tools)
-        return {
-            **self._describe_settings_values(settings, provider),
-            'memory_jobs': await self.store.job_status(session_id),
-            'scope': await self.store.get_scope(session_id),
-            'memory_last_error': getattr(getattr(self.memory, 'worker', None), 'last_error', None),
-            'semantic_enabled': bool(self.memory is not None and self.memory.embeddings.enabled),
-            'raw_messages': len(state.raw_messages),
-            'tool_history_messages': sum(1 for item in state.raw_messages if item.message.role == MessageRole.TOOL),
-            'memory_blocks': len(state.blocks),
-            'l0_blocks': l0_blocks,
-            'l1_blocks': l1_blocks,
-            'l2_blocks': l2_blocks,
-            'estimated_history_tokens': request_estimate.history_tokens,
-            'estimated_request_tokens': request_estimate.total_tokens,
-            'estimated_request_images': self._estimate_request_images(state),
-            'available_tools': [tool.name for tool in tools],
-            'provider_history_messages': len(self._build_provider_history(state, settings=settings, provider_name=provider.name)),
-            'loaded_in_memory': state.loaded,
-            'sticker_index_loaded': sticker_stats['loaded'],
-            'sticker_index_count': sticker_stats['stickers'],
-            'sticker_pack_count': sticker_stats['packs'],
-            'remote_enabled': bool(remote and remote.enabled),
-            'remote_master_ready': bool(remote and remote.enabled and getattr(remote, '_master_started', False)),
-        }
+        from tgchatbot.core.inspection import inspect_context
+        return (await inspect_context(self, session_id))['data']
 
     def _effective_max_interaction_rounds(self, settings: SessionSettings) -> int:
         if settings.max_interaction_rounds is not None:
@@ -1736,18 +1699,26 @@ class AgentRuntime:
         )
         if not state.provider_history_dirty and state.provider_history_cache and state.provider_history_cache_key == cache_key:
             return state.provider_history_cache
-        entries: list[tuple[tuple[int, int], ConversationMessage]] = []
-        for block in selected_blocks:
-            entries.append((self._history_position_for_block(block), block.render_as_message(timezone=self.config.default_metadata_timezone)))
-        for position, item in self._provider_history_rows(state.raw_messages):
-            for mapped in self._history_messages_for_provider(settings=settings, provider_name=provider_name, message=item.message):
-                mapped = attributed_message(mapped, message_id=item.db_id, timezone=self.config.default_metadata_timezone)
-                entries.append(((position, 1), mapped))
-        messages = [message for _key, message in sorted(entries, key=lambda item: item[0])]
+        messages = [entry.message for entry in self.project_context(state, settings=settings,
+            provider_name=provider_name, selected_blocks=selected_blocks)]
         state.provider_history_cache = messages
         state.provider_history_cache_key = cache_key
         state.provider_history_dirty = False
         return messages
+
+    def project_context(self, state, *, settings, provider_name, selected_blocks=None) -> list[HistoryEntry]:
+        """The request projection with source ownership kept outside its payload."""
+        entries = []
+        if selected_blocks is None:
+            selected_blocks = self._select_blocks_for_prompt(state, settings=settings)
+        for block in selected_blocks:
+            entries.append((self._history_position_for_block(block), HistoryEntry(
+                block.render_as_message(timezone=self.config.default_metadata_timezone), block_id=block.block_id)))
+        for position, item in self._provider_history_rows(state.raw_messages):
+            for mapped in self._history_messages_for_provider(settings=settings, provider_name=provider_name, message=item.message):
+                mapped = attributed_message(mapped, message_id=item.db_id, timezone=self.config.default_metadata_timezone)
+                entries.append(((position, 1), HistoryEntry(mapped, message_id=item.db_id)))
+        return [entry for _key, entry in sorted(entries, key=lambda item: item[0])]
 
     def _select_blocks_for_prompt(self, state: LiveConversationState, *, settings: SessionSettings) -> list[MemoryBlock]:
         blocks = [block for block in state.blocks if block.lifecycle == 'sealed']
