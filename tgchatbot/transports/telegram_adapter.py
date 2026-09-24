@@ -471,9 +471,19 @@ class TelegramBotApp:
         if context.args:
             await message.reply_text('Usage: /compact\nUses the target shown in /params context.')
             return
+        session_id = self._session_id(chat)
+        settings = await self.store.get_or_create_session(session_id, self._default_settings())
         progress = await message.reply_text('Compacting context…')
+        renderer = TelegramMessageRenderer(
+            progress,
+            response_delivery=ResponseDelivery.EDIT,
+            min_edit_interval_s=self.config.telegram.min_edit_interval_s,
+            source_message=message,
+            reply_to_source_message=self.config.telegram.reply_to_user_message,
+            process_visibility=settings.process_visibility,
+        )
         try:
-            result = await self.runtime.prepare_context(session_id=self._session_id(chat), force=True)
+            result = await self.runtime.prepare_context(session_id=session_id, force=True, emit=renderer.emit)
         except StaleScopeError:
             text = 'Compaction stopped: this chat was reset or changed.'
         except Exception:
@@ -482,8 +492,8 @@ class TelegramBotApp:
                     'Retry /compact; /params context shows the current limits.')
         else:
             text = command_views.compaction_result(result)
-        await progress.edit_text(text, parse_mode='HTML')
-        self._record_activity(self._session_id(chat))
+        await renderer.message.edit_text(text, parse_mode='HTML')
+        self._record_activity(session_id)
 
     async def reset_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat

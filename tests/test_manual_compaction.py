@@ -2,16 +2,19 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+
+from telegram.error import BadRequest
 
 from tests.business_helpers import BusinessTestCase
 from tgchatbot.core.memory import MemoryService
 from tgchatbot.core.memory_worker import MemoryWorker
 from tgchatbot.core.prompting import build_system_prompt
 from tgchatbot.core.runtime import AgentRuntime
-from tgchatbot.domain.models import ConversationMessage, MessageRole, ProviderResponse
+from tgchatbot.domain.models import ConversationMessage, MessageRole, ProcessVisibility, ProviderResponse
 from tgchatbot.transports.telegram_adapter import TelegramBotApp
 from tgchatbot.transports.telegram_command_views import plain_text
 
@@ -66,6 +69,89 @@ class ManualCompactionWorkflows(BusinessTestCase):
         return self.runtime._estimate_request_tokens(state,settings=settings,provider=self.provider,
             instructions=build_system_prompt(settings,timezone=self.config.default_metadata_timezone),
             tools=self.runtime._request_tools(settings))
+
+    async def test_progress_is_visible_before_the_next_batch_finishes(self):
+        await self.archive()
+        await self.settings(process_visibility=ProcessVisibility.STATUS)
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def held(**request):
+            if self.provider.requests:
+                entered.set()
+                await release.wait()
+            return await self.summarize(**request)
+        with patch.object(self.provider, 'generate', side_effect=held):
+            task = asyncio.create_task(self.app.compact_command(self.update, self.context))
+            try:
+                await asyncio.wait_for(entered.wait(), 5)
+                self.assertFalse(task.done())
+                shown = self.progress.edit_text.await_args.kwargs['text']
+                self.assertIn('Status: Compacting context', shown)
+                self.assertIn('raw_tokens=', shown)
+                self.assertNotIn('Context ready', shown)
+                self.message.reply_text.assert_awaited_once()
+                release.set()
+                await asyncio.wait_for(task, 10)
+            finally:
+                release.set()
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+        self.assertIn('Context ready', self.result_text())
+        self.message.reply_text.assert_awaited_once()
+
+    async def test_progress_uses_the_existing_visibility_modes(self):
+        self.app.config = replace(self.config, telegram=replace(self.config.telegram, min_edit_interval_s=0))
+        for visibility in ProcessVisibility:
+            with self.subTest(visibility=visibility):
+                await self.store.reset_context(self.session)
+                await self.archive()
+                await self.settings(process_visibility=visibility)
+                self.progress.edit_text.reset_mock()
+                self.message.reply_text.reset_mock()
+                with patch.object(self.provider, 'generate', side_effect=self.summarize):
+                    await self.app.compact_command(self.update, self.context)
+                updates = [call.kwargs['text'] for call in self.progress.edit_text.await_args_list
+                           if 'text' in call.kwargs]
+                if visibility in (ProcessVisibility.OFF, ProcessVisibility.MINIMAL):
+                    self.assertEqual(updates, [])
+                else:
+                    self.assertGreater(len(updates), 1)
+                    if visibility == ProcessVisibility.FULL:
+                        self.assertGreater(updates[-1].count('Status: Compacting context'), 1)
+                    else:
+                        self.assertTrue(all(text.count('Status: Compacting context') == 1 for text in updates))
+                self.assertIn('Context ready', self.result_text())
+                self.message.reply_text.assert_awaited_once()
+
+    async def test_progress_delivery_failure_does_not_interrupt_compaction(self):
+        originals = await self.archive()
+        async def unavailable(*args, **kwargs):
+            if kwargs.get('parse_mode') != 'HTML':
+                raise TimeoutError('Temporary Telegram edit failure')
+        self.progress.edit_text.side_effect = unavailable
+        with patch.object(self.provider, 'generate', side_effect=self.summarize):
+            await self.app.compact_command(self.update, self.context)
+        self.assertGreater(self.progress.edit_text.await_count, 1)
+        self.assertIn('Context ready', self.result_text())
+        self.assertGreater(len(await self.store.list_memory_blocks(self.session)), 1)
+        self.assertEqual(len(await self.store.read_messages(self.session,
+            [row.db_id for row in originals])), len(originals))
+
+    async def test_completion_edits_the_replacement_progress_message(self):
+        await self.archive()
+        self.progress.message_id = 500
+        self.progress.delete = AsyncMock()
+        self.progress.edit_text.side_effect = BadRequest('Message to edit not found')
+        replacement = SimpleNamespace(message_id=501, edit_text=AsyncMock())
+        bot = SimpleNamespace(send_message=AsyncMock(return_value=replacement))
+        self.message.chat = self.update.effective_chat
+        self.message.get_bot = lambda: bot
+        with patch.object(self.provider, 'generate', side_effect=self.summarize), self.assertLogs(
+                'tgchatbot.transports.telegram_render', level='WARNING'):
+            await self.app.compact_command(self.update, self.context)
+        bot.send_message.assert_awaited_once()
+        self.progress.edit_text.assert_awaited_once()
+        self.assertIn('Context ready', plain_text(replacement.edit_text.await_args.args[0]))
 
     async def test_command_bypasses_trigger_reaches_target_and_retains_profiles_and_originals(self):
         originals = await self.archive()
