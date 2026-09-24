@@ -38,7 +38,8 @@ selects that provider's configured model. `/model <id>` overrides it. The prompt
 and history survive switching; unavailable routes produce an error rather than
 silently sending the conversation to a different provider.
 
-Custom Chat Completions profiles use `LLM_PROVIDERS_JSON`:
+OpenAI and DeepSeek use the Responses API. Custom Chat Completions profiles use
+`LLM_PROVIDERS_JSON`:
 
 ```dotenv
 CUSTOM_LLM_KEY=replace-me

@@ -17,8 +17,9 @@ from tgchatbot.tools.base import ToolSpec
 
 
 class ChatCompletionsProvider:
-    """Stateless Chat Completions adapter for DeepSeek, OpenRouter and custom endpoints."""
+    """Stateless Chat Completions adapter for OpenRouter and custom endpoints."""
     inspection_format = 'chat_completions'
+    input_image_roles = (MessageRole.USER,)
 
     def __init__(self, config: ChatCompletionsConfig) -> None:
         self.config = config

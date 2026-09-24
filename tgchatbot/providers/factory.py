@@ -3,6 +3,7 @@ from __future__ import annotations
 from tgchatbot.config import AppConfig
 from tgchatbot.providers.base import ModelProvider
 from tgchatbot.providers.chat_completions import ChatCompletionsProvider
+from tgchatbot.providers.deepseek_responses import DeepSeekResponsesProvider
 from tgchatbot.providers.gemini import GeminiProvider
 from tgchatbot.providers.openai_responses import OpenAIResponsesProvider
 
@@ -16,6 +17,8 @@ def build_provider(config: AppConfig, name: str, *, require_credentials: bool = 
         return OpenAIResponsesProvider(config.openai)
     if name == 'gemini':
         return GeminiProvider(config.gemini)
+    if name == 'deepseek':
+        return DeepSeekResponsesProvider(config.provider_config(name))
     return ChatCompletionsProvider(config.provider_config(name))
 
 

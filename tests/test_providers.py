@@ -43,6 +43,11 @@ class ProviderConfigTests(unittest.TestCase):
                 self.assertEqual(config.default_provider, name)
                 self.assertEqual(config.default_session_settings().model, 'chosen-model')
 
+    def test_max_reasoning_effort_is_preserved_from_environment(self):
+        config = self.load(OPENAI_API_KEY='mock', OPENAI_REASONING_EFFORT='max')
+        self.assertEqual(config.openai.reasoning_effort, 'max')
+        self.assertEqual(self.load(OPENAI_API_KEY='mock').openai.reasoning_effort, 'none')
+
     def test_new_session_metadata_defaults_to_utc_plus_eight(self):
         for env in ({}, {'DEFAULT_METADATA_TIMEZONE': '  '}):
             with self.subTest(env=env):
@@ -268,10 +273,12 @@ class ToolEvidenceContractTests(unittest.TestCase):
 class ServiceTierContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_explicit_tier_reaches_native_request_and_errors_do_not_fall_back(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as directory:
-            for name in ('gemini', 'openai', 'deepseek'):
+            for name in ('gemini', 'openai', 'custom'):
                 with self.subTest(provider=name), patch.dict(os.environ, {
                     'APP_DATA_DIR': directory, 'TGBOT_TOKEN': 'mock', f'{name.upper()}_API_KEY': 'mock',
                     f'{name.upper()}_MODEL': 'gemini-3.8-flash' if name == 'gemini' else 'configured-model',
+                    **({'LLM_PROVIDERS_JSON': json.dumps([{'name': 'custom', 'api_key_env': 'CUSTOM_API_KEY',
+                        'base_url': 'https://test.invalid/', 'model': 'configured-model'}])} if name == 'custom' else {}),
                 }, clear=True):
                     config = load_config()
                     provider = build_provider(config, name)
@@ -293,7 +300,8 @@ class ServiceTierContractTests(unittest.IsolatedAsyncioTestCase):
                         return httpx.Response(200, json=body)
                     provider._client = httpx.AsyncClient(base_url='https://test.invalid/', transport=httpx.MockTransport(handle))
                     try:
-                        settings = replace(config.default_session_settings(), service_tier='flex', native_web_search_mode='off')
+                        settings = replace(config.default_session_settings(), provider=name, model=provider.config.model,
+                            service_tier='flex', native_web_search_mode='off')
                         args = {'settings': settings, 'messages': [ConversationMessage.user_text('Synthetic annotation')], 'instructions': 'Describe.', 'tools': []}
                         result = await provider.generate(**args)
                         if name == 'gemini':
@@ -609,7 +617,7 @@ class AllAdaptersContractTests(unittest.IsolatedAsyncioTestCase):
                     def handler(request):
                         captured.append(json.loads(request.content))
                         text = json.dumps(candidate)
-                        if name == 'openai':
+                        if name in {'openai', 'deepseek'}:
                             body = {'status': 'completed' if completed else 'incomplete', 'output': [{'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': text}]}]}
                         elif name == 'gemini':
                             body = {'candidates': [{'finishReason': 'STOP' if completed else 'MAX_TOKENS', 'content': {'role': 'model', 'parts': [{'text': text}]}}]}
@@ -625,7 +633,8 @@ class AllAdaptersContractTests(unittest.IsolatedAsyncioTestCase):
                         result = await runtime._generate_structured_candidate(provider, config.default_session_settings(), [ConversationMessage.user_text('Please use English')], mode='episode')
                         self.assertEqual(result['user_profile'], ['Use English'])
                         payload = captured[0]
-                        self.assertNotIn('tools', payload) if name in {'deepseek', 'openrouter'} else None
+                        if name in {'deepseek', 'openrouter'}:
+                            self.assertFalse(payload.get('tools'))
                         completed = False
                         with self.assertLogs('tgchatbot.core.runtime', level='ERROR'):
                             with self.assertRaises(CompactionModelRequestFailed) as failed:

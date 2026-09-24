@@ -2,14 +2,18 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
+
+import httpx
 
 from tests.business_helpers import BusinessTestCase
 from tgchatbot.core.memory import MemoryService
 from tgchatbot.domain.models import ConversationMessage
 from tgchatbot.providers.gemini import GeminiProvider
+from tgchatbot.providers.openai_responses import OpenAIResponsesProvider
 from tgchatbot.stickers.catalog import StickerCatalog
 from tgchatbot.storage.presets import PresetStore
 from tgchatbot.storage.sticker_catalog import StickerCatalogStore
@@ -64,6 +68,33 @@ class TelegramCommandUIWorkflows(BusinessTestCase):
         remote = SimpleNamespace(enabled=False, _master_started=False)
         self.runtime.tool_registry = ToolRegistry(self.config, remote, catalog)
         self.runtime.memory = MemoryService(self.store, SimpleNamespace(enabled=False))
+
+    async def test_max_reasoning_command_survives_reload_and_reset_to_default(self):
+        provider = OpenAIResponsesProvider(self.config.openai)
+        self.addAsyncCleanup(provider.aclose)
+        self.runtime.providers['openai'] = provider
+        await self.settings(provider='openai', model='gpt-6-luna')
+        await self.command('param', 'reasoning_effort')
+        self.assertIn('|max|', self.received_text())
+
+        await self.command('param', 'reasoning_effort', 'max')
+        restored = await (await self.new_store()).get_or_create_session(
+            self.session, self.config.default_session_settings())
+        self.assertEqual(restored.reasoning_effort, 'max')
+        self.assertIn('max', self.received_text())
+        requests = []
+        def respond(request):
+            requests.append(json.loads(request.content))
+            return httpx.Response(200, json={'status': 'completed', 'output': []})
+        provider._client = httpx.AsyncClient(base_url='https://fixture.invalid/', transport=httpx.MockTransport(respond))
+        await provider.generate(settings=restored, messages=[ConversationMessage.user_text('Hello.')], instructions='', tools=[])
+        self.assertEqual(requests[0]['reasoning']['effort'], 'max')
+
+        await self.command('param', 'reasoning_effort', 'default')
+        restored = await (await self.new_store()).get_or_create_session(
+            self.session, self.config.default_session_settings())
+        self.assertIsNone(restored.reasoning_effort)
+        self.assertIn('configured default', self.received_text())
 
     async def test_focused_setting_inspect_change_and_default_survive_reload(self):
         await self.command('params', 'model')

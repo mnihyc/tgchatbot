@@ -6,7 +6,7 @@ from typing import Iterable
 
 DEFAULT_METADATA_TIMEZONE = "Asia/Singapore"
 
-REASONING_EFFORT_VALUES = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
+REASONING_EFFORT_VALUES = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
 REASONING_SUMMARY_VALUES = frozenset({"off", "on", "auto", "detailed", "concise"})
 TEXT_VERBOSITY_VALUES = frozenset({"low", "medium", "high"})
 GEMINI_THINKING_LEVEL_VALUES = frozenset({"minimal", "low", "medium", "high"})

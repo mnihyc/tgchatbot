@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import copy
 import os
+from pathlib import Path
+import tempfile
 import unittest
 from dataclasses import replace
 from unittest.mock import patch
@@ -17,7 +19,10 @@ from tests.test_memory_image_tools import PIXEL
 
 class ContextAccountingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        with patch.dict(os.environ, {'DEFAULT_PROVIDER': 'gemini', 'DEEPSEEK_API_KEY': 'fixture-key'}, clear=True):
+        directory = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent)
+        self.addCleanup(directory.cleanup)
+        with patch.dict(os.environ, {'APP_DATA_DIR': directory.name,
+                'DEFAULT_PROVIDER': 'gemini', 'DEEPSEEK_API_KEY': 'fixture-key'}, clear=True):
             self.config = load_config(require_telegram=False)
 
     def tool(self, name, phase, payload, **metadata):
@@ -87,6 +92,25 @@ class ContextAccountingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row['assistant'], provider._estimate_part_tokens(text))
         self.assertEqual(row['tools'], provider._estimate_part_tokens(call) + provider._estimate_part_tokens(second))
         self.assertGreaterEqual(row['system'], provider._estimate_part_tokens(thought))
+
+    async def test_deepseek_accounting_matches_its_role_and_tool_image_support(self):
+        provider = build_provider(self.config, 'deepseek')
+        self.addAsyncCleanup(provider.aclose)
+        settings = replace(self.config.default_session_settings(), provider='deepseek', model=provider.config.model)
+        image = MessagePart(PartKind.IMAGE, mime_type='image/png', preview_ref='pending-preview')
+        unsupported = replace(image, data_b64=PIXEL)
+        result = self.tool('read_doc', 'result', {'output': {'ok': True}})
+        result.parts.append(unsupported)
+        messages = [ConversationMessage(MessageRole.USER, [image]),
+            ConversationMessage(MessageRole.ASSISTANT, [unsupported]), result]
+        for enabled in (True, False):
+            provider.capabilities = replace(provider.capabilities, multimodal_input=enabled)
+            raw = provider.estimate_request_tokens(settings=settings, messages=messages, instructions='', tools=[])
+            audit = inspect_history(provider, settings, [HistoryEntry(m) for m in messages], raw, raw)
+            self.assertIsNotNone(audit)
+            self.assertEqual(audit['images'], {'projected': 0, 'pending': int(enabled), 'unavailable': 0,
+                'unsupported': 2 if enabled else 3})
+            self.assertEqual(sum(audit['categories'].values()), raw.total_tokens)
 
     async def test_pending_and_missing_previews_are_not_reported_as_projected_pixels(self):
         provider = build_provider(self.config, 'gemini', require_credentials=False)

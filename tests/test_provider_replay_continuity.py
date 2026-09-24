@@ -16,10 +16,12 @@ from PIL import Image
 from tests.business_helpers import BusinessTestCase
 from tgchatbot.config import ChatCompletionsConfig
 from tgchatbot.core.runtime import AgentRuntime
+from tgchatbot.core.memory import MemoryService
 from tgchatbot.domain.models import (ChatMode, ConversationMessage, MessagePart, PartKind,
     ToolHistoryMode, ToolResult)
 from tgchatbot.providers.gemini import GeminiProvider
 from tgchatbot.providers.chat_completions import ChatCompletionsProvider
+from tgchatbot.providers.factory import build_provider
 from tgchatbot.providers.openai_responses import OpenAIResponsesProvider
 from tgchatbot.storage.previews import PreviewCache
 from tgchatbot.transports.telegram_adapter import TelegramBotApp
@@ -27,15 +29,25 @@ from tgchatbot.transports.telegram_adapter import TelegramBotApp
 
 class ProviderReplayContinuityTests(BusinessTestCase):
     async def test_openai_and_compatible_plain_tool_batches_preserve_reasoning_and_results(self):
-        for name in ('openai', 'compatible'):
+        for name in ('openai', 'compatible', 'deepseek'):
             with self.subTest(provider=name):
                 await self.store.reset_context(self.session)
                 self.runtime.invalidate_session(self.session)
                 wire = []
-                if name == 'openai':
-                    provider = OpenAIResponsesProvider(replace(self.config.openai, api_key='synthetic-key'))
+                if name in {'openai', 'deepseek'}:
+                    if name == 'openai':
+                        provider = OpenAIResponsesProvider(replace(self.config.openai, api_key='synthetic-key'))
+                        reasoning = {'type': 'reasoning', 'id': 'reasoning', 'encrypted_content': 'opaque-reasoning', 'summary': []}
+                    else:
+                        profile = ChatCompletionsConfig(name=name, api_key='synthetic-key',
+                            base_url='https://fixture.invalid/', model='deepseek-flash')
+                        self.config = replace(self.config, chat_completions=(profile,))
+                        self.runtime.config = self.config
+                        provider = build_provider(self.config, name)
+                        reasoning = {'type': 'reasoning', 'id': 'reasoning', 'summary': [],
+                            'content': [{'type': 'reasoning_text', 'text': 'Check both notes.'}]}
                     batch = [
-                        {'type': 'reasoning', 'id': 'reasoning', 'encrypted_content': 'opaque-reasoning', 'summary': []},
+                        reasoning,
                         {'type': 'message', 'id': 'introduction', 'role': 'assistant',
                             'content': [{'type': 'output_text', 'text': 'Checking both notes.'}]},
                         *[{'type': 'function_call', 'id': 'item-' + call_id, 'call_id': call_id,
@@ -94,6 +106,75 @@ class ProviderReplayContinuityTests(BusinessTestCase):
                     trigger_message_id=followup.db_id)
                 self.assertEqual(wire[3][history_key], wire[2][history_key])
                 self.assertEqual(self.tools.runner.run.await_count, 2)
+
+    async def test_deepseek_update_replays_legacy_history_and_post_compaction_profiles_after_restart(self):
+        profile = ChatCompletionsConfig(name='deepseek', api_key='synthetic-key',
+            base_url='https://fixture.invalid/', model='deepseek-flash')
+        self.config = replace(self.config, chat_completions=(profile,))
+        self.runtime.config = self.config
+        settings = await self.settings(provider='deepseek', model=profile.model,
+            mode=ChatMode.ASSIST, tool_history_mode=ToolHistoryMode.TRANSLATED, compact_trigger_tokens=100000)
+        legacy = ChatCompletionsProvider(profile)
+        await legacy.aclose()
+        self.addAsyncCleanup(legacy.aclose)
+        legacy_replies = [
+            {'role': 'assistant', 'content': 'Checking the old note.', 'reasoning_content': 'Keep the preference attached to its author.',
+                'tool_calls': [{'id': 'old-check', 'type': 'function', 'function': {'name': 'shell_exec', 'arguments': '{}'}}]},
+            {'role': 'assistant', 'content': 'The note is saved.', 'reasoning_content': 'The check completed.'},
+        ]
+        scripts = copy.deepcopy(legacy_replies)
+        def old_endpoint(request):
+            message = scripts.pop(0)
+            return httpx.Response(200, json={'choices': [{'message': message,
+                'finish_reason': 'tool_calls' if message.get('tool_calls') else 'stop'}]})
+        legacy._client = httpx.AsyncClient(base_url=profile.base_url, transport=httpx.MockTransport(old_endpoint))
+        self.runtime.providers = {'deepseek': legacy}
+        source = await self.runtime.ingest_user_message(session_id=self.session,
+            incoming_message=ConversationMessage.user_text('I prefer jasmine tea.', metadata={
+                'actor_id': 'telegram:user:7', 'actor_kind': 'user', 'actor_name': 'Participant'}))
+        result = await self.runtime.run_turn_from_stored(session_id=self.session,
+            user_display_name='Participant', trigger_message_id=source.db_id)
+        await self.runtime.record_assistant_text(session_id=self.session, text=result.text, metadata={'provider_native': {
+            'provider': 'deepseek', 'model': settings.model, 'items': result.provider_history_items}})
+        await self.store.save_profile_fact(self.session, subject_actor_id='telegram:user:7',
+            asserted_by='telegram:user:7', claim='Prefers jasmine tea', source_ids=[source.db_id])
+        await self.store.create_memory_block(self.session, summary_text='Earlier tea preference.',
+            estimated_tokens=10, source_message_ids=[source.db_id])
+
+        provider = build_provider(self.config, 'deepseek')
+        self.addAsyncCleanup(provider.aclose)
+        wire = []
+        def new_endpoint(request):
+            self.assertEqual(request.url.path, '/responses')
+            wire.append(json.loads(request.content))
+            return httpx.Response(200, json={'status': 'completed', 'output': [
+                {'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': 'Jasmine tea.'}]}]})
+        provider._client = httpx.AsyncClient(base_url=profile.base_url, transport=httpx.MockTransport(new_endpoint))
+        self.runtime.providers = {'deepseek': provider}
+        self.runtime.memory = MemoryService(self.store, SimpleNamespace(enabled=False))
+        trigger = await self.runtime.ingest_user_message(session_id=self.session,
+            incoming_message=ConversationMessage.user_text('Which tea did I prefer?'))
+        await self.runtime.run_turn_from_stored(session_id=self.session,
+            user_display_name='Participant', trigger_message_id=trigger.db_id)
+        items = wire[0]['input']
+        calls = [item for item in items if item.get('type') == 'function_call']
+        self.assertEqual([item['name'] for item in calls], ['shell_exec', 'user_profile_fetch'])
+        outcomes = {item['call_id']: item['output'] for item in items if item.get('type') == 'function_call_output'}
+        self.assertEqual(set(outcomes), {item['call_id'] for item in calls})
+        self.assertIn('Prefers jasmine tea', outcomes[calls[1]['call_id']])
+        self.assertEqual([part['text'] for item in items if item.get('type') == 'reasoning' for part in item['content']],
+            [message['reasoning_content'] for message in legacy_replies])
+        for message in legacy_replies:
+            self.assertEqual(sum(item.get('content') == message['content'] for item in items), 1)
+
+        await self.store.close()
+        reopened = await self.new_store()
+        restored = AgentRuntime(config=self.config, store=reopened, tool_registry=self.tools,
+            providers={'deepseek': provider}, memory=MemoryService(reopened, SimpleNamespace(enabled=False)))
+        await restored.run_turn_from_stored(session_id=self.session,
+            user_display_name='Participant', trigger_message_id=trigger.db_id)
+        self.assertEqual(wire[1]['input'], items)
+        self.assertEqual(self.tools.runner.run.await_count, 1, 'Completed legacy tools are replayed, not executed again')
 
     async def test_signed_parallel_and_sequential_calls_and_delivered_reply_keep_request_prefix(self):
         settings = await self.settings(provider='gemini', model='gemini-3.8-flash',

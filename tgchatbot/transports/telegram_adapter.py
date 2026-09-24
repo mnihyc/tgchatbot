@@ -55,6 +55,7 @@ from tgchatbot.settings_schema import (
     MAX_OUTPUT_TOKENS_MIN,
     NATIVE_WEB_SEARCH_MAX_MIN,
     PROVIDER_RETRY_COUNT_MIN,
+    REASONING_EFFORT_VALUES,
     REASONING_SUMMARY_VALUES,
     SPONTANEOUS_REPLY_CHANCE_MAX,
     SPONTANEOUS_REPLY_CHANCE_MIN,
@@ -279,7 +280,7 @@ class TelegramBotApp:
 
     def _parameter_usage(self, settings: SessionSettings) -> dict[str, str]:
         usage = {
-            'reasoning_effort': 'reasoning_effort <none|minimal|low|medium|high|xhigh|default>',
+            'reasoning_effort': 'reasoning_effort <none|minimal|low|medium|high|xhigh|max|default>',
             'reasoning_summary': 'reasoning_summary <off|on|auto|detailed|concise|default>',
             'text_verbosity': 'text_verbosity <low|medium|high|default>',
             'include_thoughts': 'include_thoughts <on|off|default>',
@@ -764,7 +765,7 @@ class TelegramBotApp:
             if not self._provider_supports_control(settings, 'reasoning_effort'):
                 await update.effective_message.reply_text('reasoning_effort is not supported by the current provider/model.')
                 return
-            allowed = {'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'default'}
+            allowed = REASONING_EFFORT_VALUES | {'default'}
             if value not in allowed:
                 await update.effective_message.reply_text(f'Invalid reasoning_effort. Current effective value: {settings.reasoning_effort or self._provider_reasoning_effort_default(settings.provider)}')
                 return

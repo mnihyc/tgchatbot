@@ -89,14 +89,14 @@ def inspect_history(provider, settings, entries: list[HistoryEntry], raw_estimat
 
     for index, entry in enumerate(entries):
         message = entry.message
-        tool_images = kind != 'gemini' or provider.supports_tool_evidence(settings)
-        pending_messages = ([message] if kind != 'chat_completions' or
-                            provider.capabilities.multimodal_input and message.role == MessageRole.USER else [])
+        tool_images = provider.supports_tool_evidence(settings)
+        supported = (provider.capabilities.multimodal_input and
+                     message.role in getattr(provider, 'input_image_roles', tuple(MessageRole)))
+        pending_messages = [message] if supported else []
         pending = pending_image_tokens(pending_messages, tool_images=tool_images)
         add(index, content_category(entry), pending)
         images['pending'] += pending // TokenEstimator.IMAGE_TOKENS
         pixels = [p for p in message.parts if p.kind == PartKind.IMAGE]
-        supported = (kind != 'chat_completions' or provider.capabilities.multimodal_input and message.role == MessageRole.USER)
         supported = supported and (tool_images or message.role != MessageRole.TOOL)
         images['unsupported'] += sum(bool(p.data_b64 or p.preview_ref) for p in pixels) if not supported else 0
         images['unavailable'] += sum(not p.data_b64 and not p.preview_ref for p in pixels) if supported else 0
