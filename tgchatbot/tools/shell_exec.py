@@ -19,7 +19,7 @@ class ShellExecTool:
             name='shell_exec',
             description=(
                 'Run POSIX sh in a new process in this chat\'s remote workspace (TGCHATBOT_SESSION_DIR). '
-                'Files persist; shell state does not. Attachment paths use YYYY-MM-DD/; create dated or custom folders. '
+                'Files persist; shell state does not. User-uploaded attachments are in attachments/YYYY-MM-DD/; create dated or custom folders. '
                 'Each call executes again. Inspect stdout, stderr and returncode; file_send delivers files.'
             ),
             parameters_schema={

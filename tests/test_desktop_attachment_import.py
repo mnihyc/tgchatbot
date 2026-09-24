@@ -30,7 +30,7 @@ class DesktopAttachmentImportTests(BusinessTestCase):
         self.remote_files = {}
         self.staged = []
 
-        async def sync(session, paths, *, sent_at=None, filenames=None):
+        async def sync(session, paths, *, sent_at=None, filenames=None, user_id=None):
             self.assertEqual(session, self.session)
             # Import must have committed source identity before remote work.
             self.assertTrue(await self.store.list_canonical_messages(self.session))
@@ -73,6 +73,8 @@ class DesktopAttachmentImportTests(BusinessTestCase):
             await self.ingest(records)
             originals = await self.store.list_canonical_messages(self.session)
             self.assertEqual(len(originals), len(media))
+            self.assertEqual([call.kwargs['user_id'] for call in self.remote.sync_inputs.call_args_list],
+                [int(item.message.metadata['actor_id'].removeprefix('telegram:user:')) for item in originals])
             for item, (field, filename, mime, raw) in zip(originals, media):
                 imported = next(part for part in item.message.parts if part.kind == PartKind.FILE)
                 async def download(buffer, raw=raw):
@@ -167,7 +169,7 @@ class DesktopAttachmentImportTests(BusinessTestCase):
                  '2026-04-30T16:01:00+00:00': '2026-05-01'}
         expected_paths = {}
         seen = []
-        async def sync(session, paths, *, sent_at=None, filenames=None):
+        async def sync(session, paths, *, sent_at=None, filenames=None, user_id=None):
             self.assertEqual(session, self.session)
             day = dates[sent_at]
             receipts = {}
@@ -285,8 +287,8 @@ class DesktopAttachmentImportTests(BusinessTestCase):
 
     async def test_full_reset_during_upload_does_not_reintroduce_old_generation_message(self):
         (self.bundle / 'notes.txt').write_bytes(b'A retained export original')
-        async def reset_then_sync(session, paths, *, sent_at=None, filenames=None):
-            result = await self.sync(session, paths, sent_at=sent_at, filenames=filenames)
+        async def reset_then_sync(session, paths, *, sent_at=None, filenames=None, user_id=None):
+            result = await self.sync(session, paths, sent_at=sent_at, filenames=filenames, user_id=user_id)
             await self.store.reset_full(self.session, self.config.default_session_settings())
             return result
         self.remote.sync_inputs.side_effect = reset_then_sync

@@ -27,6 +27,7 @@ from ijson.common import ObjectBuilder
 from tgchatbot.domain.models import ConversationMessage, MessagePart, MessageRole, PartKind, SessionSettings
 from tgchatbot.config import TelegramConfig
 from tgchatbot.domain.provenance import telegram_actor, telegram_metadata, utc_time
+from tgchatbot.domain.identities import telegram_user_id
 from tgchatbot.domain.timestamps import resolve_timezone
 from tgchatbot.media.attachments import sync_attachment_parts
 from tgchatbot.storage.artifacts import ArtifactStore
@@ -323,7 +324,8 @@ async def _sync_import_attachment(message: ConversationMessage, record: dict[str
                 pending = replace(descriptor, artifact_path=str(staged), remote_sync=True,
                     size_bytes=staged.stat().st_size)
                 synced = await sync_attachment_parts(session_id, [pending], remote_workspace,
-                    sent_at=message.metadata.get('sent_at'))
+                    sent_at=message.metadata.get('sent_at'),
+                    user_id=telegram_user_id(message.metadata.get('actor_id')))
             descriptor = next(part for part in synced if part.kind == PartKind.FILE)
         except OSError:
             descriptor.detail = 'remote copy unavailable: exported file could not be read'

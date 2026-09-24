@@ -47,6 +47,7 @@ from tgchatbot.transports.telegram_routing import topic_arguments
 from tgchatbot.storage.postgres_store import PostgresStore, StaleScopeError
 from tgchatbot.storage.presets import PresetStore
 from tgchatbot.domain.provenance import utc_time, telegram_metadata, telegram_actor
+from tgchatbot.domain.identities import telegram_user_id
 from tgchatbot.tools.remote_workspace import RemoteWorkspaceClient
 from tgchatbot.settings_schema import (
     COMPACT_TOOL_RATIO_THRESHOLD_MIN,
@@ -1496,7 +1497,8 @@ class TelegramBotApp:
                 await self.store.assert_scope(session_id, {key: intake_scope[key] for key in ('generation', 'context_id')})
             if parts:
                 parts = await self._sync_parts_to_remote(session_id, parts,
-                    sent_at=canonical_metadata.get('sent_at'))
+                    sent_at=canonical_metadata.get('sent_at'),
+                    user_id=telegram_user_id(canonical_metadata.get('actor_id')))
             if attachment_parts and not any(part.kind != PartKind.TEXT for part in parts):
                 # Download failure or disabled processing must still leave a
                 # searchable attachment reference in the current revision.
@@ -1658,8 +1660,9 @@ class TelegramBotApp:
 
 
     async def _sync_parts_to_remote(self, session_id: str, parts: list[MessagePart], *,
-                                    sent_at: datetime | str | None = None) -> list[MessagePart]:
-        return await sync_attachment_parts(session_id, parts, self.remote_workspace, sent_at=sent_at)
+                                    sent_at: datetime | str | None = None,
+                                    user_id: int | None = None) -> list[MessagePart]:
+        return await sync_attachment_parts(session_id, parts, self.remote_workspace, sent_at=sent_at, user_id=user_id)
 
     async def _promote_candidate_after_delay(self, chat_id: int, token: int, candidate: ReplyCandidate, delay_s: float) -> None:
         await asyncio.sleep(delay_s)

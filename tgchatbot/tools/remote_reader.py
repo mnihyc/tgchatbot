@@ -7,14 +7,14 @@ import base64
 from contextlib import closing
 import json
 import math
+import os
 from pathlib import Path
 import sys
 
 
 def read_document(request):
-    path = Path(request['path']).resolve()
-    if not path.is_relative_to(Path(request['root']).resolve()):
-        raise ValueError('File is outside this workspace')
+    selected = resolve_workspace_file(request['root'], request['path'])
+    path = Path(selected['path'])
     if not path.is_file():
         raise ValueError('File is unavailable')
     fmt = request['file_format']
@@ -31,6 +31,8 @@ def read_document(request):
     parts, used_tokens, used_bytes, used_images = [], 0, 0, 0
     limits = request['limits']
     details = {}
+    if selected['workspace_path'] != os.path.relpath(request['path'], request['root']):
+        details['path'] = selected['workspace_path']
 
     def append(*new_parts, stop_when_full=False):
         nonlocal used_tokens, used_bytes, used_images

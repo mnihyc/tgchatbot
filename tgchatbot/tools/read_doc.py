@@ -49,7 +49,8 @@ class ReadDocTool:
             result = await self.remote.inspect_file(session_id=ctx.session_id, path=path,
                 file_format=fmt, start=args.get('start'), end=args.get('end'), limits=limits)
             output = {key: value for key, value in result.items() if key != 'parts'}
-            output.update(path=path, file_format=fmt)
+            output.setdefault('path', path)
+            output['file_format'] = fmt
             if result.get('ok'):
                 parts = [MessagePart(kind=PartKind(part['kind']), text=part.get('text'),
                     filename=part.get('filename'), mime_type=part.get('mime_type'),

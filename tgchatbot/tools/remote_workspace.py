@@ -217,13 +217,14 @@ class RemoteWorkspaceClient:
 
     async def sync_inputs(self, session_id: str, local_paths: tuple[Path, ...] | list[Path], *,
                           sent_at: datetime | str | None = None,
-                          filenames: dict[str, str] | None = None) -> RemoteSyncResult:
+                          filenames: dict[str, str] | None = None,
+                          user_id: int | None = None) -> RemoteSyncResult:
         paths = await self.ensure_session_dirs(session_id)
         # Intake owns the original UTC timestamp and filename. The workspace
         # owns their remote location and reports each successful overwrite.
         day = format_timestamp(sent_at if sent_at is not None else datetime.now(timezone.utc),
             self.config.default_metadata_timezone).split('T', 1)[0]
-        upload_dir = f"{paths.root.rstrip('/')}/{day}"
+        upload_dir = f"{paths.root.rstrip('/')}/attachments/{day}"
         to_upload: list[tuple[Path, str]] = []
         skipped_oversize = 0
         for path in local_paths:
@@ -236,7 +237,7 @@ class RemoteWorkspaceClient:
                 continue
             key = str(path.resolve())
             filename = await asyncio.to_thread(self._upload_filename, path,
-                (filenames or {}).get(key) or path.name)
+                (filenames or {}).get(key) or path.name, user_id)
             to_upload.append((path, f'{upload_dir}/{filename}'))
         if to_upload:
             result = await self._run_ssh_command(f"mkdir -p {shq(upload_dir)}",
@@ -267,14 +268,15 @@ class RemoteWorkspaceClient:
         return RemoteSyncResult(paths_by_source=paths_by_source)
 
     @staticmethod
-    def _upload_filename(path: Path, original_name: str) -> str:
+    def _upload_filename(path: Path, original_name: str, user_id: int | None = None) -> str:
         filename = Path(original_name).name
         if filename in {'', '.', '..'}:
             filename = path.name
         with path.open('rb') as stream:
             file_id = hashlib.file_digest(stream, 'sha256').hexdigest()[:16]
         named = Path(filename)
-        return f'{named.stem}_{file_id}{named.suffix}'
+        uploader = f'_{user_id}' if user_id is not None else ''
+        return f'{named.stem}{uploader}_{file_id}{named.suffix}'
 
     async def run_shell(self, *, session_id: str, command: str, timeout_s: int) -> dict[str, Any]:
         paths = await self.ensure_session_dirs(session_id)
@@ -325,7 +327,8 @@ class RemoteWorkspaceClient:
                     results.append(RemoteFileResult(workspace_path,
                         error=f'Request exceeds the configured file limit ({max_files}).'))
                     continue
-                remote_path = resolved[index]
+                remote_path = resolved[index]['path']
+                workspace_path = resolved[index]['workspace_path']
                 filename = posixpath.basename(requested_path)
                 local_path = None
                 retained = False
@@ -380,20 +383,13 @@ class RemoteWorkspaceClient:
             raise
         return results
 
-    async def _resolve_remote_paths(self, paths: RemoteSessionPaths, selected: list[str]) -> list[str]:
+    async def _resolve_remote_paths(self, paths: RemoteSessionPaths, selected: list[str]) -> list[dict[str, str]]:
         # Lexical prefix checks cannot see remote symlinks. Resolve once before
         # any transfer, preserving the requested alias only as its upload name.
-        program = (
-            'import json\nfrom pathlib import Path\n'
-            f'root = Path({paths.root!r}).resolve()\n'
-            'resolved = []\n'
-            f'for value in {selected!r}:\n'
-            '    path = Path(value).resolve()\n'
-            '    if not path.is_relative_to(root):\n'
-            '        raise ValueError("Requested remote path is outside the session workspace")\n'
-            '    resolved.append(str(path))\n'
-            'print(json.dumps(resolved, ensure_ascii=False))\n'
-        )
+        program = (files('tgchatbot.tools').joinpath('workspace_paths.py').read_text()
+            + '\nimport json\n'
+            + f'print(json.dumps([resolve_workspace_file({paths.root!r}, value) '
+              f'for value in {selected!r}], ensure_ascii=False))\n')
         result = await self._run_ssh_command(f'python3 -c {shq(program)}',
             timeout_s=self.ssh.default_timeout_s, full_stdout=True)
         if not result['ok']:
@@ -409,6 +405,7 @@ class RemoteWorkspaceClient:
         request = {'root': paths.root, 'path': selected, 'file_format': file_format,
                    'start': start, 'end': end, 'limits': limits}
         program = (files('tgchatbot.media').joinpath('image_encoding.py').read_text()
+                   + '\n' + files('tgchatbot.tools').joinpath('workspace_paths.py').read_text()
                    + '\n' + files('tgchatbot.tools').joinpath('remote_reader.py').read_text())
         result = await self._run_ssh_command(
             f'python3 -c {shq(program)} {shq(json.dumps(request))}',

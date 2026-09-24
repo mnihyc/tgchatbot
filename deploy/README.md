@@ -123,8 +123,9 @@ Configure SSH in `.env` before enabling remote tools. Keep an SSH identity under
 retained under `data/home/.ssh/known_hosts`.
 
 Each chat has one working directory, also available as `TGCHATBOT_SESSION_DIR`.
-Uploads use `YYYY-MM-DD/name_<file-id>.ext`; tool paths are relative to that
-directory. Files remain until explicitly removed.
+Tool paths are relative to this directory. New user-uploaded attachments use
+`attachments/YYYY-MM-DD/name_<user-id>_<file-id>.ext`; anonymous senders omit the
+user ID. Existing filenames are kept. Files remain until explicitly removed.
 
 `read_doc` reads a selected workspace file through the remote host's `python3`.
 Install Pillow for images and pypdfium2 for PDFs in that Python environment

@@ -7,6 +7,13 @@ import json
 from typing import Any
 
 
+def telegram_user_id(actor_id: str | None) -> int | None:
+    """Return the actual user identity; a sender chat is not its posting account."""
+    if actor_id and actor_id.startswith('telegram:user:'):
+        return int(actor_id.removeprefix('telegram:user:'))
+    return None
+
+
 def actor_reference(actor_id: str) -> str:
     """Use the complete Telegram numeric identity with a concise namespace."""
     for canonical, reference in (('telegram:user:', 'person_id:'), ('telegram:chat:', 'chat_id:')):

@@ -14,7 +14,8 @@ logger = logging.getLogger(__name__)
 
 
 async def sync_attachment_parts(session_id: str, parts: list[MessagePart], remote_workspace, *,
-                                sent_at: datetime | str | None = None) -> list[MessagePart]:
+                                sent_at: datetime | str | None = None,
+                                user_id: int | None = None) -> list[MessagePart]:
     syncable_parts = [part for part in parts if part.artifact_path and part.remote_sync]
     local_paths = [part.artifact_path for part in syncable_parts if part.artifact_path]
     if not local_paths:
@@ -35,7 +36,7 @@ async def sync_attachment_parts(session_id: str, parts: list[MessagePart], remot
     paths_by_source: dict[str, str] = {}
     try:
         sync_result = await remote_workspace.sync_inputs(session_id, local_path_objs,
-            sent_at=sent_at, filenames=filenames)
+            sent_at=sent_at, filenames=filenames, user_id=user_id)
         paths_by_source = sync_result.paths_by_source
         logger.info('attachment.sync.ok sid=%s requested=%s synced=%s', clip_for_log(session_id, limit=48), len(local_path_objs), len(paths_by_source))
     except Exception as exc:

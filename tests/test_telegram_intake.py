@@ -59,7 +59,7 @@ class TelegramIntakeTests(BusinessTestCase):
         self.app._register_handlers()
         transferred = []
 
-        async def sync(_session, paths, *, sent_at=None, filenames=None):
+        async def sync(_session, paths, *, sent_at=None, filenames=None, user_id=None):
             transferred.extend((path.name, path.read_bytes()) for path in paths)
             receipts = {}
             for path in paths:
@@ -249,7 +249,7 @@ class TelegramIntakeTests(BusinessTestCase):
         document = SimpleNamespace(file_id='synthetic-document', file_unique_id='unique-document',
             file_name='notes.txt', mime_type='text/plain', file_size=24, get_file=AsyncMock(return_value=file))
         uploaded = []
-        async def sync(session, paths, *, sent_at=None, filenames=None):
+        async def sync(session, paths, *, sent_at=None, filenames=None, user_id=None):
             uploaded.extend(paths)
             self.assertTrue(all(path.exists() for path in paths))
             self.assertEqual(list(filenames.values()), ['notes.txt'])
@@ -272,8 +272,29 @@ class TelegramIntakeTests(BusinessTestCase):
         self.assertEqual(remote_parts[0].workspace_path, '2026-01-01/notes_0123456789abcdef.txt')
         self.assertEqual(rows[1]['metadata']['telegram_attachments'][0]['file_id'], 'synthetic-document')
         self.app.remote_workspace.sync_inputs.assert_awaited_once()
+        self.assertEqual(self.app.remote_workspace.sync_inputs.call_args.kwargs['user_id'], 7)
         self.assertTrue(uploaded and all(not path.exists() for path in uploaded), 'Temporary downloads keep their existing cleanup behavior')
         self.app._promote_candidate_after_delay.assert_awaited_once()
+
+    async def test_upload_owner_uses_sender_identity_without_claiming_forwarded_or_anonymous_authorship(self):
+        async def download(buffer):
+            buffer.write(b'Document')
+        file = SimpleNamespace(download_to_memory=AsyncMock(side_effect=download))
+        document = SimpleNamespace(file_id='identity-document', file_unique_id='identity-unique',
+            file_name='notes.txt', mime_type='text/plain', file_size=8,
+            get_file=AsyncMock(return_value=file))
+        self.app.remote_workspace = SimpleNamespace(enabled=True,
+            session_paths=lambda session: SimpleNamespace(root='/remote'),
+            sync_inputs=AsyncMock(return_value=RemoteSyncResult({})))
+        forwarded = self.update(None, document=document, actor=17)
+        forwarded.effective_message.forward_origin = SimpleNamespace(to_dict=lambda:
+            {'type': 'user', 'sender_user': {'id': 999, 'first_name': 'Original author'}})
+        await self.ingest(forwarded)
+        self.assertEqual(self.app.remote_workspace.sync_inputs.call_args.kwargs['user_id'], 17)
+        anonymous = self.update(None, document=document, source_id=2, actor=1087968824)
+        anonymous.effective_message.sender_chat = SimpleNamespace(id=-10042, title='Channel')
+        await self.ingest(anonymous)
+        self.assertIsNone(self.app.remote_workspace.sync_inputs.call_args.kwargs['user_id'])
 
     async def test_identical_photo_redelivery_serializes_download_and_preserves_enriched_revision(self):
         entered, release = asyncio.Event(), asyncio.Event()
@@ -305,7 +326,7 @@ class TelegramIntakeTests(BusinessTestCase):
         dates = {'2026-04-30T15:59:00+00:00': '2026-04-30',
                  '2026-04-30T16:01:00+00:00': '2026-05-01'}
         uploaded, observed = {}, []
-        async def sync(session, paths, *, sent_at=None, filenames=None):
+        async def sync(session, paths, *, sent_at=None, filenames=None, user_id=None):
             self.assertEqual(session, self.session)
             observed.append(sent_at)
             receipts = {}

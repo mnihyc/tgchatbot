@@ -111,7 +111,7 @@ class StorageLayoutTests(BusinessTestCase):
             remote_path = remote.session_paths(self.session).root + '/2026-04-30/report_0123456789abcdef.txt'
             uploaded = {}
 
-            async def sync_inputs(session_id, paths, *, sent_at=None, filenames=None):
+            async def sync_inputs(session_id, paths, *, sent_at=None, filenames=None, user_id=None):
                 paths_by_source = {}
                 for path in paths:
                     self.assertEqual(filenames[str(path.resolve())], 'report.txt')
@@ -142,7 +142,8 @@ class StorageLayoutTests(BusinessTestCase):
         remote = RemoteWorkspaceClient(config)
         paths = remote.session_paths(self.session)
         remote.ensure_session_dirs = AsyncMock(return_value=paths)
-        remote._resolve_remote_paths = AsyncMock(side_effect=lambda paths, selected: selected)
+        remote._resolve_remote_paths = AsyncMock(side_effect=lambda paths, selected:
+            [{'path': path, 'workspace_path': str(Path(path).relative_to(paths.root))} for path in selected])
 
         async def scp(*arguments, **kwargs):
             # Only the process boundary is mocked: fetch path construction and

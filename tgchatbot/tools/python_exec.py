@@ -19,7 +19,7 @@ class PythonExecTool:
             name='python_exec',
             description=(
                 'Run Python 3 in a new process in this chat\'s remote workspace (TGCHATBOT_SESSION_DIR). '
-                'Files persist; Python variables do not. Attachment paths use YYYY-MM-DD/; create dated or custom folders. '
+                'Files persist; Python variables do not. User-uploaded attachments are in attachments/YYYY-MM-DD/; create dated or custom folders. '
                 'Each call executes again. Print useful results; file_send delivers files.'
             ),
             parameters_schema={
