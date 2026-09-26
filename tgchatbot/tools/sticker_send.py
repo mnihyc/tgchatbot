@@ -251,16 +251,16 @@ class StickerSendSelectedTool:
         self.catalog = catalog
         self.spec = ToolSpec(
             name='sticker_send_selected',
-            description='Send one known sticker. Each call creates a new send request, including repeat calls for the same sticker_id. '
-                'queued confirms acceptance for automatic delivery after the final response; sent confirms delivery; '
+            description='Add one selected sticker to your reply. Each call creates a new send request, including repeat calls for the same sticker_id. '
+                'queued confirms acceptance for automatic delivery; sent confirms delivery; '
                 'unknown means it may already have been delivered.',
             parameters_schema={
                 'type': 'object',
                 'properties': {
                     'selected_sticker_id': _param('string', 'Exact sticker_id returned by sticker_query.'),
-                    'delivery_timing': _param('string', 'send_now sends immediately and returns the delivery outcome. '
-                        'after_final sends automatically when the turn ends, including with no final text. Defaults to after_final.',
-                        enum=['send_now', 'after_final'], default='after_final'),
+                    'delivery_timing': _param('string', 'send_now sends immediately and reports the delivery outcome; '
+                        'after_text places the sticker after your reply text. Defaults to after_text.',
+                        enum=['send_now', 'after_text'], default='after_text'),
                 },
                 'required': ['selected_sticker_id'],
                 'additionalProperties': False,
@@ -270,11 +270,13 @@ class StickerSendSelectedTool:
 
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         try:
-            sticker_id = str(args.get('selected_sticker_id', args.get('sticker_id', '')) or '').strip()
+            sticker_id = str(args.get('selected_sticker_id') or '').strip()
             if not sticker_id:
                 return ToolResult(call_id='', name=self.spec.name, output={'ok': False, 'error': 'Empty selected_sticker_id'})
-            timing_raw = str(args.get('delivery_timing', args.get('timing', 'after_final')) or 'after_final').strip().lower()
-            timing = StickerTiming.parse(timing_raw)
+            timing_raw = str(args.get('delivery_timing') or 'after_text').strip().lower()
+            timing = {'send_now': StickerTiming.SEND_NOW, 'after_text': StickerTiming.AFTER_FINAL}.get(timing_raw)
+            if timing is None:
+                raise ValueError('delivery_timing must be send_now or after_text')
             entry = await self.catalog.aget_available(sticker_id)
             if entry is None:
                 reference = self.catalog.agent_sticker_id(sticker_id)
@@ -285,7 +287,7 @@ class StickerSendSelectedTool:
                 label=entry.summary, source_id=entry.sticker_id, content_sha256=entry.asset.content_hash)
             return ToolResult(call_id='', name=self.spec.name, output={
                 'ok': True, 'status': 'queued', 'sticker_id': entry.agent_id,
-                'delivery_timing': timing.value,
+                'delivery_timing': timing_raw,
                 'caption': entry.asset.card.get('caption', ''), 'action': entry.asset.card.get('action', ''),
             }, stickers=[sticker])
         except Exception as exc:

@@ -32,15 +32,7 @@ class StickerMode(str, Enum):
 
 class StickerTiming(str, Enum):
     SEND_NOW = "send_now"
-    BEFORE_FINAL = "send_now"
     AFTER_FINAL = "after_final"
-
-    @classmethod
-    def parse(cls, value: str | None) -> "StickerTiming":
-        normalized = str(value or 'after_final').strip().lower()
-        if normalized == 'before_final':
-            normalized = 'send_now'
-        return cls(normalized)
 
 
 class PromptInjectionMode(str, Enum):

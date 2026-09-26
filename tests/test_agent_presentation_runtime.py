@@ -45,6 +45,8 @@ class AgentPresentationRuntimeTests(BusinessTestCase):
             text = message_body(row.message)
             self.assertIn('state=sent', text)
             self.assertIn('A reassuring hug', text)
+            self.assertIn('delivery_timing=after_text', text)
+            self.assertNotIn('after_final', text)
             self.assertEqual('sid:456' in text, not failed_reference)
             self.assertNotIn(canonical_id, text)
             self.assertNotIn('synthetic-private-operation', text)

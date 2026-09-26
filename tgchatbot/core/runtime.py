@@ -3477,6 +3477,8 @@ class AgentRuntime:
         """Agent-visible receipt; transport identity remains in the ledger."""
         view = {key: payload[key] for key in ('filename', 'workspace_path', 'sticker_id',
             'sticker_label', 'emoji', 'delivery_timing', 'error') if payload.get(key) is not None}
+        if view.get('delivery_timing') == StickerTiming.AFTER_FINAL.value:
+            view['delivery_timing'] = 'after_text'
         state = payload.get('status', payload.get('delivery_state'))
         if state is not None:
             view['status'] = state

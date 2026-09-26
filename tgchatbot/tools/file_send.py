@@ -17,7 +17,7 @@ class FileSendTool:
         self.spec = ToolSpec(
             name='file_send',
             description=(
-                'Queue workspace files for automatic delivery after the final response. Each call creates new upload requests, '
+                'Add workspace files to your reply for automatic delivery after your reply text. Each call creates new upload requests, '
                 'even for previously requested paths. Results give each file\'s status: queued means accepted for automatic delivery. '
                 'Use paths relative to the session directory, or absolute paths within it.'
             ),
@@ -44,7 +44,7 @@ class FileSendTool:
             output = {
                 'ok': bool(artifacts),
                 'status': ('queued' if len(artifacts) == len(results) else 'partial') if artifacts else 'failed',
-                'delivery_timing': 'after_final',
+                'delivery_timing': 'after_text',
                 'files': [{'workspace_path': result.workspace_path,
                     'status': 'queued' if result.artifact is not None else 'failed',
                     **({'error': result.error} if result.error else {})} for result in results],

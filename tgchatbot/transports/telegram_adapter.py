@@ -1989,7 +1989,7 @@ class TelegramBotApp:
             return OutboundSticker(
                 path=Path(path),
                 emoji=payload.get('emoji'),
-                timing=StickerTiming.parse(timing),
+                timing=StickerTiming(timing),
                 label=payload.get('label'),
                 source_id=payload.get('source_id'),
                 delivery_operation_id=payload.get('delivery_operation_id'),

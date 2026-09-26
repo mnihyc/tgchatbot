@@ -24,7 +24,7 @@ class ToolWorkflowTests(BusinessTestCase):
         self.assertEqual(result.artifacts, [artifact])
         self.assertEqual(result.output['files'], [{'workspace_path': 'report.txt', 'status': 'queued'}])
         self.assertEqual(result.output['status'], 'queued')
-        self.assertEqual(result.output['delivery_timing'], 'after_final')
+        self.assertEqual(result.output['delivery_timing'], 'after_text')
 
     async def test_file_send_validation_and_empty_result_are_model_visible_errors(self):
         remote = SimpleNamespace(fetch_files=AsyncMock(return_value=[]))

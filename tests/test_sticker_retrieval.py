@@ -444,16 +444,43 @@ class StickerConversationTests(unittest.IsolatedAsyncioTestCase):
         await self.query(persona_mode='clear_session_persona')
         self.assertIsNone(state.session_persona)
 
-    async def test_selection_is_queued_and_retains_timing_aliases_without_recording_delivery(self):
+    async def test_selection_reports_delivery_order_without_recording_delivery(self):
         asset = self.asset()
         await self.catalog.aensure_loaded()
         tool = StickerSendSelectedTool(self.catalog)
-        result = await tool.run({'sticker_id': asset.agent_id, 'timing': 'before_final'}, self.ctx)
+        for declaration in (tool.spec.generic_function_declaration(), tool.spec.gemini_function_declaration(),
+                            tool.spec.openai_tool()):
+            field = declaration['parameters']['properties']['delivery_timing']
+            self.assertEqual([value for value in field['enum'] if value is not None], ['send_now', 'after_text'])
+            self.assertEqual(field['default'], 'after_text')
+        result = await tool.run({'selected_sticker_id': asset.agent_id, 'delivery_timing': 'send_now'}, self.ctx)
         self.assertEqual(result.output['status'], 'queued')
+        self.assertEqual(result.output['delivery_timing'], 'send_now')
         self.assertEqual(result.stickers[0].timing, StickerTiming.SEND_NOW)
         self.assertEqual(result.stickers[0].content_sha256, asset.content_hash)
-        after = await tool.run({'selected_sticker_id': asset.agent_id}, self.ctx)
-        self.assertEqual(after.stickers[0].timing, StickerTiming.AFTER_FINAL)
+        for arguments in ({}, {'delivery_timing': None}, {'delivery_timing': 'after_text'}):
+            with self.subTest(arguments=arguments):
+                after = await tool.run({'selected_sticker_id': asset.agent_id, **arguments}, self.ctx)
+                self.assertEqual(after.output['status'], 'queued')
+                self.assertEqual(after.output['delivery_timing'], 'after_text')
+                self.assertEqual(after.output['caption'], asset.card['caption'])
+                self.assertEqual(after.output['action'], asset.card['action'])
+                self.assertEqual(after.stickers[0].timing, StickerTiming.AFTER_FINAL)
+        self.deliveries.recent.assert_not_awaited()
+
+    async def test_retired_send_arguments_do_not_select_or_schedule_a_sticker(self):
+        asset = self.asset()
+        await self.catalog.aensure_loaded()
+        tool = StickerSendSelectedTool(self.catalog)
+        for timing in ('before_final', 'after_final'):
+            with self.subTest(timing=timing):
+                result = await tool.run({'selected_sticker_id': asset.agent_id, 'delivery_timing': timing}, self.ctx)
+                self.assertFalse(result.output['ok'])
+                self.assertIn('delivery_timing must be send_now or after_text', result.output['error'])
+                self.assertEqual(result.stickers, [])
+        result = await tool.run({'sticker_id': asset.agent_id, 'timing': 'send_now'}, self.ctx)
+        self.assertFalse(result.output['ok'])
+        self.assertEqual(result.stickers, [])
         self.deliveries.recent.assert_not_awaited()
 
     async def test_reused_filename_cannot_send_different_original(self):

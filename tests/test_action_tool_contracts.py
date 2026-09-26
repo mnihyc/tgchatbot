@@ -13,7 +13,7 @@ from telegram.error import TimedOut
 
 from tests.business_helpers import BusinessTestCase
 from tgchatbot.core.runtime import AgentRuntime
-from tgchatbot.domain.models import ChatMode, ConversationMessage, StickerMode
+from tgchatbot.domain.models import ChatMode, ConversationMessage, StickerMode, ToolHistoryMode
 from tgchatbot.providers.gemini import GeminiProvider
 from tgchatbot.stickers.catalog import StickerCatalog
 from tgchatbot.stickers.config import StickerConfig
@@ -26,7 +26,8 @@ from tgchatbot.transports.telegram_adapter import TelegramBotApp
 
 
 class ActionToolContractTests(BusinessTestCase):
-    async def sticker_turn(self, timing, *, count=2, uncertain=False):
+    async def sticker_turn(self, timing, *, count=2, uncertain=False,
+                           final_text='Here is my response.', accompanying_text=''):
         asset = self.path / 'greeting.webp'
         Image.new('RGB', (4, 4), 'blue').save(asset, format='WEBP')
         digest = hashlib.sha256(asset.read_bytes()).hexdigest()
@@ -44,7 +45,9 @@ class ActionToolContractTests(BusinessTestCase):
                 'args': {'selected_sticker_id': 'sid:7', 'delivery_timing': timing}},
             'thoughtSignature': 'synthetic-signature'}]}}]} for number in range(count)]
         replies.append({'candidates': [{'finishReason': 'STOP', 'content': {'role': 'model',
-            'parts': [{'text': 'Here is my response.'}]}}]})
+            'parts': [{'text': final_text}] if final_text else []}}]})
+        if accompanying_text:
+            replies[0]['candidates'][0]['content']['parts'].insert(0, {'text': accompanying_text})
         wire = []
         def respond(request):
             wire.append(json.loads(request.content))
@@ -66,9 +69,12 @@ class ActionToolContractTests(BusinessTestCase):
             receipt = await send_sticker(bot, chat_id=100, sticker=sticker, deliveries=deliveries)
             await runtime.record_tool_observation(session_id=self.session, name='sticker_send',
                 phase='delivery', payload=receipt)
+        spoken = []
         async def emit(event):
             if event.kind == 'sticker':
                 await deliver(TelegramBotApp._sticker_from_event(event))
+            elif event.kind == 'assistant_text':
+                spoken.append(event.detail)
         turn = await runtime.run_turn(session_id=self.session, user_display_name='Participant',
             incoming_message=ConversationMessage.user_text('Send a suitable greeting.'), emit=emit)
         def outputs(contents):
@@ -76,17 +82,23 @@ class ActionToolContractTests(BusinessTestCase):
                 for part in content.get('parts', []) if 'functionResponse' in part
                 and part['functionResponse']['name'] == tool.spec.name]
         visible = outputs(wire[-1]['contents'])
-        expected = 'unknown' if uncertain else 'queued' if timing == 'after_final' else 'sent'
+        deferred = timing == 'after_text'
+        expected = 'unknown' if uncertain else 'queued' if deferred else 'sent'
         self.assertEqual([result['status'] for result in visible], [expected] * count)
+        self.assertEqual([result['delivery_timing'] for result in visible],
+            ['after_text' if deferred else 'send_now'] * count)
+        self.assertEqual(turn.text, final_text)
+        self.assertEqual(spoken, [accompanying_text] if accompanying_text else [])
         if uncertain:
             self.assertFalse(visible[0]['ok'])
             self.assertIn('may have been sent', visible[0]['error'])
         else:
             self.assertTrue(all(result['ok'] for result in visible))
-        self.assertEqual(bot.send_sticker.await_count, 0 if timing == 'after_final' else count)
-        if timing == 'after_final':
+        self.assertEqual(bot.send_sticker.await_count, 0 if deferred else count)
+        if deferred:
             for sticker in turn.stickers:
                 await deliver(sticker)
+                self.assertEqual((await deliveries.get(sticker.delivery_operation_id))['timing'], 'after_final')
         self.assertEqual(bot.send_sticker.await_count, count)
         self.assertEqual(len({sticker.delivery_operation_id for sticker in turn.stickers}), count)
         for sticker in turn.stickers:
@@ -104,15 +116,63 @@ class ActionToolContractTests(BusinessTestCase):
         self.assertIn('sid:7', compacted)
         self.assertIn('status=' + expected, compacted)
         self.assertIn('Sticker delivery receipt', compacted)
+        if deferred:
+            self.assertIn('delivery_timing=after_text', compacted)
 
     async def test_two_immediate_calls_are_two_sends_with_confirmed_model_results(self):
-        await self.sticker_turn('before_final')
+        await self.sticker_turn('send_now')
 
     async def test_two_deferred_calls_execute_once_each_after_the_turn(self):
-        await self.sticker_turn('after_final')
+        await self.sticker_turn('after_text')
+
+    async def test_sticker_only_reply_can_still_finish_without_text(self):
+        await self.sticker_turn('after_text', count=1, final_text='')
+
+    async def test_text_alongside_the_call_is_not_lost_or_repeated_when_final_is_empty(self):
+        await self.sticker_turn('after_text', count=1, final_text='', accompanying_text='I am here with you.')
 
     async def test_uncertain_delivery_keeps_identity_and_outcome_through_restart_and_compaction(self):
         await self.sticker_turn('send_now', count=1, uncertain=True)
+
+    async def test_previous_signed_call_and_result_remain_exact_after_restart(self):
+        settings = await self.settings(provider='gemini', model='gemini-3.8-flash',
+            tool_history_mode=ToolHistoryMode.NATIVE_SAME_PROVIDER)
+        arguments = {'selected_sticker_id': 'sid:7', 'delivery_timing': 'after_final'}
+        native = {'role': 'model', 'parts': [{'text': 'Here is a hug.'},
+            {'functionCall': {'name': 'sticker_send_selected', 'id': 'saved-call', 'args': arguments},
+             'thoughtSignature': 'saved-opaque-signature'}]}
+        result = {'ok': True, 'status': 'queued', 'sticker_id': 'sid:7',
+            'delivery_timing': 'after_final', 'caption': '', 'action': 'Offering a hug'}
+        call = await self.runtime.record_tool_observation(session_id=self.session,
+            name='sticker_send_selected', phase='call', provider_name='gemini',
+            payload={'call_id': 'saved-call', 'arguments': arguments}, metadata_update={
+                'tool_batch_id': 'saved-batch', 'tool_model': settings.model,
+                'provider_native': {'provider': 'gemini', 'model': settings.model, 'items': [native]}})
+        response = await self.runtime.record_tool_observation(session_id=self.session,
+            name='sticker_send_selected', phase='result', provider_name='gemini',
+            payload={'call_id': 'saved-call', 'output': result}, metadata_update={
+                'tool_batch_id': 'saved-batch', 'tool_model': settings.model,
+                'tool_call_message_id': call.db_id})
+        provider = GeminiProvider(replace(self.config.gemini, api_key='synthetic-key'))
+        self.addAsyncCleanup(provider.aclose)
+        reopened = await self.new_store()
+        cold = AgentRuntime(config=self.config, store=reopened, tool_registry=self.tools,
+            providers={'gemini': provider})
+        views = []
+        for runtime in (self.runtime, cold):
+            state = await runtime._get_live_state(self.session)
+            history = runtime._build_provider_history(state, settings=settings, provider_name='gemini')
+            contents = [item for message in history for item in provider._message_to_contents(message)]
+            self.assertIn(native, contents)
+            outputs = [part['functionResponse']['response']['result'] for item in contents
+                for part in item.get('parts', []) if 'functionResponse' in part]
+            self.assertEqual(outputs, [result])
+            views.append(contents)
+        self.assertEqual(views[0], views[1])
+        originals = await reopened.read_messages(self.session, [call.db_id, response.db_id])
+        self.assertEqual(originals[0].message.metadata['tool_payload']['arguments'], arguments)
+        self.assertEqual(originals[1].message.metadata['tool_payload']['output'], result)
+        self.tools.runner.run.assert_not_awaited()
 
     async def test_saved_preference_is_acknowledged_even_when_search_fails_and_survives_restart(self):
         await self.settings()
