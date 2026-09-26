@@ -556,6 +556,7 @@ class AgentRuntime:
                 stored_target = await self._append_stored(session_id, target_message)
                 await self._append_live_message(state, stored_target)
         history = self._build_provider_history(state, settings=settings, provider_name=provider.name)
+        context_through_message_id = state.last_message_id
         logger.debug('turn.history sid=%s provider=%s messages=%s cached=%s', self._session_log_id(session_id), provider.name, len(history), not state.provider_history_dirty)
         accumulated_items: list[dict[str, Any]] = []
         turn_history_start = state.last_message_id + 1
@@ -848,6 +849,7 @@ class AgentRuntime:
                         _admission_protected.reset(protection)
                     history = self._continuation_history(state,settings=settings,provider=provider,
                         native_from_id=turn_history_start)
+                    context_through_message_id = state.last_message_id
                     accumulated_items = []
                 iteration += 1
                 continue
@@ -874,6 +876,7 @@ class AgentRuntime:
                 provider_model=settings.model,
                 provider_history_items=persistent_history_items,
                 reply_target=target,
+                context_through_message_id=context_through_message_id,
             )
 
     async def describe_settings(self, session_id: str) -> dict[str, Any]:

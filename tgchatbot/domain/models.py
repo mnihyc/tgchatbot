@@ -250,3 +250,5 @@ class TurnResult:
     provider_history_items: list[dict[str, Any]] = field(default_factory=list)
     scope: dict[str, int] | None = None
     reply_target: dict[str, Any] = field(default_factory=dict)
+    # Input snapshot used for this reply, not the live context at completion.
+    context_through_message_id: int = 0

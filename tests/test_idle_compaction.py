@@ -272,7 +272,10 @@ class IdleCompactionWorkflows(BusinessTestCase):
         self.assertEqual(sum(not request.get('response_schema') for request in self.requests), 1)
         app._deliver_result.assert_awaited_once()
         self.assertEqual(app._deliver_result.call_args.args[0].message_id, 101)
-        self.assertEqual(app._flow_state(100).last_replied_message_id, incoming.db_id)
+        # The delivered request covers both triggers and may also include
+        # framework records appended while preparing its context.
+        self.assertGreaterEqual(app._flow_state(100).last_replied_message_id, incoming.db_id)
+        self.assertIsNone(app._flow_state(100).latest_reply_candidate)
         self.assertTrue(notice.edit_text.await_count)
 
     async def test_reset_during_summary_prevents_stale_commit(self):

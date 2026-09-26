@@ -1706,7 +1706,9 @@ class TelegramBotApp:
         state = self._flow_state(chat_id)
         accepted = False
         async with state.mutex:
-            if state.latest_reply_candidate is None or candidate.stored_message_id >= state.latest_reply_candidate.stored_message_id:
+            if (candidate.stored_message_id > state.last_replied_message_id
+                    and (state.latest_reply_candidate is None
+                         or candidate.stored_message_id >= state.latest_reply_candidate.stored_message_id)):
                 state.latest_reply_candidate = candidate
                 accepted = True
         logger.info('tg.reply.candidate chat=%s msg=%s accepted=%s', self._chat_log_id(chat_id), candidate.stored_message_id, int(accepted))
@@ -1892,6 +1894,8 @@ class TelegramBotApp:
                         await renderer.abort()
                     except Exception:
                         logger.exception('tg.deliver.abort_failed chat=%s msg=%s', self._chat_log_id(chat.id), candidate.stored_message_id)
+        else:
+            return max(candidate.stored_message_id, result.context_through_message_id)
         return candidate.stored_message_id
 
     async def _deliver_result(
